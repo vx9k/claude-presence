@@ -305,11 +305,51 @@ fn next_allowed(window: &VecDeque<Instant>, last: Option<Instant>) -> Option<Ins
     t
 }
 
+/// What the worker last got onto the wire.
+#[derive(Default)]
+struct Wire {
+    /// What Discord currently shows (and keepalives re-assert).
+    on_wire: Option<String>,
+    /// Generation of the last activity Discord answered for.
+    sent_gen: u64,
+    /// Resend the wanted activity even if its generation was already sent.
+    resend: bool,
+}
+
+impl Wire {
+    /// Record the outcome of sending `want` (generation `generation`).
+    /// Returns `false` when the connection is lost and must be dropped.
+    fn record(&mut self, res: &io::Result<()>, want: Option<String>, generation: u64) -> bool {
+        match res {
+            Ok(()) => {
+                crate::debug!("activity {}", if want.is_some() { "set" } else { "cleared" });
+                self.on_wire = want;
+                self.sent_gen = generation;
+                self.resend = false;
+                true
+            }
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                crate::warn!("Discord rejected the activity: {e}");
+                // Not shown, so nothing to keep alive: re-sending a payload
+                // Discord refused would only fail again every keepalive.
+                self.on_wire = None;
+                self.sent_gen = generation;
+                self.resend = false;
+                true
+            }
+            Err(e) => {
+                crate::info!("Discord connection lost: {e}");
+                self.on_wire = None;
+                self.resend = true;
+                false
+            }
+        }
+    }
+}
+
 fn worker(shared: &Shared, client_id: &str) {
     let mut conn: Option<Conn> = None;
-    let mut on_wire: Option<String> = None; // what Discord currently shows
-    let mut sent_gen = 0u64;
-    let mut resend = false;
+    let mut wire = Wire::default();
     let mut window: VecDeque<Instant> = VecDeque::with_capacity(MAX_PER_WINDOW + 1);
     let mut last_send: Option<Instant> = None;
     let mut retry_at = Instant::now();
@@ -321,24 +361,24 @@ fn worker(shared: &Shared, client_id: &str) {
             loop {
                 if g.stop {
                     drop(g);
-                    if let (Some(c), Some(_)) = (conn.as_mut(), on_wire.as_ref()) {
+                    if let (Some(c), Some(_)) = (conn.as_mut(), wire.on_wire.as_ref()) {
                         let _ = c.set_activity(None);
                     }
                     return;
                 }
                 let now = Instant::now();
                 let keepalive = conn.as_ref().map(|c| if c.bridge { KEEPALIVE_BRIDGE } else { KEEPALIVE });
-                let keepalive_at = match (keepalive, &on_wire, last_send) {
+                let keepalive_at = match (keepalive, &wire.on_wire, last_send) {
                     (Some(k), Some(_), Some(l)) => Some(l + k),
                     _ => None,
                 };
-                let dirty = g.generation != sent_gen || resend;
+                let dirty = g.generation != wire.sent_gen || wire.resend;
                 let mut wake = None;
                 if dirty || keepalive_at.is_some_and(|t| t <= now) {
                     if conn.is_none() && g.activity.is_none() {
                         // Nothing to clear on a connection we don't have.
-                        sent_gen = g.generation;
-                        resend = false;
+                        wire.sent_gen = g.generation;
+                        wire.resend = false;
                         continue;
                     }
                     let mut at = next_allowed(&window, last_send).unwrap_or(now);
@@ -390,26 +430,9 @@ fn worker(shared: &Shared, client_id: &str) {
         while window.len() > MAX_PER_WINDOW || window.front().is_some_and(|&t| now - t >= WINDOW) {
             window.pop_front();
         }
-        match res {
-            Ok(()) => {
-                crate::debug!("activity {}", if want.is_some() { "set" } else { "cleared" });
-                on_wire = want;
-                sent_gen = generation;
-                resend = false;
-            }
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                crate::warn!("Discord rejected the activity: {e}");
-                on_wire = want;
-                sent_gen = generation;
-                resend = false;
-            }
-            Err(e) => {
-                crate::info!("Discord connection lost: {e}");
-                conn = None;
-                on_wire = None;
-                resend = true;
-                retry_at = now;
-            }
+        if !wire.record(&res, want, generation) {
+            conn = None;
+            retry_at = now;
         }
     }
 }
@@ -472,6 +495,24 @@ mod tests {
         assert_eq!(c.set_activity(None).unwrap_err().kind(), io::ErrorKind::InvalidData);
         server.join().unwrap();
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn rejected_activity_is_not_kept_alive() {
+        let mut w = Wire::default();
+        assert!(w.record(&Ok(()), Some("a".into()), 1));
+        assert_eq!((w.on_wire.as_deref(), w.sent_gen, w.resend), (Some("a"), 1, false));
+
+        // Discord refused it: don't resend (keepalive only runs while on_wire is set).
+        let rejected = Err(io::Error::new(io::ErrorKind::InvalidData, "bad"));
+        assert!(w.record(&rejected, Some("b".into()), 2));
+        assert_eq!((w.on_wire.as_deref(), w.sent_gen, w.resend), (None, 2, false));
+
+        // A broken connection: forget what's shown and resend after reconnecting.
+        w.record(&Ok(()), Some("c".into()), 3);
+        let lost = Err(io::Error::new(io::ErrorKind::BrokenPipe, "gone"));
+        assert!(!w.record(&lost, Some("d".into()), 4));
+        assert_eq!((w.on_wire.as_deref(), w.sent_gen, w.resend), (None, 3, true));
     }
 
     #[test]

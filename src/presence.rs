@@ -183,6 +183,68 @@ mod tests {
     }
 
     #[test]
+    fn singular_edges() {
+        let mut v = Vars::default();
+        v.set("n", "1");
+        v.set("k", "1.0k");
+        assert_eq!(render("{n} prompts.", &v).0, "1 prompt.");
+        assert_eq!(render("{n} prompts, 2 tools", &v).0, "1 prompt, 2 tools");
+        assert_eq!(render("{n}", &v).0, "1");
+        assert_eq!(render("{n} ", &v).0, "1");
+        assert_eq!(render("{n} s", &v).0, "1 s");
+        assert_eq!(render("{n}  prompts", &v).0, "1  prompts");
+        assert_eq!(render("{n}prompts", &v).0, "1prompts");
+        assert_eq!(render("{k} tokens", &v).0, "1.0k tokens");
+        assert_eq!(render("{n} tokens·x", &v).0, "1 token · x");
+        // Non-ASCII after the number: no slicing inside a multi-byte char.
+        assert_eq!(render("{n} é", &v).0, "1 é");
+        assert_eq!(render("{n} tökens", &v).0, "1 tökens");
+        assert_eq!(render("{n} {n} prompts", &v).0, "1 1 prompt");
+    }
+
+    #[test]
+    fn render_edges() {
+        let v = vars();
+        assert_eq!(render("", &v), (String::new(), true));
+        assert_eq!(render("·", &v).0, "");
+        assert_eq!(render(" · {project} · ", &v).0, "demo");
+        assert_eq!(render("a··b", &v).0, "a · b");
+        assert_eq!(render("→ {project} ←", &v).0, "→ demo ←");
+        assert_eq!(render("a } b", &v).0, "a } b");
+        assert_eq!(render("{}", &v), (String::new(), false));
+        assert_eq!(render("{{project}}", &v).0, "");
+        assert_eq!(render("é{", &v).0, "é{");
+        // Values are inserted verbatim, never re-expanded or re-split.
+        let mut v = Vars::default();
+        v.set("project", "{tool} · x");
+        v.set("tool", "Bash");
+        assert_eq!(render("in {project}", &v).0, "in {tool} · x");
+        // First definition wins.
+        v.set("project", "other");
+        assert_eq!(render("{project}", &v).0, "{tool} · x");
+    }
+
+    #[test]
+    fn field_and_clamp_edges() {
+        assert_eq!(field(String::new(), 128), None);
+        assert_eq!(clamp(String::new(), 128), "");
+        assert_eq!(clamp("ab".into(), 128), "ab");
+        assert_eq!(clamp("é".into(), 128), "é\u{2800}");
+        let exact = "x".repeat(128);
+        assert_eq!(clamp(exact.clone(), 128), exact);
+        let c = clamp("\u{1F600}".repeat(40), 128);
+        assert!(c.len() <= 128 && c.ends_with('…'), "{c}");
+        let c = clamp("x".repeat(129), 128);
+        assert_eq!(c.len(), 128);
+    }
+
+    #[test]
+    fn activity_json_skips_empty_fields() {
+        let a = Activity { details: Some("d".into()), ..Activity::default() };
+        assert_eq!(sonic_rs::to_string(&a).unwrap(), r#"{"type":0,"details":"d","instance":false}"#);
+    }
+
+    #[test]
     fn clamps() {
         assert_eq!(clamp("a".into(), 128), "a\u{2800}");
         let long = "é".repeat(100);

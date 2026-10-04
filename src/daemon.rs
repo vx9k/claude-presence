@@ -149,6 +149,15 @@ fn file_name(p: &str) -> String {
     p.rsplit(['/', '\\']).next().unwrap_or(p).to_owned()
 }
 
+/// Seconds of quiet before `s` expires, `None` if sessions never expire.
+fn expiry_secs(idle_timeout: u64, s: &Session) -> Option<i64> {
+    let t = idle_timeout as i64;
+    if t == 0 {
+        return None;
+    }
+    Some(if s.status.active() { t.max(3600) } else { t })
+}
+
 struct Rotation {
     key: (usize, Status),
     index: usize,
@@ -169,6 +178,8 @@ pub struct Daemon {
     last_save: Instant,
     last_rescan: Instant,
     last_tail: Instant,
+    /// Whether a hook has arrived yet (logged once, to show hooks are wired).
+    got_hook: bool,
 }
 
 const SAVE_EVERY: Duration = Duration::from_secs(60);
@@ -193,6 +204,7 @@ impl Daemon {
             last_save: now,
             last_rescan: now,
             last_tail: now,
+            got_hook: false,
         }
     }
 
@@ -207,6 +219,10 @@ impl Daemon {
             .and_then(|i| i.hook_event_name.as_deref())
             .map(str::to_owned)
             .unwrap_or_else(|| String::from_utf8_lossy(arg_event).into_owned());
+        if !self.got_hook {
+            self.got_hook = true;
+            crate::info!("first hook received ({event})");
+        }
         let Some(input) = input else {
             crate::debug!("unparseable {event} payload");
             return;
@@ -322,18 +338,14 @@ impl Daemon {
     }
 
     fn expiry_secs(&self, s: &Session) -> Option<i64> {
-        let t = self.cfg.idle_timeout as i64;
-        if t == 0 {
-            return None;
-        }
-        Some(if s.status.active() { t.max(3600) } else { t })
+        expiry_secs(self.cfg.idle_timeout, s)
     }
 
     /// Drop sessions that went quiet (e.g. terminal closed without SessionEnd).
     fn expire(&mut self, now: i64) {
         let mut dead = Vec::new();
-        for (id, s) in &self.sessions {
-            let Some(secs) = self.expiry_secs(s) else { continue };
+        for (id, s) in &mut self.sessions {
+            let Some(secs) = expiry_secs(self.cfg.idle_timeout, s) else { continue };
             if now - s.last_activity < secs * 1000 {
                 continue;
             }
@@ -347,6 +359,10 @@ impl Daemon {
                 .unwrap_or(0);
             if now - modified >= secs * 1000 {
                 dead.push(id.clone());
+            } else {
+                // A transcript still being written counts as activity, so the
+                // next expiry deadline moves forward instead of staying past.
+                s.last_activity = s.last_activity.max(modified);
             }
         }
         for id in dead {
@@ -480,11 +496,15 @@ impl Daemon {
             }
         }
         let key = (self.ids.get(&id).copied().unwrap_or(0), status);
-        let interval = self.cfg.rotation_interval.max(5) as i64 * 1000;
+        let interval = self.cfg.rotation_interval as i64 * 1000;
         if self.rotation.key != key {
             self.rotation = Rotation { key, index: 0, since: now };
-        } else if frames.len() > 1 && now - self.rotation.since >= interval {
-            self.rotation.index += 1;
+        } else if now - self.rotation.since >= interval {
+            // Restart the interval even with a single eligible frame, so
+            // `next_rotation` never falls into the past.
+            if frames.len() > 1 {
+                self.rotation.index += 1;
+            }
             self.rotation.since = now;
         }
         let (details, state) = frames.swap_remove(self.rotation.index % frames.len());
@@ -534,7 +554,7 @@ impl Daemon {
         if self.template(s.status).rotation.is_empty() {
             return None;
         }
-        Some(self.rotation.since + self.cfg.rotation_interval.max(5) as i64 * 1000)
+        Some(self.rotation.since + self.cfg.rotation_interval as i64 * 1000)
     }
 
     fn push(&mut self) {
@@ -828,7 +848,9 @@ mod tests {
     #[test]
     fn sticky_session_choice() {
         let mut d = daemon();
+        assert!(!d.got_hook);
         d.handle_hook(b"UserPromptSubmit\n{\"session_id\":\"a\",\"cwd\":\"/p/a\"}");
+        assert!(d.got_hook);
         assert_eq!(d.pick().as_deref(), Some("a"));
         d.handle_hook(b"UserPromptSubmit\n{\"session_id\":\"b\",\"cwd\":\"/p/b\"}");
         // Both active: keep showing "a".
@@ -837,5 +859,40 @@ mod tests {
         // "a" went idle while "b" is still working: switch.
         assert_eq!(d.pick().as_deref(), Some("b"));
         d.presenter.shutdown();
+    }
+
+    #[test]
+    fn single_frame_rotation_does_not_spin() {
+        let mut d = daemon();
+        // Fresh stats: every idle rotation frame is skipped, only the base
+        // frame is eligible.
+        d.handle_hook(b"Stop\n{\"session_id\":\"r\",\"cwd\":\"/p/r\"}");
+        d.tick();
+        d.rotation.since -= 10 * d.cfg.rotation_interval as i64 * 1000;
+        let wait = d.tick();
+        assert!(wait > Duration::from_secs(1), "tick spins: {wait:?}");
+        assert!(d.next_rotation().unwrap() > timeutil::now_ms());
+        d.presenter.shutdown();
+    }
+
+    #[test]
+    fn live_transcript_does_not_spin_expiry() {
+        let mut d = daemon();
+        let tp = std::env::temp_dir().join(format!("cp-expiry-{}.jsonl", std::process::id()));
+        std::fs::write(&tp, "").unwrap();
+        let tp_s = tp.to_string_lossy().replace('\\', "\\\\");
+        d.handle_hook(
+            format!("Stop\n{{\"session_id\":\"e\",\"cwd\":\"/p/e\",\"transcript_path\":\"{tp_s}\"}}").as_bytes(),
+        );
+        let now = timeutil::now_ms();
+        // No hooks for longer than idle_timeout, but the transcript was just written.
+        d.sessions.get_mut("e").unwrap().last_activity = now - (d.cfg.idle_timeout as i64 + 60) * 1000;
+        d.expire(now);
+        assert!(d.sessions.contains_key("e"));
+        assert!(d.next_expiry().unwrap() > now);
+        let wait = d.tick();
+        assert!(wait > Duration::from_secs(1), "tick spins: {wait:?}");
+        d.presenter.shutdown();
+        let _ = std::fs::remove_file(&tp);
     }
 }

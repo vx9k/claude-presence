@@ -17,9 +17,11 @@ pub struct Config {
     /// Show Discord's elapsed-time counter, starting when the session started.
     pub show_elapsed: bool,
     /// Seconds without hooks (and a quiet transcript) before an idle session
-    /// is dropped and the card cleared. 0 = keep until SessionEnd.
+    /// is dropped and the card cleared. 0 = keep until SessionEnd. Clamped to
+    /// `IDLE_TIMEOUT_MIN..=IDLE_TIMEOUT_MAX` on load.
     pub idle_timeout: u64,
-    /// Seconds between rotation frames (idle stats carousel).
+    /// Seconds between rotation frames (idle stats carousel). Clamped to
+    /// `ROTATION_INTERVAL_MIN..=ROTATION_INTERVAL_MAX` on load.
     pub rotation_interval: u64,
     /// Add a "View on GitHub" button when the project has a github.com origin.
     /// Off by default: private repos would leak their URL.
@@ -94,6 +96,15 @@ fn f(details: &str, state: &str) -> Frame {
     Frame { details: details.into(), state: state.into() }
 }
 
+/// Shorter idle timeouts would clear and re-set the card between ordinary
+/// prompts, burning Discord's rate-limit budget.
+pub const IDLE_TIMEOUT_MIN: u64 = 60;
+/// A week; use 0 to keep sessions forever.
+pub const IDLE_TIMEOUT_MAX: u64 = 7 * 86_400;
+/// Discord accepts an activity update at most every 4 s.
+pub const ROTATION_INTERVAL_MIN: u64 = 5;
+pub const ROTATION_INTERVAL_MAX: u64 = 86_400;
+
 const CDN: &str = "https://cdn.qualit.ly";
 
 impl Default for Assets {
@@ -156,7 +167,7 @@ impl Config {
     pub fn load(path: &Path) -> Config {
         match std::fs::read_to_string(path) {
             Ok(s) => match toml::from_str::<Config>(&s) {
-                Ok(c) => c,
+                Ok(c) => c.sanitized(),
                 Err(e) => {
                     crate::error!("{}: {e}; using defaults", path.display());
                     Config::default()
@@ -168,6 +179,16 @@ impl Config {
                 Config::default()
             }
         }
+    }
+
+    /// Clamp numeric settings into ranges the daemon's millisecond
+    /// arithmetic (`secs as i64 * 1000`) can't overflow.
+    pub fn sanitized(mut self) -> Config {
+        if self.idle_timeout != 0 {
+            self.idle_timeout = self.idle_timeout.clamp(IDLE_TIMEOUT_MIN, IDLE_TIMEOUT_MAX);
+        }
+        self.rotation_interval = self.rotation_interval.clamp(ROTATION_INTERVAL_MIN, ROTATION_INTERVAL_MAX);
+        self
     }
 
     pub fn status_display_type(&self) -> Option<u8> {
@@ -206,9 +227,10 @@ show_elapsed = true
 
 # Seconds without activity before an idle session's card is cleared.
 # (A closed Claude Code clears it immediately via the SessionEnd hook.)
-# 0 = keep until SessionEnd.
+# 0 = keep until SessionEnd; otherwise clamped to 60..604800 (7 days).
 idle_timeout = 900
 
+# Seconds between rotation frames; clamped to 5..86400 (1 day).
 rotation_interval = 15
 
 # Adds a "View on GitHub" button for github.com origins. Off by default
@@ -281,5 +303,73 @@ mod tests {
         assert_eq!(c.status.idle.details, "zzz");
         assert_eq!(c.status.working, Config::default().status.working);
         assert_eq!(c.assets, Assets::default());
+    }
+
+    fn load_str(name: &str, toml: &str) -> Config {
+        let p = std::env::temp_dir().join(format!("cp-config-{name}-{}.toml", std::process::id()));
+        std::fs::write(&p, toml).unwrap();
+        let c = Config::load(&p);
+        let _ = std::fs::remove_file(&p);
+        c
+    }
+
+    #[test]
+    fn clamps_durations_on_load() {
+        let c = load_str("huge", "idle_timeout = 9223372036854775807\nrotation_interval = 9223372036854775807\n");
+        assert_eq!(c.idle_timeout, IDLE_TIMEOUT_MAX);
+        assert_eq!(c.rotation_interval, ROTATION_INTERVAL_MAX);
+        // The daemon's millisecond arithmetic must not overflow.
+        assert!((c.idle_timeout as i64).checked_mul(1000).is_some());
+        assert!((c.rotation_interval as i64).checked_mul(1000).is_some());
+
+        let c = load_str("zero", "idle_timeout = 0\nrotation_interval = 0\n");
+        assert_eq!(c.idle_timeout, 0, "0 keeps meaning \"never expire\"");
+        assert_eq!(c.rotation_interval, ROTATION_INTERVAL_MIN);
+
+        let c = load_str("small", "idle_timeout = 1\nrotation_interval = 1\n");
+        assert_eq!(c.idle_timeout, IDLE_TIMEOUT_MIN);
+        assert_eq!(c.rotation_interval, ROTATION_INTERVAL_MIN);
+
+        let c = load_str("ok", "idle_timeout = 1200\nrotation_interval = 30\n");
+        assert_eq!((c.idle_timeout, c.rotation_interval), (1200, 30));
+    }
+
+    #[test]
+    fn defaults_are_within_clamp_ranges() {
+        assert_eq!(Config::default().sanitized(), Config::default());
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored() {
+        let c = load_str("unknown", "no_such_key = 1\n[status.idle]\nbogus = \"x\"\ndetails = \"d\"\n[extra]\na = 1\n");
+        assert_eq!(c.status.idle.details, "d");
+        assert_eq!(c.client_id, Config::default().client_id);
+    }
+
+    #[test]
+    fn invalid_values_fall_back_to_defaults() {
+        for bad in [
+            "idle_timeout = -1\n",
+            "idle_timeout = \"900\"\n",
+            "activity_type = 300\n",
+            "buttons = [{ label = \"x\" }]\n",
+            "this is not toml",
+        ] {
+            assert_eq!(load_str("bad", bad), Config::default(), "{bad:?}");
+        }
+        assert_eq!(load_str("empty", ""), Config::default());
+        assert_eq!(Config::load(Path::new("/nonexistent/cp/config.toml")), Config::default());
+    }
+
+    #[test]
+    fn status_display_mapping() {
+        let mut c = Config::default();
+        assert_eq!(c.status_display_type(), None);
+        c.status_display = "state".into();
+        assert_eq!(c.status_display_type(), Some(1));
+        c.status_display = "details".into();
+        assert_eq!(c.status_display_type(), Some(2));
+        c.status_display = "bogus".into();
+        assert_eq!(c.status_display_type(), None);
     }
 }

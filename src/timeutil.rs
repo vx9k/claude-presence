@@ -126,6 +126,9 @@ pub fn parse_rfc3339_ms(s: &str) -> Option<i64> {
         sign @ (b'+' | b'-') => {
             let oh = digits(b, i + 1, 2)? as i64;
             let om = digits(b, i + 4, 2)? as i64;
+            if b[i + 3] != b':' || oh > 23 || om > 59 {
+                return None;
+            }
             let o = oh * 3600 + om * 60;
             if *sign == b'-' { -o } else { o }
         }
@@ -155,7 +158,8 @@ pub fn fmt_hours_ms(ms: i64) -> String {
     if mins < 60 {
         format!("{mins}m")
     } else if mins < 600 {
-        format!("{:.1}h", mins as f64 / 60.0)
+        // Truncate like the whole-hour branch, so 9h59m reads 9.9h, not 10.0h.
+        format!("{}.{}h", mins / 60, mins % 60 / 6)
     } else {
         format!("{}h", mins / 60)
     }
@@ -187,6 +191,69 @@ mod tests {
     }
 
     #[test]
+    fn rfc3339_offsets_and_fractions() {
+        let utc = parse_rfc3339_ms("2026-10-04T05:25:00Z").unwrap();
+        assert_eq!(parse_rfc3339_ms("2026-10-03T23:55:00-05:30"), Some(utc));
+        assert_eq!(parse_rfc3339_ms("2026-10-04T05:25:00+00:00"), Some(utc));
+        assert_eq!(parse_rfc3339_ms("2026-10-04T05:25:00-00:00"), Some(utc));
+        assert_eq!(parse_rfc3339_ms("2026-10-04t05:25:00z"), Some(utc));
+        assert_eq!(parse_rfc3339_ms("2026-10-04 05:25:00Z"), Some(utc));
+        assert_eq!(parse_rfc3339_ms("2026-10-04T05:25:00.1Z"), Some(utc + 100));
+        assert_eq!(parse_rfc3339_ms("2026-10-04T05:25:00.12Z"), Some(utc + 120));
+        assert_eq!(parse_rfc3339_ms("2026-10-04T05:25:00.999999999Z"), Some(utc + 999));
+        assert_eq!(parse_rfc3339_ms("2026-10-04T05:25:00.5+01:00"), Some(utc - 3_600_000 + 500));
+        assert_eq!(parse_rfc3339_ms("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
+        assert_eq!(parse_rfc3339_ms("1969-12-31T23:59:59Z"), Some(-1000));
+        assert_eq!(parse_rfc3339_ms("2026-12-31T23:59:60Z"), parse_rfc3339_ms("2027-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn rfc3339_rejects_malformed() {
+        for s in [
+            "",
+            "2026-10-04",
+            "2026-10-04T05:25:00",
+            "2026-10-04T05:25:00.Z",
+            "2026-10-04T05:25:00+02",
+            "2026-10-04T05:25:00+0200",
+            "2026-10-04T05:25:00+02-00",
+            "2026-10-04T05:25:00+24:00",
+            "2026-10-04T05:25:00+02:60",
+            "2026-10-04T05:25:00 Z",
+            "2026-10-04X05:25:00Z",
+            "2026/10/04T05:25:00Z",
+            "2026-00-04T05:25:00Z",
+            "2026-10-00T05:25:00Z",
+            "2026-10-32T05:25:00Z",
+            "2026-10-04T24:00:00Z",
+            "2026-10-04T05:60:00Z",
+            "2026-10-04T05:25:61Z",
+            "2026-1a-04T05:25:00Z",
+            "-026-10-04T05:25:00Z",
+            "２０２６-10-04T05:25:00Z",
+            "2026-10-04T05:25:00.１Z",
+        ] {
+            assert_eq!(parse_rfc3339_ms(s), None, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn rfc3339_never_panics() {
+        // Every prefix and every single-byte corruption of valid inputs,
+        // including multi-byte characters landing on fixed offsets.
+        let good = ["2026-10-04T05:25:00.123+02:00", "2026-10-04T05:25:00Z"];
+        for g in good {
+            for i in 0..=g.len() {
+                let _ = parse_rfc3339_ms(&g[..i]);
+                for rep in ["", "é", "\u{1F600}", "x", "9", "+", ".", ":"] {
+                    let s = format!("{}{rep}{}", &g[..i], g.get(i + 1..).unwrap_or(""));
+                    let _ = parse_rfc3339_ms(&s);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn day_math() {
         assert_eq!(day_number(0, 0), 0);
         assert_eq!(day_number(-1, 0), -1);
@@ -204,5 +271,32 @@ mod tests {
         assert_eq!(fmt_hours_ms(204 * MINUTE_MS), "3.4h");
         assert_eq!(fmt_hours_ms(1000 * MINUTE_MS), "16h");
         assert_eq!(fmt_duration_ms(3 * 3_600_000 + 12 * MINUTE_MS), "3h 12m");
+    }
+
+    #[test]
+    fn formatting_edges() {
+        assert_eq!(fmt_duration_ms(-5_000), "0s");
+        assert_eq!(fmt_duration_ms(59_999), "59s");
+        assert_eq!(fmt_duration_ms(60_000), "1m");
+        assert_eq!(fmt_duration_ms(3_600_000), "1h 0m");
+        let _ = fmt_duration_ms(i64::MAX);
+        let _ = fmt_duration_ms(i64::MIN);
+
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(1_000), "1.0k");
+        assert_eq!(fmt_count(999_949), "999.9k");
+        assert_eq!(fmt_count(999_950), "1.00M");
+        assert_eq!(fmt_count(999_994_999), "999.99M");
+        assert_eq!(fmt_count(999_995_000), "1.00B");
+        let _ = fmt_count(u64::MAX);
+
+        assert_eq!(fmt_hours_ms(-1), "0m");
+        assert_eq!(fmt_hours_ms(59 * MINUTE_MS), "59m");
+        assert_eq!(fmt_hours_ms(60 * MINUTE_MS), "1.0h");
+        // 9h59m must not round up to "10.0h" (and then read "10h" a minute later).
+        assert_eq!(fmt_hours_ms(599 * MINUTE_MS), "9.9h");
+        assert_eq!(fmt_hours_ms(600 * MINUTE_MS), "10h");
+        assert_eq!(fmt_hours_ms(659 * MINUTE_MS), "10h");
+        let _ = fmt_hours_ms(i64::MAX);
     }
 }

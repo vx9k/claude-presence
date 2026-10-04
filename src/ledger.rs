@@ -54,14 +54,16 @@ pub struct Usage {
 impl Usage {
     #[inline]
     pub fn total(&self) -> u64 {
-        self.input + self.output + self.cache_read + self.cache_write
+        self.input.saturating_add(self.output).saturating_add(self.cache_read).saturating_add(self.cache_write)
     }
+    /// Saturating: a corrupt transcript with absurd counts must not wrap
+    /// totals around (they only ever grow) or panic in debug builds.
     #[inline]
     fn add(&mut self, o: &Usage) {
-        self.input += o.input;
-        self.output += o.output;
-        self.cache_read += o.cache_read;
-        self.cache_write += o.cache_write;
+        self.input = self.input.saturating_add(o.input);
+        self.output = self.output.saturating_add(o.output);
+        self.cache_read = self.cache_read.saturating_add(o.cache_read);
+        self.cache_write = self.cache_write.saturating_add(o.cache_write);
     }
     #[inline]
     fn max(&self, o: &Usage) -> Usage {
@@ -105,7 +107,7 @@ impl Day {
         for (a, b) in self.minutes.iter_mut().zip(o.minutes.iter()) {
             *a |= *b;
         }
-        self.tokens += o.tokens;
+        self.tokens = self.tokens.saturating_add(o.tokens);
         self.prompts += o.prompts;
         self.turns += o.turns;
     }
@@ -396,7 +398,8 @@ fn process_line(line: &[u8], st: &mut FileState, cx: &mut Ctx<'_>) {
                         if g.total() > 0 {
                             st.usage.add(&g);
                             cx.delta.totals.usage.add(&g);
-                            cx.delta.day(day).tokens += g.total();
+                            let d = cx.delta.day(day);
+                            d.tokens = d.tokens.saturating_add(g.total());
                         }
                     }
                     Seen::Dup => {}
@@ -438,7 +441,7 @@ fn count_turn(st: &mut FileState, d: &mut Delta, u: &Usage, day: i32) {
     d.totals.usage.add(u);
     d.totals.turns += 1;
     let day = d.day(day);
-    day.tokens += u.total();
+    day.tokens = day.tokens.saturating_add(u.total());
     day.turns += 1;
 }
 
@@ -555,6 +558,13 @@ fn walk(root: &Path, out: &mut Vec<String>) {
     }
 }
 
+/// Truncate `seen.bin` to a whole number of 8-byte ids.
+fn realign_seen(path: &Path) -> io::Result<()> {
+    let f = fs::OpenOptions::new().write(true).open(path)?;
+    let len = f.metadata()?.len();
+    f.set_len(len & !7)
+}
+
 /// Key under which a transcript is tracked (canonical path).
 pub fn key_for(path: &Path) -> Option<String> {
     fs::canonicalize(path).ok()?.into_os_string().into_string().ok()
@@ -618,6 +628,12 @@ impl Ledger {
                 l.days = s.days.into_iter().collect();
                 l.files = s.files;
                 if let Ok(b) = fs::read(&l.seen_path) {
+                    if b.len() % 8 != 0 {
+                        // A torn append: drop the partial id so later appends stay aligned.
+                        if let Err(e) = realign_seen(&l.seen_path) {
+                            crate::warn!("{}: {e}", l.seen_path.display());
+                        }
+                    }
                     l.seen.reserve(b.len() / 8);
                     l.seen.extend(b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())));
                 }
@@ -778,9 +794,10 @@ impl Ledger {
         report
     }
 
-    /// Persist if anything changed. The ledger is written atomically before
-    /// the seen-id log is appended, so a crash in between can only make us
-    /// skip (never double count) a duplicate later.
+    /// Persist if anything changed. New seen ids are appended to `seen.bin`
+    /// and synced *before* `ledger.json` is atomically replaced: a crash in
+    /// between leaves ids marked seen whose counts were never saved, so that
+    /// save window is undercounted — never double counted.
     pub fn save(&mut self) -> io::Result<()> {
         if !self.dirty {
             return Ok(());
@@ -788,6 +805,36 @@ impl Ledger {
         if let Some(dir) = self.ledger_path.parent() {
             fs::create_dir_all(dir)?;
         }
+        self.append_seen()?;
+        self.write_ledger()?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Append and sync the ids counted since the last save.
+    fn append_seen(&mut self) -> io::Result<()> {
+        if self.unsaved_ids.is_empty() {
+            return Ok(());
+        }
+        let mut bytes = Vec::with_capacity(self.unsaved_ids.len() * 8);
+        for id in &self.unsaved_ids {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        // Realign through a separate write handle: on Windows an append-only
+        // handle lacks the FILE_WRITE_DATA access that truncation needs.
+        if fs::metadata(&self.seen_path).is_ok_and(|m| m.len() % 8 != 0) {
+            realign_seen(&self.seen_path)?;
+        }
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(&self.seen_path)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        self.unsaved_ids.clear();
+        self.unsaved_ids.shrink_to(64);
+        Ok(())
+    }
+
+    /// Atomically replace `ledger.json` (temp file + rename).
+    fn write_ledger(&self) -> io::Result<()> {
         let stored = StoredRef {
             version: VERSION,
             totals: &self.totals,
@@ -801,19 +848,7 @@ impl Ledger {
             f.write_all(&json)?;
             f.sync_all()?;
         }
-        fs::rename(&tmp, &self.ledger_path)?;
-        if !self.unsaved_ids.is_empty() {
-            let mut bytes = Vec::with_capacity(self.unsaved_ids.len() * 8);
-            for id in &self.unsaved_ids {
-                bytes.extend_from_slice(&id.to_le_bytes());
-            }
-            let mut f = fs::OpenOptions::new().create(true).append(true).open(&self.seen_path)?;
-            f.write_all(&bytes)?;
-            self.unsaved_ids.clear();
-            self.unsaved_ids.shrink_to(64);
-        }
-        self.dirty = false;
-        Ok(())
+        fs::rename(&tmp, &self.ledger_path)
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -948,6 +983,222 @@ mod tests {
         let off = 0;
         let day = timeutil::day_number(timeutil::parse_rfc3339_ms("2026-10-04T10:00:00Z").unwrap(), off);
         assert_eq!(l2.days[&day].active_minutes(), 5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A ledger over one transcript `name` in a fresh temp dir.
+    fn one_file(name: &str, content: &[u8]) -> (PathBuf, PathBuf, String, Ledger) {
+        let dir = tmpdir(name);
+        let f = dir.join("t.jsonl");
+        fs::write(&f, content).unwrap();
+        let key = key_for(&f).unwrap();
+        let l = Ledger::load(dir.join("ledger.json"), dir.join("seen.bin"));
+        (dir, f, key, l)
+    }
+
+    #[test]
+    fn malformed_lines_are_skipped() {
+        let mut content = Vec::new();
+        for l in [
+            "",
+            "{",
+            "not json at all",
+            "[]",
+            "42",
+            "null",
+            r#"{"type":"assistant"}"#,
+            r#"{"type":"assistant","message":{"id":"x"}}"#,
+            r#"{"type":"assistant","message":{"id":"neg","usage":{"input_tokens":-5}}}"#,
+            r#"{"type":"assistant","message":{"id":"str","usage":{"input_tokens":"5"}}}"#,
+            r#"{"type":"user","message":{"content":42}}"#,
+            r#"{"type":"user","uuid":"bad-ts","timestamp":"yesterday","message":{"content":"hi"}}"#,
+        ] {
+            content.extend_from_slice(l.as_bytes());
+            content.push(b'\n');
+        }
+        content.extend_from_slice(b"\xff\xfe{\"type\":\"user\"}\n");
+        content.extend_from_slice(asst("ok", "2026-10-04T10:00:00Z", 3, 4).as_bytes());
+        content.extend_from_slice(b"\r\n");
+        let (dir, _, key, mut l) = one_file("malformed", &content);
+        assert!(l.ingest(&key));
+        assert_eq!(l.totals.turns, 1, "only the valid assistant line counts");
+        assert_eq!(l.totals.usage.input, 3);
+        assert_eq!(l.totals.prompts, 1, "a bad timestamp doesn't drop the prompt");
+        assert_eq!(l.file(&key).unwrap().offset, content.len() as u64);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trailing_partial_line_waits() {
+        let full = asst("m1", "2026-10-04T10:00:00Z", 1, 1) + "\n";
+        let partial = asst("m2", "2026-10-04T10:00:01Z", 1, 1);
+        let (dir, f, key, mut l) = one_file("partial", (full.clone() + &partial).as_bytes());
+        l.ingest(&key);
+        l.ingest(&key);
+        assert_eq!(l.totals.turns, 1);
+        assert_eq!(l.file(&key).unwrap().offset, full.len() as u64);
+        // A file with no newline at all is never consumed.
+        fs::write(&f, &partial).unwrap();
+        let (dir2, _, key2, mut l2) = one_file("partial-only", partial.as_bytes());
+        l2.ingest(&key2);
+        assert_eq!((l2.totals.turns, l2.file(&key2).unwrap().offset), (0, 0));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn duplicates_count_once() {
+        let mut lines = vec![user("p1", "2026-10-04T10:00:00Z", "hi"), user("p1", "2026-10-04T10:00:01Z", "hi")];
+        lines.push(asst("m1", "2026-10-04T10:00:02Z", 10, 1));
+        // More distinct messages than the per-file ring remembers...
+        for i in 0..2 * RING {
+            lines.push(asst(&format!("f{i}"), "2026-10-04T10:00:03Z", 1, 1));
+        }
+        // ...then the first id again, as a resumed session would copy it.
+        lines.push(asst("m1", "2026-10-04T10:00:04Z", 10, 1));
+        let (dir, f, key, mut l) = one_file("dups", (lines.join("\n") + "\n").as_bytes());
+        l.ingest(&key);
+        assert_eq!(l.totals.prompts, 1);
+        assert_eq!(l.totals.turns, 1 + 2 * RING as u64);
+        assert_eq!(l.totals.usage.input, 10 + 2 * RING as u64);
+        // The same ids appended later, in a separate read, still don't count.
+        let mut fh = fs::OpenOptions::new().append(true).open(&f).unwrap();
+        writeln!(fh, "{}\n{}", user("p1", "2026-10-04T10:01:00Z", "hi"), asst("m1", "2026-10-04T10:01:00Z", 10, 1))
+            .unwrap();
+        l.ingest(&key);
+        assert_eq!((l.totals.prompts, l.totals.turns), (1, 1 + 2 * RING as u64));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replaced_transcript_is_reread_without_double_counting() {
+        let a = asst("m1", "2026-10-04T10:00:00Z", 5, 5);
+        let (dir, f, key, mut l) = one_file("replaced", (a.clone() + "\n" + &a + "\n").as_bytes());
+        l.ingest(&key);
+        assert_eq!(l.totals.turns, 1);
+        // Truncated and rewritten shorter: start over, but known ids stay counted.
+        fs::write(&f, format!("{a}\n")).unwrap();
+        l.ingest(&key);
+        assert_eq!(l.totals.turns, 1);
+        // (Shorter again, so the rewrite is noticed: same-inode rewrites are
+        // detected by length, transcripts being append-only.)
+        fs::write(&f, format!("{}\n", asst("m", "2026-10-04T10:00:00Z", 1, 1))).unwrap();
+        l.ingest(&key);
+        assert_eq!(l.totals.turns, 2);
+        // Replaced by a different file (new inode) of the same length.
+        #[cfg(unix)]
+        {
+            let tmp = dir.join("t.tmp");
+            fs::write(&tmp, format!("{}\n", asst("n", "2026-10-04T10:00:00Z", 1, 1))).unwrap();
+            fs::rename(&tmp, &f).unwrap();
+            l.ingest(&key);
+            assert_eq!(l.totals.turns, 3);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn huge_token_counts_saturate() {
+        let max = u64::MAX;
+        let lines = [
+            asst("big1", "2026-10-04T10:00:00Z", max, max),
+            asst("big2", "2026-10-04T10:00:01Z", max, 1),
+            // Usage growth on an already counted message.
+            asst("big2", "2026-10-04T10:00:02Z", max, max),
+        ];
+        let (dir, _, key, mut l) = one_file("huge", (lines.join("\n") + "\n").as_bytes());
+        l.ingest(&key);
+        assert_eq!(l.totals.turns, 2);
+        assert_eq!(l.totals.usage.total(), max);
+        assert_eq!(l.file(&key).unwrap().usage.input, max);
+        assert_eq!(l.days.values().map(|d| d.tokens).max(), Some(max));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn out_of_range_timestamps_mark_no_minutes() {
+        let lines = [asst("old", "2019-12-31T23:59:59Z", 1, 1), asst("future", "2999-01-01T00:00:00Z", 1, 1)];
+        let (dir, _, key, mut l) = one_file("ts-range", (lines.join("\n") + "\n").as_bytes());
+        l.ingest(&key);
+        assert_eq!(l.totals.turns, 2, "tokens still count");
+        assert!(l.days.values().all(|d| d.active_minutes() == 0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn seen_len(dir: &Path) -> u64 {
+        fs::metadata(dir.join("seen.bin")).unwrap().len()
+    }
+
+    fn append_bytes(p: &Path, b: &[u8]) {
+        fs::OpenOptions::new().append(true).open(p).unwrap().write_all(b).unwrap();
+    }
+
+    #[test]
+    fn torn_seen_bin_is_realigned() {
+        let a = asst("m1", "2026-10-04T10:00:00Z", 1, 1);
+        let (dir, f, key, mut l) = one_file("torn", format!("{a}\n").as_bytes());
+        l.ingest(&key);
+        l.save().unwrap();
+        assert_eq!(seen_len(&dir), 8);
+
+        // A torn append left 3 stray bytes: load ignores and truncates them.
+        append_bytes(&dir.join("seen.bin"), &[1, 2, 3]);
+        let mut l = Ledger::load(dir.join("ledger.json"), dir.join("seen.bin"));
+        assert_eq!(seen_len(&dir), 8);
+        assert!(l.seen.contains(&id_hash(b"m1")));
+
+        // Torn again while running: the next append realigns first.
+        append_bytes(&dir.join("seen.bin"), &[4, 5]);
+        append_bytes(&f, format!("{}\n", asst("m2", "2026-10-04T10:00:01Z", 1, 1)).as_bytes());
+        l.ingest(&key);
+        l.save().unwrap();
+        assert_eq!(seen_len(&dir), 16);
+        let l = Ledger::load(dir.join("ledger.json"), dir.join("seen.bin"));
+        assert_eq!(l.seen.len(), 2);
+        assert!(l.seen.contains(&id_hash(b"m1")) && l.seen.contains(&id_hash(b"m2")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crash_between_seen_and_ledger_never_double_counts() {
+        let m1 = asst("m1", "2026-10-04T10:00:00Z", 1, 1);
+        let m2 = asst("m2", "2026-10-04T10:00:01Z", 1, 1);
+        let (dir, f, key, mut l) = one_file("crash", format!("{m1}\n").as_bytes());
+        l.ingest(&key);
+        l.save().unwrap();
+        let saved = l.totals.clone();
+
+        // m2 arrives; the daemon dies after seen.bin is synced but before
+        // ledger.json is replaced.
+        append_bytes(&f, format!("{m2}\n").as_bytes());
+        l.ingest(&key);
+        assert_eq!(l.totals.turns, 2);
+        l.append_seen().unwrap();
+        drop(l);
+
+        // Restart, then a resumed session copies m2 into a new transcript.
+        let mut l = Ledger::load(dir.join("ledger.json"), dir.join("seen.bin"));
+        assert_eq!(l.totals, saved);
+        fs::write(dir.join("resumed.jsonl"), format!("{m2}\n")).unwrap();
+        l.scan(std::slice::from_ref(&dir));
+        assert_eq!(l.totals.turns, saved.turns, "m2 may be lost, never counted twice");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seen_ids_persist_even_if_ledger_write_fails() {
+        let (dir, _, key, mut l) =
+            one_file("order", format!("{}\n", asst("m1", "2026-10-04T10:00:00Z", 1, 1)).as_bytes());
+        l.ingest(&key);
+        // A directory in the way makes the ledger rename fail.
+        fs::create_dir_all(dir.join("ledger.json/x")).unwrap();
+        assert!(l.save().is_err());
+        assert_eq!(seen_len(&dir), 8, "seen.bin must be written before ledger.json");
+        assert!(l.is_dirty(), "the ledger write is retried on the next save");
+        fs::remove_dir_all(dir.join("ledger.json")).unwrap();
+        l.save().unwrap();
+        assert_eq!(seen_len(&dir), 8, "ids are appended once");
+        assert!(!l.is_dirty());
         let _ = fs::remove_dir_all(&dir);
     }
 

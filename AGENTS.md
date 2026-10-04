@@ -48,8 +48,10 @@ fix or discover something.
   process never parses JSON.
 - **Ledger** (`ledger.json` + append-only `seen.bin`): totals only grow;
   tokens counted once per `message.id`, prompts once per `uuid`, globally.
-  `ledger.json` is written atomically *before* `seen.bin` is appended. Bump
-  `VERSION` in `src/ledger.rs` on incompatible changes.
+  `seen.bin` is appended and synced before `ledger.json` is atomically
+  replaced; a crash between them undercounts at most one save window, never
+  double counts. `seen.bin` is truncated to a multiple of 8 bytes on load and
+  before appending. Bump `VERSION` in `src/ledger.rs` on incompatible changes.
 - **Discord rate limit:** ≤ 4 `SET_ACTIVITY` per 20 s, ≥ 4 s apart; bursts
   coalesce to the latest state. All Discord I/O stays on its worker thread.
 - **`settings.json`:** only touch hook entries whose command contains
