@@ -599,6 +599,18 @@ impl Daemon {
     }
 
     fn save(&mut self) {
+        // Stats that couldn't load (e.g. a busy database) are loaded before
+        // any save: saving the in-memory rebuild would replace them.
+        if self.ledger.needs_load() {
+            if !self.ledger.retry_load() {
+                self.last_save = Instant::now();
+                return;
+            }
+            crate::info!("stats loaded");
+            if self.cfg.scan_history {
+                self.rescan();
+            }
+        }
         if let Err(e) = self.ledger.save() {
             crate::error!("saving stats: {e}");
         }
@@ -630,7 +642,9 @@ impl Daemon {
         {
             self.rescan();
         }
-        if self.ledger.is_dirty() && now_i.duration_since(self.last_save) >= SAVE_EVERY {
+        // Unloaded stats are retried on the same deadline, hooks or not.
+        let save_due = self.ledger.is_dirty() || self.ledger.needs_load();
+        if save_due && now_i.duration_since(self.last_save) >= SAVE_EVERY {
             self.save();
         }
         self.push();
@@ -650,7 +664,7 @@ impl Daemon {
         if active_key.is_some() {
             wait = wait.min(TAIL_EVERY.saturating_sub(now_i.duration_since(self.last_tail)));
         }
-        if self.ledger.is_dirty() {
+        if self.ledger.is_dirty() || self.ledger.needs_load() {
             wait = wait.min(SAVE_EVERY.saturating_sub(now_i.duration_since(self.last_save)));
         }
         if self.cfg.rescan_interval > 0 {
@@ -774,7 +788,7 @@ pub fn run(opts: Options) -> i32 {
 
     let cfg = Config::load(&paths::config_file());
     crate::info!("listening on {}", addr.display());
-    let ledger = Ledger::load(paths::ledger_file(), paths::seen_file());
+    let ledger = Ledger::load(paths::ledger_file());
     let scan = cfg.scan_history;
     let mut d = Daemon::new(cfg, ledger);
     if scan {
@@ -832,7 +846,7 @@ mod tests {
 
     fn daemon() -> Daemon {
         let dir = std::env::temp_dir().join(format!("cp-daemon-{}", std::process::id()));
-        let ledger = Ledger::load(dir.join("l.json"), dir.join("s.bin"));
+        let ledger = Ledger::load(dir.join("l.db"));
         let cfg = Config { client_id: "0".into(), ..Config::default() };
         // Inert presenter: tests must never talk to a real Discord client.
         Daemon::with_presenter(cfg, ledger, Presenter::inert())
@@ -1113,5 +1127,65 @@ mod tests {
         let _ = d.render(timeutil::now_ms());
         d.presenter.shutdown();
         let _ = std::fs::remove_file(&tp);
+    }
+
+    #[test]
+    fn busy_stats_load_on_a_later_save() {
+        let dir = std::env::temp_dir().join(format!("cp-daemon-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = r#"{"type":"user","timestamp":"2026-10-04T10:00:00Z","uuid":"p1","message":{"content":"hi"}}"#;
+        let tp = dir.join("t.jsonl");
+        std::fs::write(&tp, format!("{line}\n")).unwrap();
+        let db = dir.join("ledger.db");
+        let mut l = Ledger::load(db.clone());
+        l.ingest(&ledger::key_for(&tp).unwrap());
+        l.save().unwrap();
+
+        let lock = rusqlite::Connection::open(&db).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        // No history scan: tests must not read the real ~/.claude.
+        let cfg = Config { client_id: "0".into(), scan_history: false, ..Config::default() };
+        let mut d = Daemon::with_presenter(cfg, Ledger::load(db.clone()), Presenter::inert());
+        assert!(d.ledger.needs_load());
+        d.save();
+        assert!(d.ledger.needs_load(), "still busy: nothing saved");
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+        d.save();
+        assert!(!d.ledger.needs_load());
+        assert_eq!(d.ledger.totals.prompts, 1, "the stored stats are loaded");
+        d.presenter.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unloaded_stats_retry_on_the_save_deadline_without_hooks() {
+        let dir = std::env::temp_dir().join(format!("cp-daemon-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tp = dir.join("t.jsonl");
+        let line = r#"{"type":"user","timestamp":"2026-10-04T10:00:00Z","uuid":"p1","message":{"content":"hi"}}"#;
+        std::fs::write(&tp, format!("{line}\n")).unwrap();
+        let db = dir.join("ledger.db");
+        let mut l = Ledger::load(db.clone());
+        l.ingest(&ledger::key_for(&tp).unwrap());
+        l.save().unwrap();
+
+        let lock = rusqlite::Connection::open(&db).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        // No scans: tests must not read the real ~/.claude.
+        let cfg = Config { client_id: "0".into(), scan_history: false, rescan_interval: 0, ..Config::default() };
+        let mut d = Daemon::with_presenter(cfg, Ledger::load(db.clone()), Presenter::inert());
+        assert!(d.ledger.needs_load() && !d.ledger.is_dirty());
+        assert!(d.tick() <= SAVE_EVERY, "a retry is scheduled even with nothing to save");
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+        d.last_save = Instant::now().checked_sub(SAVE_EVERY).unwrap();
+        d.tick();
+        assert!(!d.ledger.needs_load());
+        assert_eq!(d.ledger.totals.prompts, 1);
+        d.presenter.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -48,12 +48,10 @@ pub fn config_file() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// The lifetime stats database (legacy `ledger.json`/`seen.bin` next to it
+/// are imported by `ledger`).
 pub fn ledger_file() -> PathBuf {
-    data_dir().join("ledger.json")
-}
-
-pub fn seen_file() -> PathBuf {
-    data_dir().join("seen.bin")
+    data_dir().join("ledger.db")
 }
 
 /// Claude Code's home. Honors `CLAUDE_CONFIG_DIR` like Claude Code does.

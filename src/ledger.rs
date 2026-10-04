@@ -16,19 +16,23 @@
 //!   sessions and copied history can't inflate "hours on Claude".
 //! * Totals only ever grow: Claude Code deletes old transcripts after a while,
 //!   but the ledger keeps what it already counted.
+//! * Everything is kept in memory; `ledger.db` (SQLite) is only the durable
+//!   store. A save writes the rows changed since the last one in a single
+//!   transaction, so counted ids, totals and file offsets stay consistent.
 
 use crate::timeutil::{self, MINUTE_MS};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sonic_rs::{JsonValueTrait, LazyValue};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
-const VERSION: u32 = 1;
 /// `FileState::schema` of the current per-file counting rules.
 const SCHEMA: u8 = 1;
 /// `FileState::ident_v` of the current `file_ident` rule.
@@ -416,7 +420,7 @@ struct Ctx<'a> {
     delta: &'a mut Delta,
     /// The line was already counted before the file was re-read: it marks no
     /// minutes and adds nothing to the totals or days, only to the file's own
-    /// view (its ids still go into the global set, healing a lost `seen.bin`).
+    /// view (its ids still go into the global set, healing forgotten ones).
     file_only: bool,
 }
 
@@ -542,7 +546,7 @@ fn total_prompt(d: &mut Delta, day: i32) {
 
 /// Settle pending ids against the global set: every one counts in this
 /// file's view, only the fresh ones in the totals, and not those read from
-/// an already counted region (fresh there means `seen.bin` lost them: they
+/// an already counted region (fresh there means they were forgotten: they
 /// are only recorded again).
 fn settle(st: &mut FileState, cx: &mut Ctx<'_>, resolve: &mut dyn FnMut(&mut [Pending])) {
     if cx.pending.is_empty() {
@@ -592,20 +596,23 @@ fn ingest_file(
     // Replaced, truncated, or counted under older per-file rules: start over.
     // Lines below the old offset are already in the totals: they only rebuild
     // this file's view and record their ids (undercounts if the content
-    // really is new, never double counts, even with `seen.bin` lost).
+    // really is new, never double counts, even with the ids forgotten).
     // An identity stored under an older `file_ident` rule can't be compared:
     // adopt today's unless the file shrank (then it was rewritten).
     let adopted = st.ident_v < IDENT_V && meta.len() >= st.offset;
     if adopted {
         (st.ident, st.ident_v) = (ident, IDENT_V);
     }
-    if st.ident != ident || meta.len() < st.offset || st.schema < SCHEMA {
+    let reset = st.ident != ident || meta.len() < st.offset || st.schema < SCHEMA;
+    // A known file's reset state must be saved even if nothing is read.
+    let reset_known = reset && (st.ident != 0 || st.offset != 0);
+    if reset {
         // Persisted, so a re-read cut short by an error doesn't recount it.
         let counted_to = st.counted_to.max(st.offset).min(meta.len());
         *st = FileState { ident, schema: SCHEMA, ident_v: IDENT_V, counted_to, ..FileState::default() };
     }
     if meta.len() == st.offset {
-        return Ok(adopted);
+        return Ok(adopted || reset_known);
     }
     file.seek(SeekFrom::Start(st.offset))?;
     buf.clear();
@@ -675,13 +682,6 @@ fn walk(root: &Path, out: &mut Vec<String>) {
     }
 }
 
-/// Truncate `seen.bin` to a whole number of 8-byte ids.
-fn realign_seen(path: &Path) -> io::Result<()> {
-    let f = fs::OpenOptions::new().write(true).open(path)?;
-    let len = f.metadata()?.len();
-    f.set_len(len & !7)
-}
-
 /// Key under which a transcript is tracked (canonical path).
 pub fn key_for(path: &Path) -> Option<String> {
     fs::canonicalize(path).ok()?.into_os_string().into_string().ok()
@@ -689,12 +689,25 @@ pub fn key_for(path: &Path) -> Option<String> {
 
 // ------------------------------------------------------------------ ledger --
 
-#[derive(Serialize, Deserialize, Default)]
+/// `ledger.json` as releases before `ledger.db` wrote it; imported once.
+#[derive(Deserialize, Default)]
 struct Stored {
     version: u32,
     totals: Totals,
     days: Vec<(i32, Day)>,
     files: HashMap<String, FileState>,
+}
+
+/// Whether the database may be written.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+enum Store {
+    #[default]
+    Ready,
+    /// Not loaded (busy, or unreadable for now): saving would replace the
+    /// stored totals with whatever was rebuilt in memory. Load is retried.
+    Unavailable,
+    /// Written by a newer release: never touched.
+    Newer,
 }
 
 #[derive(Default)]
@@ -703,11 +716,18 @@ pub struct Ledger {
     pub days: BTreeMap<i32, Day>,
     files: HashMap<String, FileState>,
     seen: IdSet,
+    // What changed since the last save: saves only write these rows.
     unsaved_ids: Vec<u64>,
+    dirty_days: BTreeSet<i32>,
+    dirty_files: HashSet<String>,
+    deleted_files: HashSet<String>,
+    totals_dirty: bool,
     buf: Vec<u8>,
-    dirty: bool,
-    ledger_path: PathBuf,
-    seen_path: PathBuf,
+    db_path: PathBuf,
+    store: Store,
+    /// The state was loaded from, or saved to, the database: saves may
+    /// write only what changed.
+    from_db: bool,
 }
 
 /// Aggregates ready for templating.
@@ -731,66 +751,186 @@ pub struct ScanReport {
 }
 
 impl Ledger {
-    /// Load from disk; anything missing or unreadable starts a fresh ledger
-    /// (the next scan rebuilds it from the transcripts still on disk).
-    pub fn load(ledger_path: PathBuf, seen_path: PathBuf) -> Ledger {
-        let mut l = Ledger { ledger_path, seen_path, ..Ledger::default() };
-        let stored = fs::read(&l.ledger_path)
-            .ok()
-            .and_then(|b| sonic_rs::from_slice::<Stored>(&b).ok())
-            .filter(|s| s.version == VERSION);
-        match stored {
-            Some(s) => {
-                l.totals = s.totals;
-                l.days = s.days.into_iter().collect();
-                l.files = s.files;
-                match fs::read(&l.seen_path) {
-                    Ok(b) => {
-                        if b.len() % 8 != 0 {
-                            // A torn append: drop the partial id so later appends stay aligned.
-                            if let Err(e) = realign_seen(&l.seen_path) {
-                                crate::warn!("{}: {e}", l.seen_path.display());
-                            }
-                        }
-                        l.seen.reserve(b.len() / 8);
-                        l.seen.extend(b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())));
-                    }
-                    // The ids counted so far are unknown: a copy of them in a
-                    // new transcript counts again (re-reads of known files
-                    // don't, and record their ids again).
-                    Err(e) if !l.files.is_empty() => {
-                        crate::warn!("{}: {e}; previously counted ids are forgotten", l.seen_path.display())
-                    }
-                    Err(_) => {}
-                }
+    /// Load from `db_path`, importing a legacy `ledger.json`/`seen.bin` next
+    /// to it on first use. Anything missing starts a fresh ledger (the next
+    /// scan rebuilds it from the transcripts still on disk); a corrupt
+    /// database is moved aside first. A busy database leaves the ledger
+    /// unloaded: it works in memory and refuses to save until
+    /// [`Ledger::retry_load`] succeeds.
+    pub fn load(db_path: PathBuf) -> Ledger {
+        Ledger::load_with(db_path, false)
+    }
+
+    /// [`Ledger::load`]; a `repeat` failure is logged at debug level only.
+    fn load_with(db_path: PathBuf, repeat: bool) -> Ledger {
+        let mut l = Ledger { db_path, ..Ledger::default() };
+        let mut res = l.read_db();
+        if let Err(DbError::Sql(e)) = &res {
+            if is_corrupt(e) {
+                crate::warn!("{}: {e}; moved aside, rebuilding stats", l.db_path.display());
+                l.reset();
+                move_aside(&l.db_path);
+                res = l.read_db();
             }
-            None => {
-                if l.ledger_path.exists() {
-                    crate::warn!("{} unreadable; rebuilding stats", l.ledger_path.display());
+        }
+        match res {
+            Ok(()) => {}
+            Err(DbError::Newer(v)) => {
+                crate::error!(
+                    "{} has version {v}, from a newer claude-presence; stats will not be saved",
+                    l.db_path.display()
+                );
+                l.reset();
+                l.store = Store::Newer;
+            }
+            Err(e) => {
+                let e = e.describe(&l.db_path);
+                // Retried on every save: a lasting cause is reported once.
+                if repeat {
+                    crate::debug!("{e}; stats will load later");
+                } else {
+                    crate::warn!("{e}; stats will load later");
                 }
-                let _ = fs::remove_file(&l.seen_path);
+                l.reset();
+                l.store = Store::Unavailable;
             }
         }
         l
+    }
+
+    /// Whether a load failed for a reason that may pass (e.g. a busy
+    /// database), or a database appeared that this ledger didn't load.
+    pub fn needs_load(&self) -> bool {
+        self.store == Store::Unavailable
+    }
+
+    /// Try loading again after [`Ledger::needs_load`]; on success the stored
+    /// state replaces the one rebuilt in memory meanwhile.
+    pub fn retry_load(&mut self) -> bool {
+        let l = Ledger::load_with(self.db_path.clone(), true);
+        if l.needs_load() {
+            return false;
+        }
+        *self = l;
+        true
+    }
+
+    /// Forget a partially read state.
+    fn reset(&mut self) {
+        let db_path = std::mem::take(&mut self.db_path);
+        *self = Ledger { db_path, ..Ledger::default() };
+    }
+
+    fn read_db(&mut self) -> Result<(), DbError> {
+        let legacy = self.db_path.with_file_name(LEGACY_LEDGER);
+        // Only "not found" means there is nothing to load.
+        if !exists(&self.db_path)? && !exists(&legacy)? {
+            return Ok(());
+        }
+        let mut conn = open(&self.db_path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)?;
+        // A write lock up front: a first load creates the schema.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.from_db = true;
+        match user_version(&tx)? {
+            0 => {
+                // A legacy file that can't be read now aborts (rolls back)
+                // the import; the load is retried.
+                let migrated = self.import_legacy(&legacy)?;
+                tx.execute_batch(SCHEMA_SQL)?;
+                self.write_rows(&tx, true)?;
+                // Last: until this commits, the next load starts over.
+                tx.pragma_update(None, "user_version", DB_VERSION)?;
+                tx.commit()?;
+                if migrated {
+                    for p in [legacy, self.db_path.with_file_name(LEGACY_SEEN)] {
+                        match fs::rename(&p, with_suffix(&p, ".bak")) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                            Err(e) => crate::warn!("{}: {e}", p.display()),
+                        }
+                    }
+                }
+            }
+            DB_VERSION => {
+                read_stats(&tx, self)?;
+                read_files(&tx, &mut self.files)?;
+                let n: i64 = tx.query_row("SELECT count(*) FROM seen", [], |r| r.get(0))?;
+                self.seen.reserve(n.max(0) as usize);
+                let mut q = tx.prepare("SELECT id FROM seen")?;
+                let mut rows = q.query([])?;
+                while let Some(r) = rows.next()? {
+                    self.seen.insert(r.get::<_, i64>(0)? as u64);
+                }
+            }
+            v => return Err(DbError::Newer(v)),
+        }
+        Ok(())
+    }
+
+    /// Read a legacy ledger into `self`, for a first load to store. Returns
+    /// whether there was one (then it is renamed `*.bak` once stored); an
+    /// unparsable or unsupported one is not imported. Fails on I/O errors
+    /// other than a missing file: the import is retried rather than lost.
+    fn import_legacy(&mut self, path: &Path) -> Result<bool, DbError> {
+        let s = match read_legacy(path) {
+            Ok(Some(s)) => s,
+            Ok(None) => return Ok(false),
+            Err(Legacy::Io(e)) => return Err(DbError::Io(path.to_owned(), e)),
+            Err(Legacy::Bad(e)) => {
+                crate::warn!("{}: {e}; rebuilding stats", path.display());
+                return Ok(true);
+            }
+        };
+        let seen = self.db_path.with_file_name(LEGACY_SEEN);
+        let ids = match fs::read(&seen) {
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // The ids counted so far are unknown: a copy of them in a new
+                // transcript counts again (re-reads of known files don't, and
+                // record their ids again).
+                if missing_seen_matters(&s.totals) {
+                    crate::warn!("{}: {e}; previously counted ids are forgotten", seen.display())
+                }
+                None
+            }
+            Err(e) => return Err(DbError::Io(seen, e)),
+        };
+        self.totals = s.totals;
+        self.days = s.days.into_iter().collect();
+        self.files = s.files;
+        if let Some(b) = ids {
+            // A torn append's partial id is dropped.
+            self.seen.reserve(b.len() / 8);
+            self.seen.extend(b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())));
+        }
+        crate::info!("imported {}", path.display());
+        Ok(true)
     }
 
     pub fn file(&self, key: &str) -> Option<&FileState> {
         self.files.get(key)
     }
 
-    fn apply(&mut self, d: Delta) {
-        if d.totals == Totals::default() && d.days.is_empty() && d.new_ids.is_empty() {
-            return;
+    fn mark_file(&mut self, key: &str) {
+        self.deleted_files.remove(key);
+        if !self.dirty_files.contains(key) {
+            self.dirty_files.insert(key.to_owned());
         }
-        self.totals.usage.add(&d.totals.usage);
-        self.totals.prompts += d.totals.prompts;
-        self.totals.turns += d.totals.turns;
-        self.totals.sessions += d.totals.sessions;
+    }
+
+    fn apply(&mut self, d: Delta) {
+        if d.totals != Totals::default() {
+            self.totals.usage.add(&d.totals.usage);
+            self.totals.prompts += d.totals.prompts;
+            self.totals.turns += d.totals.turns;
+            self.totals.sessions += d.totals.sessions;
+            self.totals_dirty = true;
+        }
         for (k, v) in d.days {
             self.days.entry(k).or_default().merge(&v);
+            self.dirty_days.insert(k);
         }
         self.unsaved_ids.extend_from_slice(&d.new_ids);
-        self.dirty = true;
     }
 
     /// Ingest one transcript incrementally (used for live sessions).
@@ -821,14 +961,16 @@ impl Ledger {
                     delta.totals.sessions += 1;
                 }
                 if changed || is_new {
-                    self.dirty = true;
+                    self.mark_file(key);
                 }
                 self.files.insert(key.to_owned(), st);
                 self.apply(delta);
                 changed
             }
             Err(_) => {
+                // Possibly read partway: the offset is saved with the counts.
                 if !is_new || st.offset > 0 {
+                    self.mark_file(key);
                     self.files.insert(key.to_owned(), st);
                 }
                 self.apply(delta);
@@ -854,17 +996,23 @@ impl Ledger {
 
         let present: HashSet<&str> = paths.iter().map(String::as_str).collect();
         let before = self.files.len();
-        self.files.retain(|k, _| present.contains(k.as_str()) || Path::new(k).exists());
+        let (dirty, deleted) = (&mut self.dirty_files, &mut self.deleted_files);
+        self.files.retain(|k, _| {
+            let keep = present.contains(k.as_str()) || Path::new(k).exists();
+            if !keep {
+                dirty.remove(k);
+                deleted.insert(k.clone());
+            }
+            keep
+        });
         report.pruned = before - self.files.len();
-        if report.pruned > 0 {
-            self.dirty = true;
-        }
 
-        let mut work: Vec<(String, FileState, bool)> = paths
+        // (path, state, is_new, changed)
+        let mut work: Vec<(String, FileState, bool, bool)> = paths
             .iter()
             .map(|p| match self.files.remove(p) {
-                Some(st) => (p.clone(), st, false),
-                None => (p.clone(), FileState::default(), true),
+                Some(st) => (p.clone(), st, false, false),
+                None => (p.clone(), FileState::default(), true, false),
             })
             .collect();
         drop(present);
@@ -889,7 +1037,7 @@ impl Ledger {
                                 p.fresh = set.insert(p.id);
                             }
                         };
-                        for (path, st, is_new) in chunk.iter_mut() {
+                        for (path, st, is_new, dirty) in chunk.iter_mut() {
                             let r = ingest_file(Path::new(path), st, &mut buf, &mut delta, off, now, &mut resolve);
                             if matches!(r, Ok(true)) {
                                 changed += 1;
@@ -897,6 +1045,8 @@ impl Ledger {
                             if *is_new && !is_subagent(path) && r.is_ok() {
                                 delta.totals.sessions += 1;
                             }
+                            // An error may come after a partial read.
+                            *dirty = *is_new || !matches!(r, Ok(false));
                         }
                         (delta, changed)
                     })
@@ -911,77 +1061,199 @@ impl Ledger {
             total.merge(d);
             report.changed += c;
         }
-        let any_new = work.iter().any(|(_, _, n)| *n);
-        for (p, st, _) in work {
+        for (p, st, _, dirty) in work {
+            if dirty {
+                self.mark_file(&p);
+            }
             self.files.insert(p, st);
-        }
-        if report.changed > 0 || any_new {
-            self.dirty = true;
         }
         self.apply(total);
         report
     }
 
-    /// Persist if anything changed. New seen ids are appended to `seen.bin`
-    /// and synced *before* `ledger.json` is atomically replaced: a crash in
-    /// between (or a ledger write that keeps failing) leaves ids marked seen
-    /// whose counts were never saved: everything since the last successful
-    /// ledger write is undercounted, never double counted.
+    /// Persist what changed since the last save, in one transaction: the
+    /// counted ids, the totals and days they went into, and the file offsets
+    /// past them are stored together, so a crash or a failed save never
+    /// loses or double counts anything (the transcripts are read again from
+    /// the stored offsets). Refuses to write a database it could not load.
     pub fn save(&mut self) -> io::Result<()> {
-        if !self.dirty {
+        self.save_with(|| Ok(()))
+    }
+
+    /// [`Ledger::save`], running `before_commit` (a test failpoint) last.
+    fn save_with(&mut self, before_commit: impl FnOnce() -> rusqlite::Result<()>) -> io::Result<()> {
+        match self.store {
+            Store::Ready => {}
+            Store::Unavailable => {
+                return Err(io::Error::other(format!("{} is not loaded; not saving", self.db_path.display())));
+            }
+            Store::Newer => {
+                self.clear_dirty();
+                return Err(io::Error::other(format!(
+                    "{} is from a newer claude-presence; not saving",
+                    self.db_path.display()
+                )));
+            }
+        }
+        if !self.is_dirty() {
             return Ok(());
         }
-        if let Some(dir) = self.ledger_path.parent() {
+        if let Some(dir) = self.db_path.parent() {
             fs::create_dir_all(dir)?;
         }
-        self.append_seen()?;
-        self.write_ledger()?;
-        self.dirty = false;
+        match self.write_db(before_commit) {
+            Ok(()) => {
+                self.clear_dirty();
+                self.from_db = true;
+                Ok(())
+            }
+            Err(e @ DbError::Newer(_)) => {
+                self.store = Store::Newer;
+                self.clear_dirty();
+                Err(io::Error::other(format!("{}; not saving", e.describe(&self.db_path))))
+            }
+            // Loaded (replacing the in-memory state) before the next save.
+            Err(e @ DbError::Appeared) => {
+                self.store = Store::Unavailable;
+                Err(io::Error::other(format!("{}; loading it instead of saving", e.describe(&self.db_path))))
+            }
+            Err(DbError::Sql(e)) => Err(io::Error::other(e)),
+            Err(DbError::Io(_, e)) => Err(e),
+        }
+    }
+
+    fn write_db(&self, before_commit: impl FnOnce() -> rusqlite::Result<()>) -> Result<(), DbError> {
+        let mut conn = open(&self.db_path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A database that vanished since load is recreated in full.
+        let full = match user_version(&tx)? {
+            0 => {
+                tx.execute_batch(SCHEMA_SQL)?;
+                true
+            }
+            DB_VERSION if !self.from_db => return Err(DbError::Appeared),
+            DB_VERSION => false,
+            v => return Err(DbError::Newer(v)),
+        };
+        self.write_rows(&tx, full)?;
+        if full {
+            tx.pragma_update(None, "user_version", DB_VERSION)?;
+        }
+        before_commit()?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Append and sync the ids counted since the last save.
-    fn append_seen(&mut self) -> io::Result<()> {
-        if self.unsaved_ids.is_empty() {
-            return Ok(());
+    /// Write the changed rows, or every row if `full`.
+    fn write_rows(&self, tx: &Connection, full: bool) -> rusqlite::Result<()> {
+        let mut q = tx.prepare("INSERT OR IGNORE INTO seen(id) VALUES (?1)")?;
+        if full {
+            for &id in &self.seen {
+                q.execute([id as i64])?;
+            }
+        } else {
+            for &id in &self.unsaved_ids {
+                q.execute([id as i64])?;
+            }
         }
-        let mut bytes = Vec::with_capacity(self.unsaved_ids.len() * 8);
-        for id in &self.unsaved_ids {
-            bytes.extend_from_slice(&id.to_le_bytes());
+        if full || self.totals_dirty {
+            let (t, u) = (&self.totals, &self.totals.usage);
+            tx.execute(
+                "INSERT OR REPLACE INTO totals(id, input, output, cache_read, cache_write, prompts, turns, sessions)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    u.input as i64,
+                    u.output as i64,
+                    u.cache_read as i64,
+                    u.cache_write as i64,
+                    t.prompts as i64,
+                    t.turns as i64,
+                    t.sessions as i64
+                ],
+            )?;
         }
-        // Realign through a separate write handle: on Windows an append-only
-        // handle lacks the FILE_WRITE_DATA access that truncation needs.
-        if fs::metadata(&self.seen_path).is_ok_and(|m| m.len() % 8 != 0) {
-            realign_seen(&self.seen_path)?;
+        let mut q =
+            tx.prepare("INSERT OR REPLACE INTO day(day, minutes, tokens, prompts, turns) VALUES (?1, ?2, ?3, ?4, ?5)")?;
+        let mut day = |k: i32, d: &Day| {
+            let mut minutes = [0u8; DAY_WORDS * 8];
+            for (c, w) in minutes.chunks_exact_mut(8).zip(d.minutes.iter()) {
+                c.copy_from_slice(&w.to_le_bytes());
+            }
+            q.execute(params![k, &minutes[..], d.tokens as i64, d.prompts, d.turns])
+        };
+        if full {
+            for (&k, d) in &self.days {
+                day(k, d)?;
+            }
+        } else {
+            for &k in &self.dirty_days {
+                if let Some(d) = self.days.get(&k) {
+                    day(k, d)?;
+                }
+            }
         }
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(&self.seen_path)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
+        let mut q = tx.prepare(
+            "INSERT OR REPLACE INTO file(path, pos, ident, last_ts, input, output, cache_read, cache_write,
+                 prompts, turns, model, ring, schema_v, ident_v, counted_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        )?;
+        let mut file = |k: &str, st: &FileState| {
+            let ring = sonic_rs::to_string(&st.ring).map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+            let u = &st.usage;
+            q.execute(params![
+                k,
+                st.offset as i64,
+                st.ident as i64,
+                st.last_ts,
+                u.input as i64,
+                u.output as i64,
+                u.cache_read as i64,
+                u.cache_write as i64,
+                st.prompts,
+                st.turns,
+                st.model,
+                ring,
+                st.schema,
+                st.ident_v,
+                st.counted_to as i64
+            ])
+        };
+        if full {
+            for (k, st) in &self.files {
+                file(k, st)?;
+            }
+        } else {
+            for k in &self.dirty_files {
+                if let Some(st) = self.files.get(k) {
+                    file(k, st)?;
+                }
+            }
+        }
+        let mut q = tx.prepare("DELETE FROM file WHERE path = ?1")?;
+        for k in &self.deleted_files {
+            q.execute([k])?;
+        }
+        Ok(())
+    }
+
+    fn clear_dirty(&mut self) {
         self.unsaved_ids.clear();
         self.unsaved_ids.shrink_to(64);
-        Ok(())
+        self.dirty_days.clear();
+        self.dirty_files.clear();
+        self.deleted_files.clear();
+        self.totals_dirty = false;
     }
 
-    /// Atomically replace `ledger.json` (temp file + rename).
-    fn write_ledger(&self) -> io::Result<()> {
-        let stored = StoredRef {
-            version: VERSION,
-            totals: &self.totals,
-            days: self.days.iter().map(|(k, v)| (*k, v)).collect(),
-            files: &self.files,
-        };
-        let json = sonic_rs::to_vec(&stored).map_err(io::Error::other)?;
-        let tmp = self.ledger_path.with_extension("json.tmp");
-        {
-            let mut f = File::create(&tmp)?;
-            f.write_all(&json)?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &self.ledger_path)
-    }
-
+    /// Whether a save has anything to write (never, for a database from a
+    /// newer release).
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.store != Store::Newer
+            && (self.totals_dirty
+                || !self.unsaved_ids.is_empty()
+                || !self.dirty_days.is_empty()
+                || !self.dirty_files.is_empty()
+                || !self.deleted_files.is_empty())
     }
 
     pub fn snapshot(&self, now_ms: i64, off: i64) -> Snapshot {
@@ -1011,17 +1283,246 @@ impl Ledger {
     }
 }
 
-#[derive(Serialize)]
-struct StoredRef<'a> {
-    version: u32,
-    totals: &'a Totals,
-    days: Vec<(i32, &'a Day)>,
-    files: &'a HashMap<String, FileState>,
+/// Totals and days only (for `status`), read without creating, migrating or
+/// locking out anything. A database not created yet shows the legacy
+/// ledger's stats, if any. Errors if the database is busy or unreadable.
+pub fn load_stats(db_path: &Path) -> io::Result<Ledger> {
+    let mut l = Ledger::default();
+    let mut read = || -> Result<(), DbError> {
+        // Not migrated yet (no database, or an empty one left by an import
+        // that was rolled back): the legacy ledger's stats, if any.
+        let legacy = |l: &mut Ledger| {
+            if let Ok(Some(s)) = read_legacy(&db_path.with_file_name(LEGACY_LEDGER)) {
+                l.totals = s.totals;
+                l.days = s.days.into_iter().collect();
+            }
+        };
+        if !exists(db_path)? {
+            legacy(&mut l);
+            return Ok(());
+        }
+        let mut conn = open(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let tx = conn.transaction()?;
+        match user_version(&tx)? {
+            0 => {
+                legacy(&mut l);
+                Ok(())
+            }
+            DB_VERSION => Ok(read_stats(&tx, &mut l)?),
+            v => Err(DbError::Newer(v)),
+        }
+    };
+    match read() {
+        Ok(()) => Ok(l),
+        Err(DbError::Sql(e)) => Err(io::Error::other(e)),
+        Err(DbError::Io(_, e)) => Err(e),
+        Err(e) => Err(io::Error::other(e.describe(db_path))),
+    }
+}
+
+// --------------------------------------------------------------- database --
+
+/// `PRAGMA user_version` of the current `ledger.db` schema.
+const DB_VERSION: i64 = 1;
+/// The `ledger.json` version this release imports.
+const LEGACY_VERSION: u32 = 1;
+const LEGACY_LEDGER: &str = "ledger.json";
+const LEGACY_SEEN: &str = "seen.bin";
+const BUSY_TIMEOUT: Duration = Duration::from_millis(if cfg!(test) { 100 } else { 2000 });
+
+/// u64 counters and ids are stored bit-cast to SQLite's i64.
+const SCHEMA_SQL: &str = "
+CREATE TABLE IF NOT EXISTS seen(id INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS totals(
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    input INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL, cache_write INTEGER NOT NULL,
+    prompts INTEGER NOT NULL, turns INTEGER NOT NULL, sessions INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS day(
+    day INTEGER PRIMARY KEY, minutes BLOB NOT NULL,
+    tokens INTEGER NOT NULL, prompts INTEGER NOT NULL, turns INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS file(
+    path TEXT PRIMARY KEY, pos INTEGER NOT NULL, ident INTEGER NOT NULL, last_ts INTEGER NOT NULL,
+    input INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL, cache_write INTEGER NOT NULL,
+    prompts INTEGER NOT NULL, turns INTEGER NOT NULL, model TEXT, ring TEXT NOT NULL,
+    schema_v INTEGER NOT NULL, ident_v INTEGER NOT NULL, counted_to INTEGER NOT NULL);
+";
+
+enum DbError {
+    Sql(rusqlite::Error),
+    /// A file next to the database (or its metadata) couldn't be read.
+    Io(PathBuf, io::Error),
+    /// `user_version` above ours.
+    Newer(i64),
+    /// A ledger that started without a database found a current one at
+    /// save time: it must load it rather than write over it.
+    Appeared,
+}
+
+impl DbError {
+    /// `<path>: <what went wrong>`, `db` being the database's path.
+    fn describe(&self, db: &Path) -> String {
+        match self {
+            DbError::Sql(e) => format!("{}: {e}", db.display()),
+            DbError::Io(p, e) => format!("{}: {e}", p.display()),
+            DbError::Newer(v) => format!("{} has version {v}, from a newer claude-presence", db.display()),
+            DbError::Appeared => format!("{} was created by someone else", db.display()),
+        }
+    }
+}
+
+/// Whether `path` exists; errors other than "not found" are not a no.
+fn exists(path: &Path) -> Result<bool, DbError> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(DbError::Io(path.to_owned(), e)),
+    }
+}
+
+impl From<rusqlite::Error> for DbError {
+    fn from(e: rusqlite::Error) -> DbError {
+        DbError::Sql(e)
+    }
+}
+
+/// A connection for one load or save (none is kept open between them).
+fn open(path: &Path, flags: OpenFlags) -> rusqlite::Result<Connection> {
+    let conn = Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.execute_batch("PRAGMA synchronous = FULL; PRAGMA cache_size = -512;")?;
+    Ok(conn)
+}
+
+fn user_version(c: &Connection) -> rusqlite::Result<i64> {
+    c.query_row("PRAGMA user_version", [], |r| r.get(0))
+}
+
+fn is_corrupt(e: &rusqlite::Error) -> bool {
+    matches!(e.sqlite_error_code(), Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt))
+}
+
+/// `path` with `suffix` appended to its file name.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// Move a corrupt database out of the way as `<db>.corrupt`, with its
+/// journal (which must not be rolled back into a fresh database) as the
+/// journal of the moved file.
+fn move_aside(db: &Path) {
+    for (from, to) in [
+        (with_suffix(db, "-journal"), with_suffix(db, ".corrupt-journal")),
+        (db.to_owned(), with_suffix(db, ".corrupt")),
+    ] {
+        match fs::rename(&from, &to) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => crate::warn!("{}: {e}", from.display()),
+        }
+    }
+}
+
+/// Read the totals and days into `l`.
+fn read_stats(c: &Connection, l: &mut Ledger) -> rusqlite::Result<()> {
+    let t = c
+        .query_row(
+            "SELECT input, output, cache_read, cache_write, prompts, turns, sessions FROM totals WHERE id = 1",
+            [],
+            |r| {
+                Ok(Totals {
+                    usage: Usage {
+                        input: r.get::<_, i64>(0)? as u64,
+                        output: r.get::<_, i64>(1)? as u64,
+                        cache_read: r.get::<_, i64>(2)? as u64,
+                        cache_write: r.get::<_, i64>(3)? as u64,
+                    },
+                    prompts: r.get::<_, i64>(4)? as u64,
+                    turns: r.get::<_, i64>(5)? as u64,
+                    sessions: r.get::<_, i64>(6)? as u64,
+                })
+            },
+        )
+        .optional()?;
+    l.totals = t.unwrap_or_default();
+    let mut q = c.prepare("SELECT day, minutes, tokens, prompts, turns FROM day")?;
+    let mut rows = q.query([])?;
+    while let Some(r) = rows.next()? {
+        let mut d = Day { tokens: r.get::<_, i64>(2)? as u64, prompts: r.get(3)?, turns: r.get(4)?, ..Day::default() };
+        let blob = r.get_ref(1)?.as_blob()?;
+        for (w, c) in d.minutes.iter_mut().zip(blob.chunks_exact(8)) {
+            *w = u64::from_le_bytes(c.try_into().unwrap());
+        }
+        l.days.insert(r.get(0)?, d);
+    }
+    Ok(())
+}
+
+fn read_files(c: &Connection, files: &mut HashMap<String, FileState>) -> rusqlite::Result<()> {
+    let mut q = c.prepare(
+        "SELECT path, pos, ident, last_ts, input, output, cache_read, cache_write, prompts, turns, model, ring,
+                schema_v, ident_v, counted_to FROM file",
+    )?;
+    let mut rows = q.query([])?;
+    while let Some(r) = rows.next()? {
+        // An unreadable ring only loses the in-file dedup of the last few
+        // messages' usage growth.
+        let ring = r.get_ref(11)?.as_str().ok().and_then(|s| sonic_rs::from_str(s).ok()).unwrap_or_default();
+        let st = FileState {
+            offset: r.get::<_, i64>(1)? as u64,
+            ident: r.get::<_, i64>(2)? as u64,
+            last_ts: r.get(3)?,
+            usage: Usage {
+                input: r.get::<_, i64>(4)? as u64,
+                output: r.get::<_, i64>(5)? as u64,
+                cache_read: r.get::<_, i64>(6)? as u64,
+                cache_write: r.get::<_, i64>(7)? as u64,
+            },
+            prompts: r.get(8)?,
+            turns: r.get(9)?,
+            model: r.get(10)?,
+            ring,
+            schema: r.get(12)?,
+            ident_v: r.get(13)?,
+            counted_to: r.get::<_, i64>(14)? as u64,
+        };
+        files.insert(r.get(0)?, st);
+    }
+    Ok(())
+}
+
+enum Legacy {
+    /// Couldn't be read (perhaps only for now).
+    Io(io::Error),
+    /// Read, but unparsable or of an unsupported version.
+    Bad(String),
+}
+
+/// The legacy ledger, `Ok(None)` if there is none.
+fn read_legacy(path: &Path) -> Result<Option<Stored>, Legacy> {
+    let b = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Legacy::Io(e)),
+    };
+    match sonic_rs::from_slice::<Stored>(&b) {
+        Ok(s) if s.version == LEGACY_VERSION => Ok(Some(s)),
+        Ok(s) => Err(Legacy::Bad(format!("unsupported version {}", s.version))),
+        Err(e) => Err(Legacy::Bad(e.to_string())),
+    }
+}
+
+/// Whether losing the legacy `seen.bin` lost anything: it is only created
+/// once an id is counted.
+fn missing_seen_matters(t: &Totals) -> bool {
+    t.turns + t.prompts > 0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn tmpdir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("cp-test-{name}-{}", std::process::id()));
@@ -1063,7 +1564,7 @@ mod tests {
         ];
         fs::write(&f, lines.join("\n") + "\n").unwrap();
 
-        let mut l = Ledger::load(dir.join("ledger.json"), dir.join("seen.bin"));
+        let mut l = Ledger::load(dir.join("ledger.db"));
         let r = l.scan(&[dir.join("projects")]);
         assert_eq!(r.files, 1);
         assert_eq!(l.totals.sessions, 1);
@@ -1096,7 +1597,7 @@ mod tests {
 
         // Persist, reload, rescan: nothing changes.
         l.save().unwrap();
-        let mut l2 = Ledger::load(dir.join("ledger.json"), dir.join("seen.bin"));
+        let mut l2 = Ledger::load(dir.join("ledger.db"));
         assert_eq!(l2.totals, l.totals);
         let r = l2.scan(&[dir.join("projects")]);
         assert_eq!(r.changed, 0);
@@ -1121,7 +1622,7 @@ mod tests {
         let f = dir.join("t.jsonl");
         fs::write(&f, content).unwrap();
         let key = key_for(&f).unwrap();
-        let l = Ledger::load(dir.join("ledger.json"), dir.join("seen.bin"));
+        let l = Ledger::load(dir.join("ledger.db"));
         (dir, f, key, l)
     }
 
@@ -1259,81 +1760,454 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    fn seen_len(dir: &Path) -> u64 {
-        fs::metadata(dir.join("seen.bin")).unwrap().len()
+    #[derive(Serialize)]
+    struct StoredRef<'a> {
+        version: u32,
+        totals: &'a Totals,
+        days: Vec<(i32, &'a Day)>,
+        files: &'a HashMap<String, FileState>,
+    }
+
+    impl Ledger {
+        /// Write this ledger as an older release did: `ledger.json`, and
+        /// `seen.bin` if `seen`.
+        fn write_legacy(&self, dir: &Path, seen: bool) {
+            let stored = StoredRef {
+                version: LEGACY_VERSION,
+                totals: &self.totals,
+                days: self.days.iter().map(|(k, v)| (*k, v)).collect(),
+                files: &self.files,
+            };
+            fs::write(dir.join("ledger.json"), sonic_rs::to_vec(&stored).unwrap()).unwrap();
+            if seen {
+                let ids: Vec<u8> = self.seen.iter().flat_map(|id| id.to_le_bytes()).collect();
+                fs::write(dir.join("seen.bin"), ids).unwrap();
+            }
+        }
     }
 
     fn append_bytes(p: &Path, b: &[u8]) {
         fs::OpenOptions::new().append(true).open(p).unwrap().write_all(b).unwrap();
     }
 
+    fn db(dir: &Path) -> PathBuf {
+        dir.join("ledger.db")
+    }
+
+    /// A raw connection, for tampering with or inspecting the database.
+    fn raw(dir: &Path) -> rusqlite::Connection {
+        rusqlite::Connection::open(db(dir)).unwrap()
+    }
+
+    fn row_count(dir: &Path, table: &str) -> i64 {
+        raw(dir).query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0)).unwrap()
+    }
+
+    fn fail() -> rusqlite::Result<()> {
+        Err(rusqlite::Error::ExecuteReturnedResults)
+    }
+
+    /// Everything persisted, compared field by field.
+    fn assert_same(a: &Ledger, b: &Ledger) {
+        assert_eq!(a.totals, b.totals);
+        assert_eq!(a.days, b.days);
+        assert_eq!(a.seen, b.seen);
+        let mut ka: Vec<_> = a.files.keys().collect();
+        let mut kb: Vec<_> = b.files.keys().collect();
+        ka.sort();
+        kb.sort();
+        assert_eq!(ka, kb);
+        for (k, x) in &a.files {
+            let y = &b.files[k];
+            assert_eq!(
+                (x.offset, x.ident, x.last_ts, file_view(x), &x.model, &x.ring, x.schema, x.ident_v, x.counted_to),
+                (y.offset, y.ident, y.last_ts, file_view(y), &y.model, &y.ring, y.schema, y.ident_v, y.counted_to),
+                "{k}"
+            );
+        }
+    }
+
     #[test]
-    fn torn_seen_bin_is_realigned() {
-        let a = asst("m1", "2026-10-04T10:00:00Z", 1, 1);
-        let (dir, f, key, mut l) = one_file("torn", format!("{a}\n").as_bytes());
-        l.ingest(&key);
+    fn crash_before_commit_counts_exactly_once() {
+        let first = [user("p1", "2026-10-04T10:00:00Z", "hello"), asst("m1", "2026-10-04T10:00:05Z", 100, 1)]
+            .join("\n")
+            + "\n"
+            + &no_id_lines("2026-10-04T10:00:06Z");
+        let (dir, f, key, mut l) = one_file("crash", first.as_bytes());
+        l.scan(std::slice::from_ref(&dir));
         l.save().unwrap();
-        assert_eq!(seen_len(&dir), 8);
 
-        // A torn append left 3 stray bytes: load ignores and truncates them.
-        append_bytes(&dir.join("seen.bin"), &[1, 2, 3]);
-        let mut l = Ledger::load(dir.join("ledger.json"), dir.join("seen.bin"));
-        assert_eq!(seen_len(&dir), 8);
-        assert!(l.seen.contains(&id_hash(b"m1")));
-
-        // Torn again while running: the next append realigns first.
-        append_bytes(&dir.join("seen.bin"), &[4, 5]);
-        append_bytes(&f, format!("{}\n", asst("m2", "2026-10-04T10:00:01Z", 1, 1)).as_bytes());
+        // More arrives (id-less lines included); the daemon dies mid-save.
+        let more = asst("m2", "2026-10-04T10:01:00Z", 7, 7) + "\n" + &no_id_lines("2026-10-04T10:01:01Z");
+        append_bytes(&f, more.as_bytes());
         l.ingest(&key);
-        l.save().unwrap();
-        assert_eq!(seen_len(&dir), 16);
-        let l = Ledger::load(dir.join("ledger.json"), dir.join("seen.bin"));
-        assert_eq!(l.seen.len(), 2);
-        assert!(l.seen.contains(&id_hash(b"m1")) && l.seen.contains(&id_hash(b"m2")));
+        assert!(l.save_with(fail).is_err());
+        drop(l);
+
+        // Restart, plus a resumed session copying m2 into a new transcript.
+        fs::write(dir.join("resumed.jsonl"), format!("{}\n", asst("m2", "2026-10-04T10:01:00Z", 7, 7))).unwrap();
+        let mut l = Ledger::load(db(&dir));
+        assert!(!l.needs_load());
+        l.scan(std::slice::from_ref(&dir));
+        let mut clean = Ledger::default();
+        clean.scan(std::slice::from_ref(&dir));
+        assert_eq!(l.totals, clean.totals, "counted exactly once");
+        assert_eq!(l.days, clean.days);
+        assert_eq!((l.totals.prompts, l.totals.turns, l.totals.sessions), (3, 4, 2));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn crash_between_seen_and_ledger_never_double_counts() {
-        let m1 = asst("m1", "2026-10-04T10:00:00Z", 1, 1);
-        let m2 = asst("m2", "2026-10-04T10:00:01Z", 1, 1);
-        let (dir, f, key, mut l) = one_file("crash", format!("{m1}\n").as_bytes());
+    fn failed_save_is_retried() {
+        let (dir, _, key, mut l) =
+            one_file("save-retry", format!("{}\n", asst("m1", "2026-10-04T10:00:00Z", 1, 1)).as_bytes());
+        l.ingest(&key);
+        assert!(l.save_with(fail).is_err());
+        assert!(l.is_dirty(), "nothing is forgotten after a failed save");
+        assert_eq!(load_stats(&db(&dir)).unwrap().totals, Totals::default(), "rolled back");
+        l.save().unwrap();
+        assert!(!l.is_dirty());
+        assert_same(&Ledger::load(db(&dir)), &l);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn garbage_db_is_moved_aside() {
+        let (dir, _, key, _) =
+            one_file("garbage", format!("{}\n", asst("m1", "2026-10-04T10:00:00Z", 1, 1)).as_bytes());
+        let junk = vec![0x5au8; 4096];
+        fs::write(db(&dir), &junk).unwrap();
+        fs::write(dir.join("ledger.db-journal"), b"stale").unwrap();
+        let mut l = Ledger::load(db(&dir));
+        assert!(!l.needs_load());
+        assert_eq!(l.totals, Totals::default());
+        assert_eq!(fs::read(dir.join("ledger.db.corrupt")).unwrap(), junk, "kept for inspection");
+        // (SQLite discards an invalid journal itself; a valid one is moved
+        // along with the database.)
+        assert!(!dir.join("ledger.db-journal").exists(), "no stale journal next to the fresh database");
+        l.ingest(&key);
+        l.save().unwrap();
+        assert_eq!(Ledger::load(db(&dir)).totals.turns, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_page_is_moved_aside() {
+        // A valid header with a damaged table page: SQLITE_CORRUPT, not NOTADB.
+        let (dir, _, key, mut l) =
+            one_file("corrupt-page", format!("{}\n", asst("m1", "2026-10-04T10:00:00Z", 1, 1)).as_bytes());
+        l.ingest(&key);
+        l.save().unwrap();
+        let mut b = fs::read(db(&dir)).unwrap();
+        let page: usize = raw(&dir).query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0)).unwrap() as usize;
+        assert!(b.len() >= 3 * page);
+        b[page..].fill(0xa5);
+        fs::write(db(&dir), &b).unwrap();
+        let l = Ledger::load(db(&dir));
+        assert!(!l.needs_load());
+        assert_eq!(l.totals, Totals::default());
+        assert!(dir.join("ledger.db.corrupt").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn db_created_meanwhile_is_loaded_not_overwritten() {
+        // Started with no database (or couldn't see it); another writer, or a
+        // restored backup, puts one there before our first save.
+        let (dir, _, key, mut l) =
+            one_file("appeared", format!("{}\n", asst("m1", "2026-10-04T10:00:00Z", 1, 1)).as_bytes());
+        let mut other = Ledger::load(db(&dir));
+        other.totals.prompts = 50;
+        other.totals_dirty = true;
+        other.save().unwrap();
+        l.ingest(&key);
+        assert!(l.save().is_err(), "an in-memory rebuild is not merged over stored stats");
+        assert!(l.needs_load());
+        assert_eq!(load_stats(&db(&dir)).unwrap().totals.prompts, 50);
+        assert!(l.retry_load());
+        assert_eq!(l.totals.prompts, 50);
+        // Once loaded (or created by us), later saves go through.
+        l.ingest(&key);
+        l.save().unwrap();
+        l.ingest(&key);
+        assert_eq!(Ledger::load(db(&dir)).totals.turns, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_db_path_is_retried() {
+        // A metadata error other than NotFound must not look like "no database".
+        let dir = tmpdir("db-path-err");
+        #[cfg(unix)]
+        let bad = {
+            fs::write(dir.join("f"), b"").unwrap();
+            dir.join("f").join("ledger.db") // ENOTDIR
+        };
+        #[cfg(windows)]
+        let bad = dir.join("bad<name").join("ledger.db"); // ERROR_INVALID_NAME
+        let mut l = Ledger::load(bad);
+        assert!(l.needs_load());
+        assert!(l.save().is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn busy_db_is_never_clobbered() {
+        let (dir, f, key, mut l) =
+            one_file("busy", format!("{}\n", asst("m1", "2026-10-04T10:00:00Z", 1, 1)).as_bytes());
         l.ingest(&key);
         l.save().unwrap();
         let saved = l.totals.clone();
 
-        // m2 arrives; the daemon dies after seen.bin is synced but before
-        // ledger.json is replaced.
-        append_bytes(&f, format!("{m2}\n").as_bytes());
+        let lock = raw(&dir);
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let mut l = Ledger::load(db(&dir));
+        assert!(l.needs_load());
+        assert!(load_stats(&db(&dir)).is_err(), "status reports busy, not zeros");
+        append_bytes(&f, format!("{}\n", asst("m2", "2026-10-04T10:00:01Z", 1, 1)).as_bytes());
+        l.ingest(&key);
+        assert!(l.save().is_err(), "an unloaded ledger must not overwrite the stored one");
+        assert!(!l.retry_load());
+        assert_eq!(l.totals.turns, 2, "rebuilt in memory meanwhile");
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+
+        assert_eq!(load_stats(&db(&dir)).unwrap().totals, saved, "not clobbered");
+        assert!(l.retry_load());
+        assert!(!l.needs_load());
+        assert_eq!(l.totals, saved, "the stored state replaces the in-memory one");
         l.ingest(&key);
         assert_eq!(l.totals.turns, 2);
-        l.append_seen().unwrap();
-        drop(l);
-
-        // Restart, then a resumed session copies m2 into a new transcript.
-        let mut l = Ledger::load(dir.join("ledger.json"), dir.join("seen.bin"));
-        assert_eq!(l.totals, saved);
-        fs::write(dir.join("resumed.jsonl"), format!("{m2}\n")).unwrap();
-        l.scan(std::slice::from_ref(&dir));
-        assert_eq!(l.totals.turns, saved.turns, "m2 may be lost, never counted twice");
+        l.save().unwrap();
+        assert_eq!(Ledger::load(db(&dir)).totals.turns, 2);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn seen_ids_persist_even_if_ledger_write_fails() {
-        let (dir, _, key, mut l) =
-            one_file("order", format!("{}\n", asst("m1", "2026-10-04T10:00:00Z", 1, 1)).as_bytes());
+    fn newer_db_is_never_written() {
+        let (dir, f, key, mut l) =
+            one_file("newer", format!("{}\n", asst("m1", "2026-10-04T10:00:00Z", 1, 1)).as_bytes());
         l.ingest(&key);
-        // A directory in the way makes the ledger rename fail.
-        fs::create_dir_all(dir.join("ledger.json/x")).unwrap();
-        assert!(l.save().is_err());
-        assert_eq!(seen_len(&dir), 8, "seen.bin must be written before ledger.json");
-        assert!(l.is_dirty(), "the ledger write is retried on the next save");
-        fs::remove_dir_all(dir.join("ledger.json")).unwrap();
         l.save().unwrap();
-        assert_eq!(seen_len(&dir), 8, "ids are appended once");
-        assert!(!l.is_dirty());
+        raw(&dir).pragma_update(None, "user_version", DB_VERSION + 1).unwrap();
+        let mut l = Ledger::load(db(&dir));
+        assert!(!l.needs_load(), "not retried either");
+        append_bytes(&f, format!("{}\n", asst("m2", "2026-10-04T10:00:01Z", 1, 1)).as_bytes());
+        l.ingest(&key);
+        assert!(l.save().is_err());
+        assert!(!l.is_dirty(), "the daemon doesn't keep trying");
+        assert!(load_stats(&db(&dir)).is_err());
+        let v: i64 = raw(&dir).query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, DB_VERSION + 1);
+        assert_eq!(row_count(&dir, "seen"), 1, "untouched");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extreme_values_round_trip() {
+        let lines =
+            [asst("big1", "2026-10-04T10:00:00Z", u64::MAX, u64::MAX), asst("big2", "2026-10-04T10:00:01Z", 1, 1)];
+        let (dir, _, key, mut l) = one_file("extreme", (lines.join("\n") + "\n").as_bytes());
+        l.ingest(&key);
+        for id in [u64::MAX, 1 << 63, 0] {
+            l.seen.insert(id);
+            l.unsaved_ids.push(id);
+        }
+        l.files.get_mut(&key).unwrap().counted_to = u64::MAX;
+        l.files.get_mut(&key).unwrap().ident = u64::MAX;
+        l.save().unwrap();
+        assert_same(&Ledger::load(db(&dir)), &l);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pruned_files_are_deleted() {
+        let (dir, _, _, mut l) =
+            one_file("prune", format!("{}\n", asst("m1", "2026-10-04T10:00:00Z", 1, 1)).as_bytes());
+        let b = dir.join("b.jsonl");
+        fs::write(&b, format!("{}\n", asst("m2", "2026-10-04T10:00:00Z", 1, 1))).unwrap();
+        l.scan(std::slice::from_ref(&dir));
+        l.save().unwrap();
+        assert_eq!(row_count(&dir, "file"), 2);
+        fs::remove_file(&b).unwrap();
+        assert_eq!(l.scan(std::slice::from_ref(&dir)).pruned, 1);
+        l.save().unwrap();
+        assert_eq!(row_count(&dir, "file"), 1);
+        let l2 = Ledger::load(db(&dir));
+        assert_eq!(l2.files.len(), 1);
+        assert_eq!(l2.totals.turns, 2, "totals keep what was counted");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saves_write_only_dirty_rows() {
+        let (dir, _, a, mut l) =
+            one_file("delta", format!("{}\n", asst("m1", "2026-10-04T10:00:00Z", 1, 1)).as_bytes());
+        l.ingest(&a);
+        l.save().unwrap();
+        assert!(!l.is_dirty());
+        assert!(l.save().is_ok(), "nothing to do");
+        // Tamper with the rows a later save has no reason to touch.
+        let day = *l.days.keys().next().unwrap();
+        let c = raw(&dir);
+        c.execute("UPDATE day SET tokens = 12345 WHERE day = ?1", [day]).unwrap();
+        c.execute("UPDATE file SET prompts = 77 WHERE path = ?1", [&a]).unwrap();
+        drop(c);
+        let fb = dir.join("b.jsonl");
+        fs::write(&fb, format!("{}\n", asst("m2", "2026-10-06T10:00:00Z", 1, 1))).unwrap();
+        l.ingest(&key_for(&fb).unwrap());
+        l.save().unwrap();
+        let l2 = Ledger::load(db(&dir));
+        assert_eq!(l2.days[&day].tokens, 12345, "a clean day is not rewritten");
+        assert_eq!(l2.file(&a).unwrap().prompts, 77, "a clean file is not rewritten");
+        assert_eq!(l2.totals, l.totals);
+        assert_eq!(l2.files.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emptied_transcript_reset_is_saved() {
+        let (dir, f, key, mut l) =
+            one_file("emptied", format!("{}\n", asst("m1", "2026-10-04T10:00:00Z", 1, 1)).as_bytes());
+        l.ingest(&key);
+        l.save().unwrap();
+        fs::write(&f, b"").unwrap();
+        assert!(l.ingest(&key), "the reset is a change");
+        l.save().unwrap();
+        let st = Ledger::load(db(&dir)).files.remove(&key).unwrap();
+        assert_eq!((st.offset, st.turns, st.counted_to), (0, 0, 0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_of_a_missing_db_are_empty_and_create_nothing() {
+        let dir = tmpdir("stats-missing");
+        let l = load_stats(&db(&dir)).unwrap();
+        assert_eq!(l.totals, Totals::default());
+        assert!(!db(&dir).exists());
+        // A daemon that hasn't migrated yet: the legacy ledger shows.
+        let mut legacy = Ledger::default();
+        legacy.totals.prompts = 9;
+        legacy.days.entry(20_000).or_default().turns = 3;
+        legacy.write_legacy(&dir, true);
+        let l = load_stats(&db(&dir)).unwrap();
+        assert_eq!((l.totals.prompts, l.days.clone()), (9, legacy.days.clone()));
+        assert!(!db(&dir).exists() && dir.join("ledger.json").exists(), "status migrates nothing");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A ledger over a few transcripts, written in the legacy format.
+    fn legacy_fixture(name: &str) -> (PathBuf, Ledger) {
+        let content = [user("p1", "2026-10-04T10:00:00Z", "hello"), asst("m1", "2026-10-04T10:00:05Z", 100, 1)]
+            .join("\n")
+            + "\n"
+            + &no_id_lines("2026-10-04T10:00:06Z");
+        let (dir, _, _, mut l) = one_file(name, content.as_bytes());
+        fs::write(dir.join("b.jsonl"), format!("{}\n", asst("m2", "2026-10-05T10:00:00Z", 3, 3))).unwrap();
+        l.scan(std::slice::from_ref(&dir));
+        l.write_legacy(&dir, true);
+        (dir, l)
+    }
+
+    #[test]
+    fn legacy_ledger_is_imported_once() {
+        let (dir, legacy) = legacy_fixture("legacy");
+        let mut l = Ledger::load(db(&dir));
+        assert_same(&l, &legacy);
+        assert!(!l.is_dirty());
+        assert!(!dir.join("ledger.json").exists() && !dir.join("seen.bin").exists());
+        assert!(dir.join("ledger.json.bak").exists() && dir.join("seen.bin.bak").exists());
+        assert_eq!(l.scan(std::slice::from_ref(&dir)).changed, 0, "offsets carried over");
+        assert_eq!(l.totals, legacy.totals);
+        // A legacy ledger showing up again later is not imported again.
+        let mut other = Ledger::default();
+        other.totals.prompts = 1000;
+        other.write_legacy(&dir, false);
+        assert_same(&Ledger::load(db(&dir)), &legacy);
+        assert!(dir.join("ledger.json").exists(), "left alone");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_ledger_without_seen_bin() {
+        let (dir, legacy) = legacy_fixture("legacy-noseen");
+        fs::remove_file(dir.join("seen.bin")).unwrap();
+        let mut l = Ledger::load(db(&dir));
+        assert_eq!((l.totals.clone(), l.days.clone()), (legacy.totals.clone(), legacy.days.clone()));
+        assert!(l.seen.is_empty());
+        // Known files are not recounted.
+        l.scan(std::slice::from_ref(&dir));
+        assert_eq!(l.totals, legacy.totals);
+        assert!(missing_seen_matters(&legacy.totals));
+        assert!(!missing_seen_matters(&Totals { sessions: 3, ..Totals::default() }), "TODO #18");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_torn_seen_bin_keeps_whole_ids() {
+        let (dir, legacy) = legacy_fixture("legacy-torn");
+        append_bytes(&dir.join("seen.bin"), &[1, 2, 3]);
+        let l = Ledger::load(db(&dir));
+        assert_same(&l, &legacy);
+        assert_eq!(row_count(&dir, "seen"), legacy.seen.len() as i64);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_ledger_read_error_is_retried_not_discarded() {
+        // E.g. a sharing violation from an antivirus at first start; here a
+        // directory in its place.
+        let dir = tmpdir("legacy-io");
+        fs::create_dir_all(dir.join("ledger.json")).unwrap();
+        let mut l = Ledger::load(db(&dir));
+        assert!(l.needs_load());
+        assert!(!dir.join("ledger.json.bak").exists());
+        fs::remove_dir_all(dir.join("ledger.json")).unwrap();
+        let mut legacy = Ledger::default();
+        legacy.totals.prompts = 9;
+        legacy.seen.insert(7);
+        legacy.write_legacy(&dir, true);
+        assert!(l.retry_load());
+        assert_eq!((l.totals.prompts, l.seen.len()), (9, 1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_seen_bin_read_error_is_retried_not_discarded() {
+        let (dir, legacy) = legacy_fixture("legacy-seen-io");
+        fs::remove_file(dir.join("seen.bin")).unwrap();
+        fs::create_dir_all(dir.join("seen.bin")).unwrap();
+        let mut l = Ledger::load(db(&dir));
+        assert!(l.needs_load(), "only a missing seen.bin means no ids");
+        assert!(dir.join("ledger.json").exists() && !dir.join("seen.bin.bak").exists());
+        // The aborted import left an empty database: status still shows the
+        // legacy stats, not zeros.
+        assert!(db(&dir).exists());
+        let s = load_stats(&db(&dir)).unwrap();
+        assert_eq!((s.totals, s.days), (legacy.totals.clone(), legacy.days.clone()));
+        fs::remove_dir_all(dir.join("seen.bin")).unwrap();
+        legacy.write_legacy(&dir, true);
+        assert!(l.retry_load());
+        assert_same(&l, &legacy);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_legacy_ledger_starts_fresh() {
+        for (name, json) in [("legacy-v99", r#"{"version":99,"totals":{},"days":[],"files":{}}"#), ("legacy-bad", "{")]
+        {
+            let dir = tmpdir(name);
+            fs::write(dir.join("ledger.json"), json).unwrap();
+            fs::write(dir.join("seen.bin"), [0u8; 8]).unwrap();
+            let mut l = Ledger::load(db(&dir));
+            assert!(!l.needs_load());
+            assert_eq!(l.totals, Totals::default());
+            assert!(l.seen.is_empty(), "ids without their totals are not imported");
+            assert!(dir.join("ledger.json.bak").exists(), "kept, out of the way");
+            l.save().unwrap();
+            assert_eq!(Ledger::load(db(&dir)).totals, Totals::default());
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
@@ -1644,7 +2518,7 @@ mod tests {
     }
 
     #[test]
-    fn reread_without_seen_bin_heals_it_without_recounting() {
+    fn reread_with_forgotten_ids_heals_them_without_recounting() {
         // A long line between two lines of m1 puts them in separate reads, so
         // the second one is usage growth on an already settled message.
         let pad = format!(r#"{{"type":"x","pad":"{}"}}"#, "a".repeat(READ_CHUNK + 1024));
@@ -1660,9 +2534,10 @@ mod tests {
         l.ingest(&key);
         l.save().unwrap();
         let (totals, days) = (l.totals.clone(), l.days.clone());
-        // seen.bin lost while ledger.json survived, then a schema migration.
-        fs::remove_file(dir.join("seen.bin")).unwrap();
-        let mut l = Ledger::load(dir.join("ledger.json"), dir.join("seen.bin"));
+        // Ids forgotten (a legacy ledger imported without `seen.bin`), then a
+        // schema migration.
+        raw(&dir).execute("DELETE FROM seen", []).unwrap();
+        let mut l = Ledger::load(db(&dir));
         assert!(l.seen.is_empty());
         l.files.get_mut(&key).unwrap().schema = 0;
         assert!(l.ingest(&key));
@@ -1672,7 +2547,7 @@ mod tests {
         assert_eq!(file_view(l.file(&key).unwrap()).0, 1);
         assert_eq!(l.file(&key).unwrap().usage.output, 50);
         l.save().unwrap();
-        assert_eq!(seen_len(&dir), 16, "seen.bin is rebuilt");
+        assert_eq!(row_count(&dir, "seen"), 2, "the ids are stored again");
         let _ = fs::remove_dir_all(&dir);
     }
 

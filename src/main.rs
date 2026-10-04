@@ -331,22 +331,37 @@ fn uninstall_cmd(args: &[String]) -> ExitCode {
 fn status() -> ExitCode {
     let sock = paths::hook_socket();
     let running = ipc::daemon_running(&sock);
-    let l = ledger::Ledger::load(paths::ledger_file(), paths::seen_file());
+    let db = paths::ledger_file();
+    let stats = ledger::load_stats(&db);
     // A reader that quit early (`status | head -1`) is not an error.
-    let _ = write_status(&mut std::io::stdout().lock(), running, &sock, &l);
+    let _ = write_status(&mut std::io::stdout().lock(), running, &sock, &db, &stats);
     if running { ExitCode::SUCCESS } else { ExitCode::from(3) }
 }
 
 /// The `status` report. `writeln!` instead of `println!`, which panics when
 /// stdout is closed.
-fn write_status(w: &mut impl Write, running: bool, sock: &Path, l: &ledger::Ledger) -> std::io::Result<()> {
+fn write_status(
+    w: &mut impl Write,
+    running: bool,
+    sock: &Path,
+    db: &Path,
+    stats: &std::io::Result<ledger::Ledger>,
+) -> std::io::Result<()> {
     writeln!(w, "daemon:   {}", if running { "running" } else { "not running" })?;
     writeln!(w, "socket:   {}", sock.display())?;
     writeln!(w, "config:   {}", paths::config_file().display())?;
-    writeln!(w, "stats:    {}", paths::ledger_file().display())?;
+    writeln!(w, "stats:    {}", db.display())?;
+    writeln!(w)?;
+    let l = match stats {
+        Ok(l) => l,
+        // Busy (being saved) or unreadable: zeros would look like lost stats.
+        Err(e) => {
+            writeln!(w, "stats unavailable: {e}")?;
+            return w.flush();
+        }
+    };
     let s = l.snapshot(timeutil::now_ms(), timeutil::local_offset_secs());
     let u = &l.totals.usage;
-    writeln!(w)?;
     writeln!(
         w,
         "today:    {} active · {} prompts · {} tokens",
@@ -407,14 +422,26 @@ mod tests {
     #[test]
     fn status_survives_a_closed_stdout() {
         let dir = std::env::temp_dir().join(format!("cp-status-{}", std::process::id()));
-        let l = ledger::Ledger::load(dir.join("l.json"), dir.join("s.bin"));
+        let db = dir.join("l.db");
+        let l = ledger::load_stats(&db);
         let sock = Path::new("/x.sock");
-        assert!(write_status(&mut ClosedPipe, false, sock, &l).is_err());
+        assert!(write_status(&mut ClosedPipe, false, sock, &db, &l).is_err());
         let mut out = Vec::new();
-        write_status(&mut out, true, sock, &l).unwrap();
+        write_status(&mut out, true, sock, &db, &l).unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(out.starts_with("daemon:   running\nsocket:   /x.sock\n"));
+        assert!(out.contains(&format!("stats:    {}\n", db.display())));
         assert!(out.contains("streak:   0 days"));
+    }
+
+    #[test]
+    fn status_says_when_stats_are_unavailable() {
+        let busy = Err(std::io::Error::other("database is locked"));
+        let mut out = Vec::new();
+        write_status(&mut out, true, Path::new("/x.sock"), Path::new("/l.db"), &busy).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("stats unavailable: database is locked"));
+        assert!(!out.contains("lifetime:"), "no zeros instead");
     }
 
     #[test]

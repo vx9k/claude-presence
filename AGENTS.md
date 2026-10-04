@@ -18,7 +18,9 @@ A lean alternative to the Node.js [claude-rpc](https://github.com/rar-file/claud
    quickly, even if the daemon is down.
 4. **Small dependency set** — prefer `std`. Current deps: `sonic-rs`, `memchr`,
    `serde`, `toml`, `serde_json` (install-time `settings.json` editing only,
-   for key-order preservation), `libc` (unix), `windows-sys` (windows).
+   for key-order preservation), `rusqlite` (`bundled`, no default features;
+   ledger persistence; extensions trimmed via `LIBSQLITE3_FLAGS` in
+   `.cargo/config.toml`), `libc` (unix), `windows-sys` (windows).
 
 ## Layout
 
@@ -29,7 +31,7 @@ A lean alternative to the Node.js [claude-rpc](https://github.com/rar-file/claud
 | `src/daemon.rs` | Event loop, session state machine, card rendering, signals |
 | `src/discord.rs` | Discord IPC client + worker thread with rate limiting/coalescing |
 | `src/ipc.rs` | Hook → daemon channel: Unix socket (0600) / local named pipe |
-| `src/ledger.rs` | Incremental transcript parsing, lifetime stats, persistence |
+| `src/ledger.rs` | Incremental transcript parsing, lifetime stats, delta saves to SQLite `ledger.db`, one-time legacy `ledger.json` import |
 | `src/presence.rs` | Template rendering and the activity payload |
 | `src/config.rs` | `config.toml` schema, defaults and `DEFAULT_TOML` (keep in sync — a test enforces it) |
 | `src/install.rs` | `settings.json` hook wiring and per-user services |
@@ -75,13 +77,22 @@ checks and the ledger's crash rules is in
   (`pipe_owner_trusted`), else silently skip. A starting daemon retries a
   busy endpoint for 5 s so a reinstall can replace a daemon that is still
   shutting down.
-- **Ledger** (`ledger.json` + append-only `seen.bin`): totals only grow;
-  tokens counted once per `message.id`, prompts once per `uuid`, globally.
-  `seen.bin` is appended and synced before `ledger.json` is atomically
-  replaced; a crash between them (or a failing ledger write) undercounts
-  everything since the last successful ledger write, never double counts.
-  `seen.bin` is truncated to a multiple of 8 bytes on load and before
-  appending. Token arithmetic saturates. Bump `VERSION` in `src/ledger.rs` on incompatible changes.
+- **Ledger** (SQLite `ledger.db`): totals only grow; tokens counted once
+  per `message.id`, prompts once per `uuid`, globally. State lives in
+  memory; the database is only the durable store, opened per load/save and
+  closed afterwards (no idle handle). A save writes only changed rows (new
+  seen ids, totals, dirty days, dirty files, pruned files) in one
+  `BEGIN IMMEDIATE` transaction with `synchronous=FULL`, so ids, totals and
+  file offsets commit together: a crash or failed save loses nothing and
+  never double counts (dirty sets are cleared only after `COMMIT`). A db
+  that can't be loaded (busy, unreadable, a legacy file that can't be read;
+  only `NotFound` means "nothing there") is never written, nor is one that
+  appeared after a start without one; the daemon retries the load every
+  60 s. A corrupt db is moved to `ledger.db.corrupt`; a
+  `user_version` above ours is never written. A legacy `ledger.json` +
+  `seen.bin` is imported once (same transaction that sets `user_version`)
+  and renamed `*.bak`. u64s are stored bit-cast to i64. Token arithmetic
+  saturates. Bump `DB_VERSION` in `src/ledger.rs` on incompatible changes.
 - **Discord rate limit:** ≤ 4 `SET_ACTIVITY` per 20 s, ≥ 4 s apart; bursts
   coalesce to the latest state. All Discord I/O stays on its worker thread.
   On Windows it connects with `SECURITY_IDENTIFICATION` (no impersonation
@@ -103,14 +114,18 @@ checks and the ledger's crash rules is in
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-# Platform code you can't run locally must at least type-check:
+# Optional: type-check platform code you can't run locally. Bundled SQLite
+# compiles sqlite3.c even under clippy, so these need a C cross toolchain
+# (mingw `gcc` for windows-gnu; a cross `cc` + macOS SDK, e.g. zig or
+# osxcross, for darwin). Without one, skip them and rely on CI.
 rustup target add x86_64-pc-windows-gnu aarch64-apple-darwin
 cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings
 cargo clippy --target aarch64-apple-darwin  --all-targets -- -D warnings
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, test and a release build on
-Linux, macOS and Windows.
+Linux, macOS and Windows; its native clippy on each OS is the authoritative
+platform check. Say in the PR which platforms were only checked by CI.
 
 Manual end-to-end run: `CLAUDE_PRESENCE_LOG=debug cargo run -- daemon`, then
 pipe hook JSON into `cargo run -- hook UserPromptSubmit`. Keep socket paths
