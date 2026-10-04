@@ -100,29 +100,33 @@ fn stable_location(exe: &Path, service: bool) -> std::io::Result<PathBuf> {
         return Ok(exe.to_path_buf());
     }
     std::fs::create_dir_all(&dir)?;
-    let mut restart = false;
+    // With a service the service manager starts the new daemon; without one,
+    // restart whatever was running (a duplicate just exits "already running").
+    let restart = !service && ipc::daemon_running(&paths::hook_socket());
     if !service {
         for line in install::stop_daemons() {
             println!("  {line} (to replace its binary)");
-            restart = true;
         }
     }
     let names = [exe_name("claude-presence"), exe_name("claude-presenced")];
     install::remove_stale_old(&dir, &names);
     let src_dir = exe.parent().unwrap_or(Path::new("."));
-    for name in &names {
+    // A failed copy is rolled back, so the binary on disk is usable either
+    // way: restart before reporting the error.
+    let copied = names.iter().try_for_each(|name| {
         let src = src_dir.join(name);
-        if src.exists() {
-            install::replace_binary(&src, &dir.join(name))?;
-        }
+        if src.exists() { install::replace_binary(&src, &dir.join(name)) } else { Ok(()) }
+    });
+    if copied.is_ok() {
+        println!("  copied binaries to {}", dir.display());
     }
-    println!("  copied binaries to {}", dir.display());
     if restart {
         match install::spawn_detached(&dir.join(exe_name("claude-presenced"))) {
             Ok(()) => println!("  restarted the daemon"),
             Err(e) => eprintln!("  could not restart the daemon: {e}"),
         }
     }
+    copied?;
     Ok(dir.join(exe_name("claude-presence")))
 }
 

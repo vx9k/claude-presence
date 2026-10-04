@@ -984,9 +984,9 @@ mod tests {
             // (not the user, nor Wine's primary group).
             let owner = default_owner();
             let elevated = is_elevated();
-            // CI runners must actually run it (windows-latest is elevated);
+            // GitHub's runners must actually run it (windows-latest is elevated);
             // elsewhere the precondition may legitimately not hold.
-            let in_ci = ["GITHUB_ACTIONS", "CI"].iter().any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+            let in_ci = std::env::var_os("GITHUB_ACTIONS").is_some_and(|v| v == "true");
             assert!(
                 !in_ci || (elevated && owner == "S-1-5-32-544"),
                 "CI must run the OW negative control: elevated={elevated}, default owner {owner} (want S-1-5-32-544)"
