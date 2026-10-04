@@ -67,7 +67,7 @@ checks and the ledger's crash rules is in
   private dir shipped, a hook that finds nothing at today's path (`NotFound`
   / `ConnectionRefused`, never after a failed check) falls back to
   `paths::legacy_hook_socket()`, only if `lstat` shows a socket owned by
-  the euid. Windows: named pipe whose DACL grants only the current user's
+  the euid in a parent that passes the same parent check. Windows: named pipe whose DACL grants only the current user's
   SID (not `OW`, which breaks under elevation) and
   `FILE_FLAG_FIRST_PIPE_INSTANCE`; hook clients connect with
   `SECURITY_IDENTIFICATION` and write only if the pipe's owner is the
@@ -84,6 +84,9 @@ checks and the ledger's crash rules is in
   appending. Token arithmetic saturates. Bump `VERSION` in `src/ledger.rs` on incompatible changes.
 - **Discord rate limit:** ≤ 4 `SET_ACTIVITY` per 20 s, ≥ 4 s apart; bursts
   coalesce to the latest state. All Discord I/O stays on its worker thread.
+  On Windows it connects with `SECURITY_IDENTIFICATION` (no impersonation
+  by a fake Discord pipe), and a worker still blocked at shutdown has its
+  I/O cancelled (`CancelSynchronousIo`).
 - **`settings.json`:** only touch hook entries whose command contains
   `claude-presence` and ` hook `; preserve everything else and key order.
 - **Config:** every key optional (a partial `[status.*]` table falls back per

@@ -85,8 +85,12 @@ fn exe_name(base: &str) -> String {
 
 /// On Windows, binaries are often run from Downloads; copy them to the
 /// standard per-user programs folder so hooks keep working.
+///
+/// A running daemon holds its .exe open. With a service, `install` already
+/// stopped it (and starts the new one); with `service == false` stop it here
+/// and start the new binary detached, so it isn't left stopped.
 #[cfg(windows)]
-fn stable_location(exe: &Path) -> std::io::Result<PathBuf> {
+fn stable_location(exe: &Path, service: bool) -> std::io::Result<PathBuf> {
     let dir = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| paths::home().join("AppData").join("Local"))
@@ -96,10 +100,12 @@ fn stable_location(exe: &Path) -> std::io::Result<PathBuf> {
         return Ok(exe.to_path_buf());
     }
     std::fs::create_dir_all(&dir)?;
-    // A running daemon holds its .exe open. Stop it even with --no-service
-    // (with a service, `install` already did).
-    for line in install::stop_daemons() {
-        println!("  {line} (to replace its binary)");
+    let mut restart = false;
+    if !service {
+        for line in install::stop_daemons() {
+            println!("  {line} (to replace its binary)");
+            restart = true;
+        }
     }
     let names = [exe_name("claude-presence"), exe_name("claude-presenced")];
     install::remove_stale_old(&dir, &names);
@@ -111,11 +117,17 @@ fn stable_location(exe: &Path) -> std::io::Result<PathBuf> {
         }
     }
     println!("  copied binaries to {}", dir.display());
+    if restart {
+        match install::spawn_detached(&dir.join(exe_name("claude-presenced"))) {
+            Ok(()) => println!("  restarted the daemon"),
+            Err(e) => eprintln!("  could not restart the daemon: {e}"),
+        }
+    }
     Ok(dir.join(exe_name("claude-presence")))
 }
 
 #[cfg(not(windows))]
-fn stable_location(exe: &Path) -> std::io::Result<PathBuf> {
+fn stable_location(exe: &Path, _service: bool) -> std::io::Result<PathBuf> {
     Ok(exe.to_path_buf())
 }
 
@@ -160,7 +172,7 @@ fn install_cmd(args: &[String]) -> ExitCode {
             println!("  {line} (reinstalling)");
         }
     }
-    let exe = match stable_location(&exe) {
+    let exe = match stable_location(&exe, service) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("cannot copy binaries: {e}");

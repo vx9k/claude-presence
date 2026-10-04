@@ -19,6 +19,7 @@ pub const HOOK_EVENTS: &[&str] = &[
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
+    "PostToolUseFailure",
     "Notification",
     "PreCompact",
     "Stop",
@@ -631,21 +632,30 @@ fn old_path(dst: &Path) -> PathBuf {
     dst.with_file_name(name)
 }
 
-/// `replace_binary` with the copy as a closure.
+/// `replace_binary` with the copy as a closure. If the copy fails after
+/// `dst` was moved aside, it is moved back.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn replace_with(
+    src: &Path,
     dst: &Path,
     attempts: u32,
     delay: Duration,
     mut copy: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
+    // fs::copy errors don't say which side failed: a source we can't read
+    // must not be mistaken for a locked target and get it moved away.
+    drop(fs::File::open(src)?);
     match copy_with_retry(&mut copy, attempts, delay) {
         Err(e) if is_locked(&e) && dst.exists() => {
             let old = old_path(dst);
             let _ = fs::remove_file(&old);
             // A failed rename (say, an older `.old` still running) reports the original error.
             fs::rename(dst, &old).map_err(|_| e)?;
-            copy()
+            copy().inspect_err(|_| {
+                // Never leave the hooks without a binary.
+                let _ = fs::remove_file(dst);
+                let _ = fs::rename(&old, dst);
+            })
         }
         r => r,
     }
@@ -664,7 +674,7 @@ pub fn remove_stale_old(dir: &Path, names: &[String]) {
 /// (Windows lets a running `.exe` be renamed, not overwritten) and copy.
 #[cfg(windows)]
 pub fn replace_binary(src: &Path, dst: &Path) -> io::Result<()> {
-    replace_with(dst, 20, Duration::from_millis(250), || fs::copy(src, dst).map(|_| ()))
+    replace_with(src, dst, 20, Duration::from_millis(250), || fs::copy(src, dst).map(|_| ()))
 }
 
 /// Ask a running daemon (at today's address and the legacy one) to shut
@@ -802,6 +812,25 @@ mod tests {
     }
 
     #[test]
+    fn reinstall_adds_new_events_once() {
+        assert!(HOOK_EVENTS.contains(&"PostToolUseFailure"));
+        let exe = Path::new("/opt/bin/claude-presence");
+        // Settings wired by a version that didn't know PostToolUseFailure.
+        let mut old: Value = serde_json::from_str(&wire_hooks("", exe).unwrap()).unwrap();
+        old["hooks"].as_object_mut().unwrap().remove("PostToolUseFailure");
+        let v: Value = serde_json::from_str(&wire_hooks(&old.to_string(), exe).unwrap()).unwrap();
+        for ev in HOOK_EVENTS {
+            let groups = v["hooks"][*ev].as_array().unwrap();
+            let ours = groups.iter().flat_map(|g| g["hooks"].as_array().unwrap().iter()).filter(|h| is_ours(h)).count();
+            assert_eq!(ours, 1, "{ev}");
+        }
+        assert_eq!(
+            v["hooks"]["PostToolUseFailure"][0]["hooks"][0]["command"].as_str(),
+            Some("\"/opt/bin/claude-presence\" hook PostToolUseFailure")
+        );
+    }
+
+    #[test]
     fn copy_retries_only_while_locked() {
         let locked = || Err::<u32, _>(io::Error::from(io::ErrorKind::PermissionDenied));
         // Succeeds on the third try.
@@ -862,13 +891,15 @@ mod tests {
         let old = dir.join("bin.exe.old");
         assert_eq!(old_path(&dst), old);
         fs::write(&dst, "v1").unwrap();
+        let src = dir.join("new.exe");
+        fs::write(&src, "v2").unwrap();
         // Like a running .exe on Windows: can't be overwritten, can be renamed.
         let mut tries = 0;
         let copy = |tries: &mut u32| {
             *tries += 1;
             if dst.exists() { Err(io::Error::from(io::ErrorKind::PermissionDenied)) } else { fs::write(&dst, "v2") }
         };
-        replace_with(&dst, 3, Duration::ZERO, || copy(&mut tries)).unwrap();
+        replace_with(&src, &dst, 3, Duration::ZERO, || copy(&mut tries)).unwrap();
         assert_eq!(tries, 4, "three locked tries, then one after moving it aside");
         assert_eq!(fs::read_to_string(&dst).unwrap(), "v2");
         assert_eq!(fs::read_to_string(&old).unwrap(), "v1");
@@ -876,9 +907,35 @@ mod tests {
         remove_stale_old(&dir, &["bin.exe".into(), "other.exe".into()]);
         assert!(!old.exists() && dst.exists());
         // Other failures don't move anything.
-        let e = replace_with(&dst, 3, Duration::ZERO, || Err(io::Error::from(io::ErrorKind::NotFound))).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        let e = replace_with(&src, &dst, 3, Duration::ZERO, || Err(io::Error::from(io::ErrorKind::NotFound)));
+        assert_eq!(e.unwrap_err().kind(), io::ErrorKind::NotFound);
         assert!(!old.exists() && dst.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_replacement_keeps_the_old_binary() {
+        let dir = std::env::temp_dir().join(format!("cp-replace-fail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("bin.exe");
+        let src = dir.join("new.exe");
+        fs::write(&dst, "v1").unwrap();
+        fs::write(&src, "v2").unwrap();
+        // Locked, and the copy after moving it aside fails too (say, the
+        // source is locked by a scanner): hooks must still find a binary.
+        let e = replace_with(&src, &dst, 2, Duration::ZERO, || Err(io::Error::from(io::ErrorKind::PermissionDenied)));
+        assert_eq!(e.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "v1");
+        assert!(!old_path(&dst).exists());
+        // An unreadable source fails at once: no retries, nothing moved.
+        let mut tries = 0;
+        let e = replace_with(&dir.join("missing.exe"), &dst, 20, Duration::from_secs(1), || {
+            tries += 1;
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!((e.unwrap_err().kind(), tries), (io::ErrorKind::NotFound, 0));
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "v1");
         let _ = fs::remove_dir_all(&dir);
     }
 

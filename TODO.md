@@ -7,25 +7,24 @@ Work items are ordered by priority. Delete an entry once its fix is merged.
 ## Status
 
 - CI (fmt, clippy, test, release build on Linux/macOS/Windows) is green.
-  Unit tests: 81 on Linux, 77 on Windows (socket and POSIX permission tests
+  Unit tests: 84 on Linux, 81 on Windows (socket and POSIX permission tests
   are Unix-only; named pipe tests Windows-only).
 - **Verified on Windows by hand:** `install` (Task Scheduler), `status`, the
   hook named pipe, connecting to Discord and setting an activity (via a
   hand-fed `UserPromptSubmit` hook).
 - **Verified on Windows by tests** (CI, `windows-latest`, elevated): the pipe
   DACL read back, an elevated daemon accepting a non-elevated (restricted
-  token) hook and `OW` rejecting it (that negative control runs only when
-  the runner's default owner is Administrators; the test logs a skip),
+  token) hook and `OW` rejecting it (that negative control needs an
+  elevated process whose default owner is Administrators; when `CI` or
+  `GITHUB_ACTIONS` is set the test fails instead of skipping),
   the hook-side pipe-owner check,
   `ERROR_NO_DATA`, bind retry vs `FILE_FLAG_FIRST_PIPE_INSTANCE`, the
   `__shutdown` round trip, cancelling a Discord worker blocked in pipe I/O.
   Still by hand only: the locked-`.exe` copy during a real reinstall
   (`replace_binary`; its retry/rename logic is unit-tested).
-- Under Wine (see docs/development.md) all tests pass except two Wine
-  quirks: `counts_incrementally_and_dedups` (Wine reports ctime as the
-  creation time, so `file_ident` changes on append) and
-  `our_pipe_passes_the_owner_check` (Wine's default owner is its primary
-  group `S-1-5-21-0-0-0-513`).
+- Under Wine (see docs/development.md) all tests pass except three Wine
+  quirks: `counts_incrementally_and_dedups`,
+  `our_pipe_passes_the_owner_check` and `a_fake_discord_cannot_impersonate_us`.
 - **Not yet verified anywhere real:** a full local Claude Code session
   driving the card end-to-end on Windows/macOS; OpenRC and dinit services;
   launchd; the Run-key fallback.
@@ -40,9 +39,12 @@ Line numbers are approximate.
 
 ### Low / unverified
 
-12. **`PostToolUseFailure` is handled but never wired** (`src/daemon.rs`
-    vs `install::HOOK_EVENTS`). Either add it to `HOOK_EVENTS` (check the
-    event exists in current Claude Code first) or drop the handler.
+14. **Windows `file_ident` is the creation time** (`src/ledger.rs`). NTFS
+    file tunneling can carry a creation time over to a file recreated under
+    the same name within 15 s. Consider the volume serial + file index from
+    `GetFileInformationByHandle` instead. Needs the advisor: it changes the
+    idents stored in `ledger.json` (every file would be re-read once;
+    dedup prevents double counting, but per-file stats reset).
 
 ## Nice to have
 

@@ -89,13 +89,21 @@ pub fn send_hook(
     }
 }
 
-/// `send` to an older daemon's socket, if it is a socket owned by us.
+/// `send` to an older daemon's socket, if it is a socket owned by us in a
+/// directory where nobody else can swap it (`check_parent`).
 #[cfg(unix)]
 fn send_legacy(addr: &Path, msg: &[u8]) -> io::Result<()> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    let m = std::fs::symlink_metadata(addr)?;
     // SAFETY: geteuid never fails.
-    check_legacy(m.file_type().is_socket(), m.uid(), unsafe { libc::geteuid() })?;
+    let euid = unsafe { libc::geteuid() };
+    let parent = match addr.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let m = std::fs::metadata(parent)?;
+    check_parent(m.is_dir(), m.uid(), m.mode(), euid)?;
+    let m = std::fs::symlink_metadata(addr)?;
+    check_legacy(m.file_type().is_socket(), m.uid(), euid)?;
     send(addr, msg)
 }
 
@@ -775,11 +783,11 @@ mod tests {
         use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
         use windows_sys::Win32::Security::{
             ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation, CreateRestrictedToken, CreateWellKnownSid,
-            DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetSecurityDescriptorControl, GetTokenInformation,
-            ImpersonateLoggedOnUser, OWNER_SECURITY_INFORMATION, PSID, RevertToSelf, SE_DACL_PROTECTED,
-            SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY,
-            TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL, TOKEN_OWNER, TOKEN_QUERY,
-            TokenElevation, TokenIntegrityLevel, TokenOwner, WinBuiltinAdministratorsSid,
+            DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
+            GetTokenInformation, ImpersonateLoggedOnUser, OWNER_SECURITY_INFORMATION, PSID, RevertToSelf,
+            SE_DACL_PROTECTED, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
+            TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL,
+            TOKEN_OWNER, TOKEN_QUERY, TokenElevation, TokenIntegrityLevel, TokenOwner, WinBuiltinAdministratorsSid,
         };
         use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, READ_CONTROL};
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -801,31 +809,36 @@ mod tests {
             t
         }
 
-        /// Fixed-size token information `T` of class `class`.
-        fn token_info<T: Copy>(class: i32, buf: &mut [usize; 64]) -> T {
+        /// Read token information class `class` into `out`, `len` bytes.
+        /// Fixed-size classes (TokenElevation) insist on their exact size
+        /// (ERROR_BAD_LENGTH otherwise; Wine doesn't check); variable-size
+        /// ones (TokenOwner) take any buffer big enough.
+        fn read_token_info(class: i32, out: *mut std::ffi::c_void, len: u32) {
             let t = process_token(TOKEN_QUERY);
-            let mut len = 0u32;
-            // SAFETY: `buf` is writable for the given length; `t` is open.
-            let ok = unsafe {
-                GetTokenInformation(t, class, buf.as_mut_ptr().cast(), std::mem::size_of_val(buf) as u32, &mut len)
-            };
+            let mut got = 0u32;
+            // SAFETY: `out` is writable for `len` bytes (callers); `t` is open.
+            let ok = unsafe { GetTokenInformation(t, class, out, len, &mut got) };
+            let err = io::Error::last_os_error();
             // SAFETY: closing the token we opened.
             unsafe { CloseHandle(t) };
-            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
-            // SAFETY: on success `buf` starts with an initialized, aligned T.
-            unsafe { *buf.as_ptr().cast::<T>() }
+            assert_ne!(ok, 0, "token information class {class}: {err}");
         }
 
         fn is_elevated() -> bool {
-            token_info::<TOKEN_ELEVATION>(TokenElevation, &mut [0; 64]).TokenIsElevated != 0
+            let mut e = TOKEN_ELEVATION::default();
+            let len = std::mem::size_of::<TOKEN_ELEVATION>() as u32;
+            read_token_info(TokenElevation, (&mut e as *mut TOKEN_ELEVATION).cast(), len);
+            e.TokenIsElevated != 0
         }
 
         /// The owner new objects get: Administrators for an elevated admin.
         fn default_owner() -> String {
-            let mut buf = [0; 64];
-            let o = token_info::<TOKEN_OWNER>(TokenOwner, &mut buf);
-            // SAFETY: the owner SID points into `buf`, still alive.
-            unsafe { sid_string(o.Owner) }.unwrap()
+            // TOKEN_OWNER plus the SID it points into; usize keeps it aligned.
+            let mut buf = [0usize; 32];
+            read_token_info(TokenOwner, buf.as_mut_ptr().cast(), std::mem::size_of_val(&buf) as u32);
+            // SAFETY: on success `buf` starts with an initialized, aligned
+            // TOKEN_OWNER whose SID points into `buf`, still alive.
+            unsafe { sid_string((*buf.as_ptr().cast::<TOKEN_OWNER>()).Owner) }.unwrap()
         }
 
         /// Impersonates a token on this thread until dropped.
@@ -874,19 +887,18 @@ mod tests {
             let mut label = TOKEN_MANDATORY_LABEL::default();
             label.Label.Sid = sid;
             label.Label.Attributes = SE_GROUP_INTEGRITY;
+            // The documented length: the label plus the SID it points to.
+            // SAFETY: `sid` is a valid SID.
+            let len = std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 + unsafe { GetLengthSid(sid) };
             // SAFETY: `t` is a token we own with TOKEN_ADJUST_DEFAULT; `label`
             // and `sid` outlive the call.
             let ok = unsafe {
-                SetTokenInformation(
-                    t,
-                    TokenIntegrityLevel,
-                    (&label as *const TOKEN_MANDATORY_LABEL).cast(),
-                    std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32,
-                )
+                SetTokenInformation(t, TokenIntegrityLevel, (&label as *const TOKEN_MANDATORY_LABEL).cast(), len)
             };
+            let err = io::Error::last_os_error();
             // SAFETY: allocated by ConvertStringSidToSidW, freed once.
             unsafe { LocalFree(sid) };
-            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+            assert_ne!(ok, 0, "TokenIntegrityLevel: {err}");
             // SAFETY: `t` is a valid token; the guard reverts.
             let ok = unsafe { ImpersonateLoggedOnUser(t) };
             // SAFETY: the impersonation token is a copy; ours can go.
@@ -971,13 +983,23 @@ mod tests {
             // meaningful when new objects really are owned by Administrators
             // (not the user, nor Wine's primary group).
             let owner = default_owner();
-            if is_elevated() && owner == "S-1-5-32-544" {
+            let elevated = is_elevated();
+            // CI runners must actually run it (windows-latest is elevated);
+            // elsewhere the precondition may legitimately not hold.
+            let in_ci = ["GITHUB_ACTIONS", "CI"].iter().any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+            assert!(
+                !in_ci || (elevated && owner == "S-1-5-32-544"),
+                "CI must run the OW negative control: elevated={elevated}, default owner {owner} (want S-1-5-32-544)"
+            );
+            if elevated && owner == "S-1-5-32-544" {
                 let q = test_addr("elev-ow");
                 let _l = Listener::bind_sddl(&q, "D:P(A;;GA;;;OW)").unwrap();
                 let e = as_non_elevated(move || send(&q, b"Stop\n{}")).unwrap_err();
                 assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
             } else {
-                eprintln!("default owner {owner}, not elevated Administrators: skipping the OW negative control");
+                eprintln!(
+                    "elevated={elevated}, default owner {owner}, not elevated Administrators: skipping the OW negative control"
+                );
             }
         }
 
@@ -1139,6 +1161,17 @@ mod tests {
             std::fs::write(&file, "").unwrap();
             assert!(send_hook(&current, true, || Some(file.clone()), b"Stop\n{}").is_err());
             assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+            // Nor in a dir where others could swap it (world-writable, not sticky).
+            let ww = base.join("ww");
+            std::fs::create_dir(&ww).unwrap();
+            let ww_sock = ww.join("old.sock");
+            let rx_ww = serve(Listener::bind_with(&ww_sock, false).unwrap());
+            std::fs::set_permissions(&ww, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(send_hook(&current, true, || Some(ww_sock.clone()), b"Stop\n{}").is_err());
+            assert!(rx_ww.recv_timeout(Duration::from_millis(200)).is_err());
+            std::fs::set_permissions(&ww, std::fs::Permissions::from_mode(0o1777)).unwrap();
+            send_hook(&current, true, || Some(ww_sock.clone()), b"Stop\n{}").unwrap();
+            assert_eq!(rx_ww.recv().unwrap(), b"Stop\n{}");
 
             let _ = std::fs::remove_dir_all(&base);
         }

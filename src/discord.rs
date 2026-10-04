@@ -111,7 +111,11 @@ fn open(p: &std::path::Path) -> io::Result<Stream> {
     }
     #[cfg(windows)]
     {
-        std::fs::OpenOptions::new().read(true).write(true).open(p)
+        // Identification only (std adds SECURITY_SQOS_PRESENT): a fake
+        // Discord pipe server must not be able to impersonate the daemon.
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+        std::fs::OpenOptions::new().read(true).write(true).security_qos_flags(SECURITY_IDENTIFICATION).open(p)
     }
 }
 
@@ -623,18 +627,81 @@ mod tests {
         let mut client = open(std::path::Path::new(&name)).unwrap();
         let returned = Arc::new(AtomicBool::new(false));
         let r2 = returned.clone();
+        let (reading_tx, reading) = mpsc::channel();
         let p = Presenter::spawn_with(move |_| {
+            reading_tx.send(()).unwrap();
             // The worker's own read path (read_exact retries Interrupted).
             assert!(read_frame_from(&mut client, &mut Vec::new()).is_err());
             r2.store(true, Ordering::SeqCst);
         });
-        std::thread::sleep(Duration::from_millis(100));
+        // About to block; the cancel loop covers it not having started yet.
+        reading.recv().unwrap();
         let t = Instant::now();
         p.shutdown_within(Duration::from_millis(100));
         assert!(returned.load(Ordering::SeqCst), "worker left blocked in ReadFile");
         assert!(t.elapsed() < Duration::from_secs(2), "shutdown hung: {:?}", t.elapsed());
         // SAFETY: the server handle we created, closed once.
         unsafe { CloseHandle(server) };
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_fake_discord_cannot_impersonate_us() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, RevertToSelf, SecurityIdentification, TOKEN_QUERY, TokenImpersonationLevel,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{PIPE_ACCESS_DUPLEX, ReadFile};
+        use windows_sys::Win32::System::Pipes::{
+            CreateNamedPipeW, ImpersonateNamedPipeClient, PIPE_TYPE_BYTE, PIPE_WAIT,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+        let name = format!(r"\\.\pipe\cp-test-discord-imp-{}", std::process::id());
+        let wide: Vec<u16> = std::ffi::OsStr::new(&name).encode_wide().chain(Some(0)).collect();
+        // SAFETY: NUL-terminated name; default security; the handle is closed below.
+        let server = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096, // buffered, so the client's write doesn't wait for the read
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(server, INVALID_HANDLE_VALUE);
+        let mut client = open(std::path::Path::new(&name)).unwrap();
+        client.write_all(b"x").unwrap();
+        // The server must read before it may impersonate.
+        let (mut b, mut n) = ([0u8; 1], 0u32);
+        // SAFETY: valid buffer of the given length; `server` is open.
+        assert_ne!(unsafe { ReadFile(server, b.as_mut_ptr(), 1, &mut n, std::ptr::null_mut()) }, 0);
+        // SAFETY: `server` is a connected pipe we read from; reverted below.
+        assert_ne!(unsafe { ImpersonateNamedPipeClient(server) }, 0);
+        let mut tok: HANDLE = std::ptr::null_mut();
+        // SAFETY: pseudo-handle and a valid out-pointer; OpenAsSelf so an
+        // identification-level token can still be opened.
+        let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut tok) };
+        let mut level = 0i32;
+        let mut len = 0u32;
+        // SAFETY: `tok` is open when `opened`; `level` is writable for 4 bytes.
+        let ok = opened != 0
+            && unsafe {
+                GetTokenInformation(tok, TokenImpersonationLevel, (&mut level as *mut i32).cast(), 4, &mut len)
+            } != 0;
+        // SAFETY: ends the impersonation; closes handles we own, once.
+        unsafe {
+            RevertToSelf();
+            if opened != 0 {
+                CloseHandle(tok);
+            }
+            CloseHandle(server);
+        }
+        assert!(ok, "{}", io::Error::last_os_error());
+        assert_eq!(level, SecurityIdentification, "the server got more than identification");
     }
 
     /// Tests that need a real socket.
