@@ -470,9 +470,14 @@ impl Daemon {
             .unwrap_or_else(|| "Claude".into());
         let usage = fs.map(|f| f.usage).unwrap_or_default();
         // The transcript counts the whole conversation (resumed history
-        // included); the hook count covers prompts since we attached, which
-        // can be one ahead while the transcript catches up with the latest.
-        let prompts = fs.map_or(0, |f| f.prompts).max(s.prompts);
+        // included). The hooks also fire for custom slash commands, which it
+        // doesn't count, so a hook count ahead of it only adds the one prompt
+        // that may not be written yet, and only while that turn runs.
+        let in_turn = matches!(status, Status::Thinking | Status::Working);
+        let prompts = match fs {
+            Some(f) => f.prompts.saturating_add(u32::from(in_turn && s.prompts > f.prompts)),
+            None => s.prompts,
+        };
 
         let mut v = Vars::default();
         v.set("project", if hidden { self.cfg.hidden_project_name.clone() } else { name });
@@ -1045,6 +1050,27 @@ mod tests {
         // The second prompt is not written yet when its hook arrives.
         hook(&mut d, "UserPromptSubmit", "lag", &tp_field);
         assert_eq!(activity(&mut d)["state"].as_str(), Some("Claude · 2 prompts · 0 tokens"));
+        d.presenter.shutdown();
+        let _ = std::fs::remove_file(&tp);
+    }
+
+    #[test]
+    fn slash_command_hooks_do_not_inflate_prompts() {
+        // Custom slash commands fire UserPromptSubmit but are not real
+        // prompts in the transcript.
+        let mut d = daemon();
+        let real = r#"{"type":"user","timestamp":"2026-10-04T10:00:00Z","uuid":"sl1","message":{"content":"go"}}"#;
+        let cmd = r#"{"type":"user","timestamp":"2026-10-04T10:00:01Z","uuid":"slc","message":{"content":"<command-name>/x</command-name>"}}"#;
+        let (tp, tp_s) = transcript("slash", &format!("{real}\n{cmd}\n{cmd}\n{cmd}\n"));
+        let tp_field = format!(",\"transcript_path\":\"{tp_s}\"");
+        for _ in 0..4 {
+            hook(&mut d, "UserPromptSubmit", "sl", &tp_field);
+        }
+        // Mid-turn: at most the one prompt that may not be written yet.
+        assert_eq!(activity(&mut d)["state"].as_str(), Some("Claude · 2 prompts · 0 tokens"));
+        hook(&mut d, "Stop", "sl", &tp_field);
+        hook(&mut d, "Notification", "sl", &tp_field);
+        assert_eq!(activity(&mut d)["state"].as_str(), Some("Claude · 1 prompt"));
         d.presenter.shutdown();
         let _ = std::fs::remove_file(&tp);
     }

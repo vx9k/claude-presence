@@ -166,6 +166,15 @@ pub struct FileState {
     schema: u8,
     #[serde(default)]
     ident_v: u8,
+    /// End of the region already counted in the totals before a re-read
+    /// from 0; persisted so a re-read cut short by an I/O error doesn't
+    /// count it again when it resumes. 0 once the re-read has passed it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    counted_to: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 // ------------------------------------------------------------- id hashing --
@@ -297,6 +306,8 @@ struct Pending {
     day: i32,
     prompt: bool,
     fresh: bool,
+    /// Read from the region already counted before a re-read (`file_only`).
+    counted: bool,
 }
 
 /// Counters accumulated by one ingestion pass, merged into the ledger later.
@@ -404,8 +415,8 @@ struct Ctx<'a> {
     pending: Vec<Pending>,
     delta: &'a mut Delta,
     /// The line was already counted before the file was re-read: it marks no
-    /// minutes, and lines without an id (no dedup possible) only rebuild the
-    /// file's own view.
+    /// minutes and adds nothing to the totals or days, only to the file's own
+    /// view (its ids still go into the global set, healing a lost `seen.bin`).
     file_only: bool,
 }
 
@@ -461,8 +472,8 @@ fn process_line(line: &[u8], st: &mut FileState, cx: &mut Ctx<'_>) {
                     }
                     Seen::Counted => {
                         let g = Usage::growth(&e.usage, &u);
-                        if g.total() > 0 {
-                            st.usage.add(&g);
+                        st.usage.add(&g);
+                        if g.total() > 0 && !cx.file_only {
                             cx.delta.totals.usage.add(&g);
                             let d = cx.delta.day(day);
                             d.tokens = d.tokens.saturating_add(g.total());
@@ -478,7 +489,7 @@ fn process_line(line: &[u8], st: &mut FileState, cx: &mut Ctx<'_>) {
                 st.ring.remove(0);
             }
             st.ring.push(RingEntry { id: h, usage: u, seen: Seen::Pending(cx.pending.len() as u32) });
-            cx.pending.push(Pending { id: h, usage: u, day, prompt: false, fresh: false });
+            cx.pending.push(Pending { id: h, usage: u, day, prompt: false, fresh: false, counted: cx.file_only });
         }
         Some("user") => {
             let Some(content) = msg.content.as_ref() else {
@@ -494,6 +505,7 @@ fn process_line(line: &[u8], st: &mut FileState, cx: &mut Ctx<'_>) {
                     day,
                     prompt: true,
                     fresh: false,
+                    counted: cx.file_only,
                 }),
                 None => {
                     st.prompts += 1;
@@ -529,7 +541,9 @@ fn total_prompt(d: &mut Delta, day: i32) {
 }
 
 /// Settle pending ids against the global set: every one counts in this
-/// file's view, only the fresh ones in the totals.
+/// file's view, only the fresh ones in the totals, and not those read from
+/// an already counted region (fresh there means `seen.bin` lost them: they
+/// are only recorded again).
 fn settle(st: &mut FileState, cx: &mut Ctx<'_>, resolve: &mut dyn FnMut(&mut [Pending])) {
     if cx.pending.is_empty() {
         return;
@@ -543,6 +557,8 @@ fn settle(st: &mut FileState, cx: &mut Ctx<'_>, resolve: &mut dyn FnMut(&mut [Pe
         }
         if p.fresh {
             cx.delta.new_ids.push(p.id);
+        }
+        if p.fresh && !p.counted {
             if p.prompt {
                 total_prompt(cx.delta, p.day);
             } else {
@@ -572,19 +588,19 @@ fn ingest_file(
     let meta = file.metadata()?;
     let ident = file_ident(&file, &meta);
     // Replaced, truncated, or counted under older per-file rules: start over.
-    // Lines below the old offset are already in the totals; their ids are
-    // deduped globally, and lines without one only rebuild this file's view
-    // (undercounts if the content really is new, never double counts).
+    // Lines below the old offset are already in the totals: they only rebuild
+    // this file's view and record their ids (undercounts if the content
+    // really is new, never double counts, even with `seen.bin` lost).
     // An identity stored under an older `file_ident` rule can't be compared:
     // adopt today's unless the file shrank (then it was rewritten).
     let adopted = st.ident_v < IDENT_V && meta.len() >= st.offset;
     if adopted {
         (st.ident, st.ident_v) = (ident, IDENT_V);
     }
-    let mut reread_end = 0;
     if st.ident != ident || meta.len() < st.offset || st.schema < SCHEMA {
-        reread_end = st.offset;
-        *st = FileState { ident, schema: SCHEMA, ident_v: IDENT_V, ..FileState::default() };
+        // Persisted, so a re-read cut short by an error doesn't recount it.
+        let counted_to = st.counted_to.max(st.offset).min(meta.len());
+        *st = FileState { ident, schema: SCHEMA, ident_v: IDENT_V, counted_to, ..FileState::default() };
     }
     if meta.len() == st.offset {
         return Ok(adopted);
@@ -620,7 +636,7 @@ fn ingest_file(
         };
         let mut start = 0;
         for nl in memchr::memchr_iter(b'\n', &buf[..=last_nl]) {
-            cx.file_only = pos + (start as u64) < reread_end;
+            cx.file_only = pos + (start as u64) < st.counted_to;
             process_line(&buf[start..nl], st, &mut cx);
             start = nl + 1;
         }
@@ -629,6 +645,9 @@ fn ingest_file(
         buf.drain(..=last_nl);
     }
     st.offset = pos;
+    if st.offset >= st.counted_to {
+        st.counted_to = 0;
+    }
     Ok(true)
 }
 
@@ -723,15 +742,24 @@ impl Ledger {
                 l.totals = s.totals;
                 l.days = s.days.into_iter().collect();
                 l.files = s.files;
-                if let Ok(b) = fs::read(&l.seen_path) {
-                    if b.len() % 8 != 0 {
-                        // A torn append: drop the partial id so later appends stay aligned.
-                        if let Err(e) = realign_seen(&l.seen_path) {
-                            crate::warn!("{}: {e}", l.seen_path.display());
+                match fs::read(&l.seen_path) {
+                    Ok(b) => {
+                        if b.len() % 8 != 0 {
+                            // A torn append: drop the partial id so later appends stay aligned.
+                            if let Err(e) = realign_seen(&l.seen_path) {
+                                crate::warn!("{}: {e}", l.seen_path.display());
+                            }
                         }
+                        l.seen.reserve(b.len() / 8);
+                        l.seen.extend(b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())));
                     }
-                    l.seen.reserve(b.len() / 8);
-                    l.seen.extend(b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())));
+                    // The ids counted so far are unknown: a copy of them in a
+                    // new transcript counts again (re-reads of known files
+                    // don't, and record their ids again).
+                    Err(e) if !l.files.is_empty() => {
+                        crate::warn!("{}: {e}; previously counted ids are forgotten", l.seen_path.display())
+                    }
+                    Err(_) => {}
                 }
             }
             None => {
@@ -1179,14 +1207,23 @@ mod tests {
         l.ingest(&key);
         assert_eq!(l.totals.turns, 1);
         // (Shorter again, so the rewrite is noticed: same-inode rewrites are
-        // detected by length, transcripts being append-only.)
-        fs::write(&f, format!("{}\n", asst("m", "2026-10-04T10:00:00Z", 1, 1))).unwrap();
+        // detected by length, transcripts being append-only.) Lines below the
+        // old offset count as already counted: a new id there is undercounted
+        // (it could also be a known one that `seen.bin` lost).
+        let m = asst("m", "2026-10-04T10:00:00Z", 1, 1);
+        fs::write(&f, format!("{m}\n")).unwrap();
         l.ingest(&key);
-        assert_eq!(l.totals.turns, 2);
+        assert_eq!((l.totals.turns, l.file(&key).unwrap().turns), (1, 1));
+        append_bytes(&f, format!("{}\n", asst("m2", "2026-10-04T10:00:01Z", 1, 1)).as_bytes());
+        l.ingest(&key);
+        assert_eq!(l.totals.turns, 2, "content past the old offset counts");
         // Replaced by a different file (new inode / file id) of the same length.
         let tmp = dir.join("t.tmp");
-        fs::write(&tmp, format!("{}\n", asst("n", "2026-10-04T10:00:00Z", 1, 1))).unwrap();
+        fs::write(&tmp, format!("{m}\n{}\n", asst("n2", "2026-10-04T10:00:01Z", 1, 1))).unwrap();
         fs::rename(&tmp, &f).unwrap();
+        l.ingest(&key);
+        assert_eq!((l.totals.turns, l.file(&key).unwrap().turns), (2, 2));
+        append_bytes(&f, format!("{}\n", asst("n3", "2026-10-04T10:00:02Z", 1, 1)).as_bytes());
         l.ingest(&key);
         assert_eq!(l.totals.turns, 3);
         let _ = fs::remove_dir_all(&dir);
@@ -1578,6 +1615,62 @@ mod tests {
         append_bytes(&f, no_id_lines("2026-10-04T10:00:02Z").as_bytes());
         l.ingest(&key);
         assert_eq!((l.totals.prompts, l.totals.turns), (totals.prompts + 1, totals.turns + 1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interrupted_reread_resumes_without_recounting() {
+        // A re-read from 0 that stopped partway (a read error) leaves the
+        // offset below the region the totals already counted.
+        let first = asst("m1", "2026-10-04T10:00:00Z", 5, 5) + "\n";
+        let content = first.clone() + &no_id_lines("2026-10-04T10:00:01Z");
+        let (dir, f, key, mut l) = one_file("reread-cut", content.as_bytes());
+        l.ingest(&key);
+        let (totals, days) = (l.totals.clone(), l.days.clone());
+        let st = l.files.get_mut(&key).unwrap();
+        (st.offset, st.counted_to, st.prompts, st.turns) = (first.len() as u64, content.len() as u64, 0, 1);
+        assert!(l.ingest(&key));
+        assert_eq!((l.totals.clone(), l.days.clone()), (totals.clone(), days.clone()));
+        let st = l.file(&key).unwrap();
+        assert_eq!((st.prompts, st.turns, st.offset), (1, 2, content.len() as u64), "the file's view is rebuilt");
+        assert_eq!(st.counted_to, 0, "cleared once passed");
+        // Content appended afterwards counts normally.
+        append_bytes(&f, no_id_lines("2026-10-04T10:00:02Z").as_bytes());
+        l.ingest(&key);
+        assert_eq!((l.totals.prompts, l.totals.turns), (totals.prompts + 1, totals.turns + 1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reread_without_seen_bin_heals_it_without_recounting() {
+        // A long line between two lines of m1 puts them in separate reads, so
+        // the second one is usage growth on an already settled message.
+        let pad = format!(r#"{{"type":"x","pad":"{}"}}"#, "a".repeat(READ_CHUNK + 1024));
+        let content = [
+            user("p1", "2026-10-04T10:00:00Z", "hello"),
+            asst("m1", "2026-10-04T10:00:05Z", 100, 1),
+            pad,
+            asst("m1", "2026-10-04T10:00:06Z", 100, 50),
+        ]
+        .join("\n")
+            + "\n";
+        let (dir, _, key, mut l) = one_file("no-seen", content.as_bytes());
+        l.ingest(&key);
+        l.save().unwrap();
+        let (totals, days) = (l.totals.clone(), l.days.clone());
+        // seen.bin lost while ledger.json survived, then a schema migration.
+        fs::remove_file(dir.join("seen.bin")).unwrap();
+        let mut l = Ledger::load(dir.join("ledger.json"), dir.join("seen.bin"));
+        assert!(l.seen.is_empty());
+        l.files.get_mut(&key).unwrap().schema = 0;
+        assert!(l.ingest(&key));
+        assert_eq!(l.totals, totals, "already counted ids are not counted again");
+        assert_eq!(l.days, days);
+        assert!(l.seen.contains(&id_hash(b"m1")) && l.seen.contains(&id_hash(b"p1")));
+        assert_eq!(file_view(l.file(&key).unwrap()).0, 1);
+        assert_eq!(l.file(&key).unwrap().usage.output, 50);
+        l.save().unwrap();
+        assert_eq!(seen_len(&dir), 16, "seen.bin is rebuilt");
         let _ = fs::remove_dir_all(&dir);
     }
 

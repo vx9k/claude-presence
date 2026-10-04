@@ -94,7 +94,7 @@ Sessions are keyed by `session_id` (`"default"` if absent). A session is created
 
 Every event refreshes `last_activity`, `cwd` and `transcript_path`, then ingests the transcript.
 
-The card's `{prompts}` is the larger of the transcript's own count and the hook count. The transcript's count covers the whole conversation, including history that `--resume` copied into a new transcript (see [ledger.md](ledger.md#counting-rules)). The hook count covers prompts since the daemon first saw the session, and it can be one ahead while the latest prompt is not yet written.
+The card's `{prompts}` is the transcript's own count once the transcript is known, else the hook count. The transcript's count covers the whole conversation, including history that `--resume` copied into a new transcript (see [ledger.md](ledger.md#counting-rules)). While a turn runs (Thinking or Working) and the hook count is ahead of it, one is added for the prompt just submitted and not yet written. Never more than one: `UserPromptSubmit` also fires for custom slash commands, which the transcript does not count as prompts, so the hook count can drift ahead for good.
 
 ### Expiry
 

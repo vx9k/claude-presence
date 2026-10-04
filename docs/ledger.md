@@ -55,6 +55,7 @@ In the data dir (`claude-presence status` prints `stats:` path):
 | `model` | Latest assistant model id (ignores ids starting with `<`) |
 | `ring` | Up to 8 recent message-id entries `{id, usage, seen}`; `seen` is `"Counted"` (new to the global set), `"Dup"` (counted in another file) or `{"Pending": n}` |
 | `schema` | Per-file counting rules the stats were built with; currently `1`. Missing (older ledgers) means `0` |
+| `counted_to` | During a re-read from 0: the end of the region already counted in the totals (the old `offset`, at most the file's length). Persisted so a re-read cut short by a read error does not count that region again when it resumes. Omitted (`0`) once the re-read has passed it |
 
 Derived values (`Ledger::snapshot`): `total_time` is active minutes summed over all days; `today_*` use today's `Day`; `streak` counts consecutive active days ending today, or yesterday if today has no activity yet. A day is active if it has any turn, prompt or minute.
 
@@ -63,7 +64,7 @@ Derived values (`Ledger::snapshot`): `total_time` is active minutes summed over 
 Source: `<claude home>/projects/**/*.jsonl` (`$CLAUDE_CONFIG_DIR` or `~/.claude`).
 
 - Incremental: each file is opened, seeked to `offset`, and read in 1 MiB chunks. Only complete lines (up to the last `\n`) are consumed; a partial trailing line waits for the writer. A file with no newline is never consumed.
-- Re-reads: if `ident` differs (both computed with the current rule), the file is shorter than `offset`, or `schema` is older than the current one, that file's state resets and it is read again from 0. Lines before the old `offset` were already counted, so during the re-read they mark no active minutes (the UTC offset may have changed since, which would land them on other minutes or days) and lines without an id or uuid rebuild only the file's own stats. Lines with an id are deduped globally as usual. If the content really is new (a replaced file), its id-less lines and minutes below the old `offset` are undercounted, never double counted. Detection is best effort: a file rewritten in place to the same or a greater length, keeping its identity, is not noticed (transcripts are append-only).
+- Re-reads: if `ident` differs (both computed with the current rule), the file is shorter than `offset`, or `schema` is older than the current one, that file's state resets (keeping `counted_to`) and it is read again from 0. Lines before `counted_to` were already counted, so during the re-read they mark no active minutes (the UTC offset may have changed since, which would land them on other minutes or days) and add nothing to the totals or day counters, with or without an id: they rebuild only the file's own stats. Their ids and uuids still go into the global set, and those missing from it are appended to `seen.bin` on the next save, which heals a lost `seen.bin`. If the content really is new (a replaced file), everything below the old `offset` is undercounted, never double counted; lines past it count as usual. Detection is best effort: a file rewritten in place to the same or a greater length, keeping its identity, is not noticed (transcripts are append-only).
 - Identity rule migration: an `ident` stored under an older rule (`ident_v` below the current one; Windows moved from creation time to file id without a `VERSION` bump) can't be compared, so it is replaced by today's identity without a re-read, unless the file is shorter than `offset` (then it is re-read as above).
 - Schema migration: ledgers written before per-file stats counted copied history have no `schema`; each such file is re-read once as above, which rebuilds its `usage`/`prompts`/`turns` without changing totals or days. No `VERSION` bump.
 - Malformed lines (invalid JSON, wrong types, negative numbers) are skipped.
@@ -79,6 +80,8 @@ Source: `<claude home>/projects/**/*.jsonl` (`$CLAUDE_CONFIG_DIR` or `~/.claude`
 | Prompts | Type `user` lines with real text, once per `uuid` globally. Excluded: `isMeta`, `isCompactSummary`, tool results, and text starting with `<local-command`, `<command-`, `<system-reminder`, `<bash-`. A prompt with no `uuid` is counted every time. |
 | Active time | Gap between consecutive timestamps under 5 minutes marks every minute between them; otherwise only the record's own minute. Timestamps before 2020-01-01 or more than 48 h in the future are ignored for time (tokens still count). |
 | Resumed or copied history | The id is already in the global set, so the totals and days do not count it again. The new file's own `usage`/`prompts`/`turns` do count it, so a resumed conversation shows its full history on the card. Usage growth on such a message grows only the file's own `usage`. |
+
+Known per-file overcount: within one file, a message is recognized as the same message only while its id is among the file's last 8 (`ring`). If more than 8 other messages come between two lines of a message counted elsewhere, its later line counts as another turn with its full usage in that file's own stats (the card). The totals and days are unaffected: the global set still dedups it.
 
 Ids are stored as 64-bit hashes (FNV-1a with a splitmix finalizer) of the `message.id` or `uuid` string.
 
@@ -96,6 +99,7 @@ Ids are stored as 64-bit hashes (FNV-1a with a splitmix finalizer) of the `messa
 | Crash after step 2, before step 3 | Ids are marked seen but their counts were not saved. Everything since the last good `ledger.json` is undercounted, never double counted. Verified by the test `crash_between_seen_and_ledger_never_double_counts`. |
 | `ledger.json` write fails | `seen.bin` already has the ids and is not appended again; the ledger write retries on the next save. |
 | Torn append to `seen.bin` (size not a multiple of 8) | On load the partial id is truncated; if it happens while running, the next append truncates first. |
+| `seen.bin` missing or unreadable while `ledger.json` loads | Logged once at load if any file is tracked: `<seen.bin path>: <error>; previously counted ids are forgotten`. Known transcripts keep their offsets, and a re-read of one (e.g. a schema migration) re-records its ids without counting them again. A copy of forgotten history in a new transcript (`--resume`) counts again in the totals. |
 | Crash before step 2 | Transcript offsets in memory are lost; the next start reads from the saved offsets and recounts only what was not persisted. |
 
 ## Arithmetic
