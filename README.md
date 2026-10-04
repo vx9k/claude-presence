@@ -308,9 +308,16 @@ used.
 2. **Is the daemon running?** `claude-presence status` should say `daemon:   running`.
    If not, check its service (see [Background service](#background-service)) or re-run
    `claude-presence install`.
-3. **Are the hooks installed?** `~/.claude/settings.json` should contain commands ending
+3. **Is the session local?** Only Claude Code running on *this* computer can be shown:
+   the `claude` CLI, or a session in the desktop app's Code tab that uses your local
+   machine. Cloud sessions (claude.ai/code, or a cloud environment picked in the desktop
+   app) run their hooks on a remote container, so nothing reaches the daemon. Plain chat
+   in the Claude app has no hooks at all. Quick test that bypasses Claude Code:
+   `echo '{"session_id":"test","cwd":"/"}' | claude-presence hook UserPromptSubmit`
+   should make a card appear.
+4. **Are the hooks installed?** `~/.claude/settings.json` should contain commands ending
    in `hook SessionStart`, `hook PreToolUse`, etc. Restart Claude Code after installing.
-4. **Watch it live.** Stop the service first (only one daemon can run; a second one just
+5. **Watch it live.** Stop the service first (only one daemon can run; a second one just
    says *another claude-presence daemon is already running* and exits), then:
    ```sh
    CLAUDE_PRESENCE_LOG=debug claude-presence daemon
@@ -319,13 +326,13 @@ used.
    You should see `connected to Discord` once a Claude Code session is active
    (`Discord refused the handshake … (check client_id)` means a bad `client_id`).
    Press Ctrl+C to quit, then start the service again.
-5. **Log files.** Windows: `%LOCALAPPDATA%\claude-presence\daemon.log`.
+6. **Log files.** Windows: `%LOCALAPPDATA%\claude-presence\daemon.log`.
    macOS: `~/Library/Logs/claude-presence.log`. systemd: `journalctl --user -u claude-presence`.
    Levels via `CLAUDE_PRESENCE_LOG`: `error`, `warn`, `info` (default), `debug`.
-6. **Vesktop / arRPC.** Bridges are detected (log says `connected to Discord (arRPC bridge)`);
+7. **Vesktop / arRPC.** Bridges are detected (log says `connected to Discord (arRPC bridge)`);
    the card is re-sent more often because bridges drop it when they reload.
    The bridge must be running before the card can appear.
-7. **Card disappeared?** That's expected after `idle_timeout` seconds (default 900) with
+8. **Card disappeared?** That's expected after `idle_timeout` seconds (default 900) with
    no activity, or immediately when Claude Code exits. A session that is mid-task is kept
    for at least an hour. Set `idle_timeout = 0` to keep it until Claude Code exits.
 

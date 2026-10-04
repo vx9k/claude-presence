@@ -45,6 +45,9 @@ pub fn render(tpl: &str, vars: &Vars) -> (String, bool) {
             all_present &= !v.is_empty() && v != "0";
             text.push_str(v);
             rest = &after[close + 1..];
+            if v == "1" {
+                singularize(&mut text, &mut rest);
+            }
         }
         text.push_str(rest);
         let t = text.trim();
@@ -57,6 +60,19 @@ pub fn render(tpl: &str, vars: &Vars) -> (String, bool) {
         out.push_str(t);
     }
     (out, all_present)
+}
+
+/// After a `1`, turn a following plural word into its singular:
+/// `"{prompts} prompts"` renders `"1 prompt"`, not `"1 prompts"`.
+fn singularize(text: &mut String, rest: &mut &str) {
+    let Some(tail) = rest.strip_prefix(' ') else { return };
+    let len = tail.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(tail.len());
+    let word = &tail[..len];
+    if word.len() > 1 && word.ends_with('s') && !word.ends_with("ss") {
+        text.push(' ');
+        text.push_str(&word[..len - 1]);
+        *rest = &tail[len..];
+    }
 }
 
 /// Fit Discord's field limits: at most `max` bytes (cut on a char boundary,
@@ -154,6 +170,16 @@ mod tests {
         assert!(!ok);
         let (s, _) = render("{project} · {file} today · {streak} day streak", &vars());
         assert_eq!(s, "demo · 0 day streak");
+    }
+
+    #[test]
+    fn singular_after_one() {
+        let mut v = Vars::default();
+        v.set("n", "1");
+        v.set("m", "2");
+        assert_eq!(render("{n} prompts · {m} prompts", &v).0, "1 prompt · 2 prompts");
+        assert_eq!(render("{n} sessions, {n} day streak", &v).0, "1 session, 1 day streak");
+        assert_eq!(render("{n} class · {n}s", &v).0, "1 class · 1s");
     }
 
     #[test]
