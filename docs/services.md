@@ -134,13 +134,13 @@ Plist keys: `Label` = `io.github.vx9k.claude-presence`, `ProgramArguments` = the
 
 After the hooks step, `install` appends `%LOCALAPPDATA%\Programs\claude-presence` (written out as an absolute path) to your user `PATH`, the `Path` value under `HKCU\Environment`, so new terminals can run `claude-presence` directly. `--no-path` skips this. The machine-wide `PATH` (HKLM) is never touched.
 
-- Entries are compared trimmed, case-insensitively and ignoring a trailing `\` or `/`. If the folder is already there: `<folder> is already in your user PATH`, nothing is written.
-- Otherwise it is appended after one `;` (a trailing `;` on the old value doesn't produce an empty entry). The value keeps its type (`REG_SZ` or `REG_EXPAND_SZ`) and `%vars%` in it are kept unexpanded. A missing `Path` value is created as `REG_EXPAND_SZ`. Output: `added <folder> to your user PATH (restart open terminals to pick it up)`.
-- If the result would be longer than 2047 characters, nothing is written: `warning: not adding <folder> to your user PATH: it would exceed 2047 characters`.
+- Entries are compared trimmed, without surrounding double quotes, with `%vars%` expanded from the environment `install` runs in (so `%LOCALAPPDATA%\Programs\claude-presence` matches), case-insensitively and ignoring a trailing `\` or `/`. If the folder is already there: `<folder> is already in your user PATH`, nothing is written.
+- Otherwise it is appended after one `;` (a trailing `;` on the old value doesn't produce an empty entry). The value keeps its type (`REG_SZ` or `REG_EXPAND_SZ`) and every entry is written as it was, `%vars%` unexpanded. A missing `Path` value is created as `REG_EXPAND_SZ`. Output: `added <folder> to your user PATH (restart open terminals to pick it up)`.
+- If adding would make the value longer than 2047 characters, nothing is written: `warning: not adding <folder> to your user PATH: it would exceed 2047 characters`. Removals only shrink the value and are never refused.
 - Any other failure prints `could not update your user PATH: <error>`; install carries on.
-- After a write, `WM_SETTINGCHANGE` ("Environment") is broadcast so Explorer, and terminals started from it afterwards, see the new value. Terminals already open keep their old `PATH` until restarted.
+- After a write, `WM_SETTINGCHANGE` ("Environment") is broadcast (waiting at most 1 s per window, skipping hung ones) so Explorer, and terminals started from it afterwards, see the new value. Terminals already open keep their old `PATH` until restarted.
 
-`uninstall` removes only the entries naming that folder (same comparison) and leaves the rest of the value as it was: `removed <folder> from your user PATH (restart open terminals to pick it up)`, or nothing if it wasn't there.
+`uninstall` removes only the entries naming that folder (same comparison) and leaves the rest of the value as it was: `removed <folder> from your user PATH (restart open terminals to pick it up)`, or nothing if it wasn't there. If no entries are left (only `;` or blanks), the `Path` value is deleted instead of being written empty.
 
 The daemon is a GUI-subsystem binary (no console window). Its log lines are `<unix seconds> <level>: <message>`; the file is truncated at start when larger than 1 MiB.
 

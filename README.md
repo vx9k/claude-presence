@@ -39,10 +39,10 @@ hooks) and `claude-presenced` (the background daemon). `install` then:
    Events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
    `PostToolUseFailure`, `Notification`, `PreCompact`, `Stop`, `SubagentStop`, `SessionEnd`
    (a Claude Code version that doesn't know an event ignores it),
-3. registers and starts `claude-presenced` as a per-user background service
-   (see [Background service](#background-service)),
-4. on Windows, adds `%LOCALAPPDATA%\Programs\claude-presence` (where it copies the
-   binaries) to your user `PATH`, so new terminals can run `claude-presence`.
+3. on Windows, adds `%LOCALAPPDATA%\Programs\claude-presence` (where it copies the
+   binaries) to your user `PATH`, so new terminals can run `claude-presence`,
+4. registers and starts `claude-presenced` as a per-user background service
+   (see [Background service](#background-service)).
 
 It ends with `daemon is running` when everything worked. Then just use Claude Code.
 Check on it any time with `claude-presence status`. (Installing from `target/debug` prints a

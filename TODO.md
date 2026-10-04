@@ -7,7 +7,7 @@ Work items are ordered by priority. Delete an entry once its fix is merged.
 ## Status
 
 - CI (fmt, clippy, test, release build on Linux/macOS/Windows) is green.
-  Unit tests: 99 on Linux, 97 on Windows (socket and POSIX permission tests
+  Unit tests: 104 on Linux, 103 on Windows (socket and POSIX permission tests
   are Unix-only; named pipe tests Windows-only).
 - **Verified on Windows by hand:** `install` (Task Scheduler), `status`, the
   hook named pipe, connecting to Discord and setting an activity (via a
@@ -42,10 +42,18 @@ Line numbers are approximate.
 
 15. **Windows user `PATH` edit is only type-checked** (`src/install.rs`,
     `edit_user_path`, `broadcast_environment_change`). The string logic
-    (`add_path_entry`, `remove_path_entry`, the 2047-character limit) is
-    unit-tested; the `HKCU\Environment` read/write and the
-    `WM_SETTINGCHANGE` broadcast have not run against a real registry. To
-    verify by hand: `install` adds the folder once (re-run says "already in
-    your user PATH"), a new terminal finds `claude-presence`, the value
-    type (`REG_EXPAND_SZ`) and `%vars%` survive, `uninstall` removes only
-    that entry, `--no-path` leaves `Path` alone.
+    (`add_path_entry`, `remove_path_entry` with quote stripping and an
+    injected `%var%` expander, the growth-only 2047-character limit, the
+    empty-value check) and `expand_env` are unit-tested; the
+    `HKCU\Environment` read/write/delete and the `WM_SETTINGCHANGE`
+    broadcast have not run against a real registry. To verify by hand:
+    `install` adds the folder once (re-run says "already in your user
+    PATH", also when the entry is written as `%LOCALAPPDATA%\...` or
+    quoted), a new terminal finds `claude-presence`, the value type
+    (`REG_EXPAND_SZ`) and `%vars%` survive, `uninstall` removes only that
+    entry (and deletes `Path` if it was the only one), `--no-path` leaves
+    `Path` alone.
+16. **Windows `file_ident` fallback is only type-checked**
+    (`src/ledger.rs`): when `FileIdInfo` fails, the identity comes from
+    `GetFileInformationByHandle` (`fold_index`, unit-tested). Not run on a
+    file system without `FileIdInfo` (FAT, some network shares).

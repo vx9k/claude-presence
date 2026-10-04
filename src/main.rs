@@ -182,7 +182,12 @@ fn remove_install_dir_from_path() {
         Ok(install::PathEdit::Written) => {
             println!("removed {} from your user PATH (restart open terminals to pick it up)", dir.display())
         }
-        Ok(_) => {}
+        // Not there: nothing to say.
+        Ok(install::PathEdit::Unchanged) => {}
+        // Removals never grow the value, so this is not expected; say so anyway.
+        Ok(install::PathEdit::TooLong) => {
+            eprintln!("warning: {} was left in your user PATH (value too long to rewrite)", dir.display())
+        }
         Err(e) => eprintln!("could not update your user PATH: {e}"),
     }
 }

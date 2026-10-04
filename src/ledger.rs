@@ -31,6 +31,8 @@ use std::sync::Mutex;
 const VERSION: u32 = 1;
 /// `FileState::schema` of the current per-file counting rules.
 const SCHEMA: u8 = 1;
+/// `FileState::ident_v` of the current `file_ident` rule.
+const IDENT_V: u8 = 1;
 /// Gaps between consecutive records shorter than this count as active time.
 const ACTIVE_GAP_MS: i64 = 5 * MINUTE_MS;
 const READ_CHUNK: usize = 1 << 20;
@@ -162,6 +164,8 @@ pub struct FileState {
     /// `SCHEMA`); an older state is re-read once from the start.
     #[serde(default)]
     schema: u8,
+    #[serde(default)]
+    ident_v: u8,
 }
 
 // ------------------------------------------------------------- id hashing --
@@ -346,7 +350,9 @@ fn file_ident(_file: &File, meta: &fs::Metadata) -> u64 {
 #[cfg(windows)]
 fn file_ident(file: &File, _meta: &fs::Metadata) -> u64 {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    };
     // SAFETY: FILE_ID_INFO is plain data; all-zero is a valid value.
     let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
     // SAFETY: the handle is open for the lifetime of `file`, and the buffer is
@@ -359,10 +365,27 @@ fn file_ident(file: &File, _meta: &fs::Metadata) -> u64 {
             std::mem::size_of::<FILE_ID_INFO>() as u32,
         )
     };
-    if ok == 0 {
+    if ok != 0 {
+        return fold_ident(info.VolumeSerialNumber, info.FileId.Identifier);
+    }
+    // File systems without FileIdInfo (e.g. some FAT or network volumes):
+    // the 32-bit volume serial and 64-bit file index.
+    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain data; all-zero is valid.
+    let mut bh: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open for the lifetime of `file` and `bh` is a valid out pointer.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut bh) } == 0 {
         return 0;
     }
-    fold_ident(info.VolumeSerialNumber, info.FileId.Identifier)
+    fold_index(bh.dwVolumeSerialNumber, bh.nFileIndexHigh, bh.nFileIndexLow)
+}
+
+/// [`fold_ident`] of a 32-bit volume serial and a 64-bit file index, laid
+/// out as the 128-bit id NTFS reports for the same index (zero-extended).
+#[cfg(any(windows, test))]
+fn fold_index(vol: u32, high: u32, low: u32) -> u64 {
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&((u64::from(high) << 32) | u64::from(low)).to_le_bytes());
+    fold_ident(u64::from(vol), id)
 }
 
 /// Fold a volume serial and a 128-bit file id into a never-zero u64 (0 is
@@ -552,13 +575,19 @@ fn ingest_file(
     // Lines below the old offset are already in the totals; their ids are
     // deduped globally, and lines without one only rebuild this file's view
     // (undercounts if the content really is new, never double counts).
+    // An identity stored under an older `file_ident` rule can't be compared:
+    // adopt today's unless the file shrank (then it was rewritten).
+    let adopted = st.ident_v < IDENT_V && meta.len() >= st.offset;
+    if adopted {
+        (st.ident, st.ident_v) = (ident, IDENT_V);
+    }
     let mut reread_end = 0;
     if st.ident != ident || meta.len() < st.offset || st.schema < SCHEMA {
         reread_end = st.offset;
-        *st = FileState { ident, schema: SCHEMA, ..FileState::default() };
+        *st = FileState { ident, schema: SCHEMA, ident_v: IDENT_V, ..FileState::default() };
     }
     if meta.len() == st.offset {
-        return Ok(false);
+        return Ok(adopted);
     }
     file.seek(SeekFrom::Start(st.offset))?;
     buf.clear();
@@ -1316,10 +1345,20 @@ mod tests {
     }
 
     #[test]
+    fn fold_index_matches_the_zero_extended_file_id() {
+        let mut id = [0u8; 16];
+        id[..8].copy_from_slice(&0x0000_0002_0000_0001u64.to_le_bytes());
+        assert_eq!(fold_index(7, 2, 1), fold_ident(7, id));
+        assert_ne!(fold_index(7, 2, 1), fold_index(7, 1, 2), "high and low are not interchangeable");
+        assert_ne!(fold_index(7, 2, 1), fold_index(8, 2, 1));
+        assert_ne!(fold_index(0, 0, 0), 0);
+    }
+
+    #[test]
     fn ident_change_rereads_without_double_counting() {
-        // An upgrade that changes how identities are computed makes every
-        // stored ident mismatch once: the file is re-read from offset 0 and
-        // the global id dedup keeps the totals unchanged.
+        // A file replaced under the same name (a different identity under the
+        // current rule) is re-read from offset 0 and the global id dedup keeps
+        // the totals unchanged.
         let lines = [
             user("p1", "2026-10-04T10:00:00Z", "hello"),
             asst("m1", "2026-10-04T10:00:05Z", 100, 1),
@@ -1455,6 +1494,39 @@ mod tests {
         assert_eq!(l.days, days);
         // And only once.
         assert!(!l.ingest(&key));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_ident_rule_is_adopted_without_rereading() {
+        // An upgrade that changes how identities are computed (Windows:
+        // creation time → file id) must not re-read every transcript.
+        let content = asst("m1", "2026-10-04T23:30:00Z", 5, 5) + "\n" + &no_id_lines("2026-10-04T23:59:00Z");
+        let (dir, f, key, mut l) = one_file("ident-v", content.as_bytes());
+        let now = timeutil::parse_rfc3339_ms("2026-10-05T12:00:00Z").unwrap();
+        l.ingest_at(&key, 0, now);
+        assert_eq!(l.file(&key).unwrap().ident_v, IDENT_V, "new files start at the current rule");
+        let real = l.file(&key).unwrap().ident;
+        let (totals, days) = (l.totals.clone(), l.days.clone());
+        let st = l.files.get_mut(&key).unwrap();
+        (st.ident_v, st.ident, st.prompts) = (0, real ^ 0x5a5a, 77);
+        l.ingest_at(&key, 3600, now);
+        let st = l.file(&key).unwrap();
+        assert_eq!((st.ident, st.ident_v, st.offset), (real, IDENT_V, content.len() as u64));
+        assert_eq!(st.prompts, 77, "not re-read");
+        assert_eq!((l.totals.clone(), l.days.clone()), (totals.clone(), days.clone()));
+        // A current-rule mismatch still means a replaced file.
+        l.files.get_mut(&key).unwrap().ident ^= 0x5a5a;
+        assert!(l.ingest_at(&key, 3600, now));
+        assert_eq!(l.file(&key).unwrap().prompts, 1);
+        assert_eq!((l.totals.clone(), l.days.clone()), (totals.clone(), days.clone()));
+        // An old rule on a file that shrank: it was rewritten, so re-read.
+        let st = l.files.get_mut(&key).unwrap();
+        (st.ident_v, st.prompts) = (0, 77);
+        fs::write(&f, no_id_lines("2026-10-04T23:59:00Z")).unwrap();
+        assert!(l.ingest_at(&key, 3600, now));
+        assert_eq!((l.file(&key).unwrap().prompts, l.file(&key).unwrap().ident_v), (1, IDENT_V));
+        assert_eq!(l.totals, totals);
         let _ = fs::remove_dir_all(&dir);
     }
 
