@@ -69,33 +69,65 @@ pub fn claude_settings() -> PathBuf {
     claude_home().join("settings.json")
 }
 
-/// Per-user directory for sockets. On Linux this is where Discord puts its
-/// own IPC socket too; on macOS it's the per-user `$TMPDIR`.
+/// A per-user directory the OS already keeps private: the Darwin user temp
+/// dir, `$XDG_RUNTIME_DIR`, or `/run/user/<uid>`.
 #[cfg(unix)]
-pub fn runtime_dir() -> PathBuf {
+fn user_runtime_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         if let Some(p) = darwin_user_temp_dir() {
-            return p;
+            return Some(p);
         }
     }
     if let Some(p) = env_path("XDG_RUNTIME_DIR") {
-        return p;
+        return Some(p);
     }
     #[cfg(target_os = "linux")]
     {
         // SAFETY: getuid never fails.
         let p = PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }));
         if p.is_dir() {
-            return p;
+            return Some(p);
         }
     }
+    None
+}
+
+/// The temp dir, which may be shared with other users.
+#[cfg(unix)]
+fn tmp_dir() -> PathBuf {
     for key in ["TMPDIR", "TMP", "TEMP"] {
         if let Some(p) = env_path(key) {
             return p;
         }
     }
     PathBuf::from("/tmp")
+}
+
+/// Per-user directory for sockets. On Linux this is where Discord puts its
+/// own IPC socket too; on macOS it's the per-user `$TMPDIR`.
+#[cfg(unix)]
+pub fn runtime_dir() -> PathBuf {
+    user_runtime_dir().unwrap_or_else(tmp_dir)
+}
+
+/// `<tmp>/claude-presence-<uid>`: the hook socket's directory when the OS
+/// offers no private runtime dir. `None` when it does. The daemon creates
+/// this directory `0700` and refuses to start unless it is a real directory
+/// owned by it with no group/other access (see `ipc::ensure_private_dir`),
+/// so another user can't pre-create the socket in a shared `/tmp`.
+#[cfg(unix)]
+pub fn private_socket_dir() -> Option<PathBuf> {
+    match user_runtime_dir() {
+        Some(_) => None,
+        None => Some(private_dir()),
+    }
+}
+
+#[cfg(unix)]
+fn private_dir() -> PathBuf {
+    // SAFETY: getuid never fails.
+    tmp_dir().join(format!("{APP}-{}", unsafe { libc::getuid() }))
 }
 
 /// `confstr(_CS_DARWIN_USER_TEMP_DIR)`: the real per-user temp dir, which is
@@ -118,13 +150,18 @@ pub fn darwin_user_temp_dir() -> Option<PathBuf> {
 /// Address the daemon listens on for hook events.
 #[cfg(unix)]
 pub fn hook_socket() -> PathBuf {
-    let dir = runtime_dir();
-    if dir == std::path::Path::new("/tmp") {
-        // Shared /tmp: make the name per-user so users don't collide.
-        // SAFETY: getuid never fails.
-        return dir.join(format!("{APP}-{}.sock", unsafe { libc::getuid() }));
+    hook_endpoint().0
+}
+
+/// The hook socket, and whether it lies in `private_socket_dir()` (which a
+/// client must verify before connecting, see `ipc::send_to`).
+#[cfg(unix)]
+pub fn hook_endpoint() -> (PathBuf, bool) {
+    match user_runtime_dir() {
+        Some(dir) => (dir.join(format!("{APP}.sock")), false),
+        // Short name: AF_UNIX paths are limited to ~100 bytes.
+        None => (private_dir().join("hook.sock"), true),
     }
-    dir.join(format!("{APP}.sock"))
 }
 
 #[cfg(windows)]
@@ -133,4 +170,47 @@ pub fn hook_socket() -> PathBuf {
     let user: String =
         user.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
     PathBuf::from(format!(r"\\.\pipe\{APP}-{user}"))
+}
+
+/// Where versions before the private socket dir listened, if that differs
+/// from today's path: `install`/`uninstall` stop a daemon found there too.
+// TODO: remove a couple of releases after the private socket dir shipped.
+#[cfg(unix)]
+pub fn legacy_hook_socket() -> Option<PathBuf> {
+    match user_runtime_dir() {
+        Some(_) => None, // unchanged
+        // SAFETY: getuid never fails.
+        None => Some(legacy_socket_in(&tmp_dir(), unsafe { libc::getuid() })),
+    }
+}
+
+#[cfg(unix)]
+fn legacy_socket_in(tmp: &std::path::Path, uid: u32) -> PathBuf {
+    if tmp == std::path::Path::new("/tmp") {
+        tmp.join(format!("{APP}-{uid}.sock"))
+    } else {
+        tmp.join(format!("{APP}.sock"))
+    }
+}
+
+#[cfg(windows)]
+pub fn legacy_hook_socket() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(windows)]
+pub fn hook_endpoint() -> (PathBuf, bool) {
+    (hook_socket(), false)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn legacy_socket_names() {
+        assert_eq!(legacy_socket_in(Path::new("/tmp"), 1000), Path::new("/tmp/claude-presence-1000.sock"));
+        assert_eq!(legacy_socket_in(Path::new("/var/tmp/me"), 1000), Path::new("/var/tmp/me/claude-presence.sock"));
+    }
 }
