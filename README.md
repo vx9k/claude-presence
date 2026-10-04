@@ -10,7 +10,8 @@ Linux, macOS and Windows. **Full documentation: [docs/](docs/README.md).**
   Compacting / Idle*, current project, git-aware project name, tool + file, model,
   session tokens, elapsed time.
 - **Lifetime stats** (active time, tokens, prompts, sessions, streak) imported from your
-  existing transcripts and kept even after Claude Code deletes old ones.
+  existing transcripts and kept even after Claude Code deletes old ones, in one SQLite file
+  (`ledger.db`, see `claude-presence status` for the path).
 - **Small and fast**: ~3–4 MB RSS, no async runtime, no polling loop: near-zero CPU, it
   wakes only for hooks and timers. A hook invocation takes ~2 ms. JSON is parsed with SIMD
   ([sonic-rs](https://github.com/cloudwego/sonic-rs)), lines are split with SIMD
@@ -154,11 +155,16 @@ Symptom-by-symptom table, log lines explained, log file locations:
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | Components, data flow, threads and timers, session state machine |
 | [docs/ipc-and-security.md](docs/ipc-and-security.md) | Hook wire format, socket/pipe permissions, threat model, privacy |
-| [docs/ledger.md](docs/ledger.md) | Lifetime stats files, dedup rules, crash consistency |
+| [docs/ledger.md](docs/ledger.md) | Lifetime stats database, dedup rules, crash consistency, migration |
 | [docs/development.md](docs/development.md) | Build, checks, test-driven workflow, sub-agents, CI |
 
 For contributors and coding agents: [AGENTS.md](AGENTS.md), [CLAUDE.md](CLAUDE.md),
 [TODO.md](TODO.md). Build with `cargo build --release`; run `cargo test`.
+Commits follow [Conventional Commits](docs/development.md#commit-messages).
+
+## Security
+
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
 ## License
 

@@ -1,0 +1,15 @@
+# Bundled SQLite (rusqlite's `bundled` feature) is compiled with every
+# extension enabled; the ledger needs none of them. `-U` works because these
+# flags come after libsqlite3-sys's own `-D`s. The `-D`s are from SQLite's
+# recommended compile-time options. Saves ~650 KB per binary.
+# Only builds from this checkout read this file (`cargo build`, `cargo install
+# --path .`); `cargo install --git` does not, and gets the untrimmed (larger,
+# functionally identical) SQLite.
+[env]
+LIBSQLITE3_FLAGS = """\
+-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_FTS5 -USQLITE_ENABLE_RTREE \
+-USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_ENABLE_STAT4 -USQLITE_SOUNDEX -USQLITE_ENABLE_COLUMN_METADATA \
+-USQLITE_ENABLE_LOAD_EXTENSION -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_JSON \
+-DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_SHARED_CACHE \
+-DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_DQS=0\
+"""
