@@ -19,7 +19,7 @@ The service name is `claude-presence` everywhere; the process is `claude-presenc
 | `run-key` (alias `registry`) | Windows | value `claude-presence` in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | Windows runs it at logon | none | `%LOCALAPPDATA%\claude-presence\daemon.log` |
 | `none` | any | nothing | - | - | - |
 
-`--no-service` skips this step; `--no-hooks` skips the `settings.json` step.
+`--no-service` skips this step; `--no-hooks` skips the `settings.json` step; `--no-path` skips adding the install folder to the user `PATH` on Windows ([User PATH](#user-path-windows); accepted and ignored on other platforms).
 
 ### Auto-detection (when `--init` is not given)
 
@@ -39,6 +39,7 @@ From [TODO.md](../TODO.md); update both when this changes. You do not need to ve
 |---|---|
 | Windows Task Scheduler | `install`, `status`, hook pipe and Discord activity verified by hand on Windows. Windows CI verifies the pipe DACL, an elevated daemon accepting a non-elevated hook, the hook-side pipe owner check, `ERROR_NO_DATA` handling, the bind retry, the `__shutdown` round trip and cancelling a stuck Discord worker (see [development.md](development.md#ci)). A full local Claude Code session on Windows is not yet verified. |
 | Run key | not verified on a real system |
+| User `PATH` edit (Windows) | the `PATH` string logic is unit-tested; the registry read/write and the `WM_SETTINGCHANGE` broadcast are only type-checked (tests never touch the real registry) |
 | launchd | not verified on a real system (CI compiles and tests it; macOS clippy target type-checks) |
 | OpenRC | not verified on a real system |
 | dinit | not verified on a real system |
@@ -119,7 +120,7 @@ Plist keys: `Label` = `io.github.vx9k.claude-presence`, `ProgramArguments` = the
 
 ### Windows
 
-1. Install copies `claude-presence.exe` and `claude-presenced.exe` from where you ran them to `%LOCALAPPDATA%\Programs\claude-presence` (unless already there) and points hooks and the task at that copy, so you can delete the download. Only add that folder to `PATH` yourself if you want to type `claude-presence` anywhere (a PATH step is listed as nice-to-have in TODO.md). Windows will not overwrite a running `.exe`, so before copying:
+1. Install copies `claude-presence.exe` and `claude-presenced.exe` from where you ran them to `%LOCALAPPDATA%\Programs\claude-presence` (unless already there) and points hooks and the task at that copy, so you can delete the download. It also adds that folder to your user `PATH` (see [User PATH](#user-path-windows)). Windows will not overwrite a running `.exe`, so before copying:
    - A running daemon is stopped first. With the service step this is the `stopped the running daemon (reinstalling)` line. With `--no-service` the copy step stops it itself (`stopped the running daemon (to replace its binary)`), and after copying starts the new one detached (`restarted the daemon`; on failure `could not restart the daemon: <error>`), so `--no-service` never leaves you without a daemon.
    - Leftover `claude-presence.exe.old` and `claude-presenced.exe.old` from an earlier install are deleted (silently; one that is still in use stays until the next install).
    - If the copy fails because the file is still locked (access denied, sharing or lock violation), it is retried for up to 5 s (20 tries, 250 ms apart). If it is still locked, the old exe is renamed to `<name>.exe.old` (Windows allows renaming a running exe) and the new one copied in its place.
@@ -128,6 +129,18 @@ Plist keys: `Label` = `io.github.vx9k.claude-presence`, `ProgramArguments` = the
 2. Task XML (UTF-16, written to `%TEMP%\claude-presence-task.xml`, deleted after): logon trigger for your account, `InteractiveToken`, `LeastPrivilege`, `MultipleInstancesPolicy` `IgnoreNew`, runs on battery, no execution time limit (`PT0S`), hidden, `RestartOnFailure` `PT1M` x 999, action = the daemon exe.
 3. `schtasks /End /TN claude-presence` (quiet), `schtasks /Create /TN claude-presence /XML <file> /F`. If Create fails, it prints `Task Scheduler registration failed; using the Run registry key instead` and uses the Run key. On success it removes any old Run value, then `schtasks /Run /TN claude-presence` (or starts the daemon detached if that fails).
 4. Run key: `reg add HKCU\...\Run /v claude-presence /t REG_SZ /d "<exe>" /f`, then the daemon is started detached.
+
+### User PATH (Windows)
+
+After the hooks step, `install` appends `%LOCALAPPDATA%\Programs\claude-presence` (written out as an absolute path) to your user `PATH`, the `Path` value under `HKCU\Environment`, so new terminals can run `claude-presence` directly. `--no-path` skips this. The machine-wide `PATH` (HKLM) is never touched.
+
+- Entries are compared trimmed, without surrounding double quotes, with `%vars%` expanded from the environment `install` runs in (so `%LOCALAPPDATA%\Programs\claude-presence` matches), case-insensitively and ignoring a trailing `\` or `/`. If the folder is already there: `<folder> is already in your user PATH`, nothing is written.
+- Otherwise it is appended after one `;` (a trailing `;` on the old value doesn't produce an empty entry). The value keeps its type (`REG_SZ` or `REG_EXPAND_SZ`) and every entry is written as it was, `%vars%` unexpanded. A missing `Path` value is created as `REG_EXPAND_SZ`. Output: `added <folder> to your user PATH (restart open terminals to pick it up)`.
+- If adding would make the value longer than 2047 characters, nothing is written: `warning: not adding <folder> to your user PATH: it would exceed 2047 characters`. Removals only shrink the value and are never refused.
+- Any other failure prints `could not update your user PATH: <error>`; install carries on.
+- After a write, `WM_SETTINGCHANGE` ("Environment") is broadcast (waiting at most 1 s per window, skipping hung ones) so Explorer, and terminals started from it afterwards, see the new value. Terminals already open keep their old `PATH` until restarted.
+
+`uninstall` removes only the entries naming that folder (same comparison) and leaves the rest of the value as it was: `removed <folder> from your user PATH (restart open terminals to pick it up)`, or nothing if it wasn't there. If no entries are left (only `;` or blanks), the `Path` value is deleted instead of being written empty.
 
 The daemon is a GUI-subsystem binary (no console window). Its log lines are `<unix seconds> <level>: <message>`; the file is truncated at start when larger than 1 MiB.
 
@@ -160,6 +173,7 @@ Stop the daemon first (the manual steps below do not ask it to stop; `claude-pre
 | launchd | `launchctl bootout gui/$(id -u)/io.github.vx9k.claude-presence`; `rm ~/Library/LaunchAgents/io.github.vx9k.claude-presence.plist` |
 | Task Scheduler | `schtasks /End /TN claude-presence`; `schtasks /Delete /TN claude-presence /F` |
 | Run key | `reg delete HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v claude-presence /f`; `taskkill /IM claude-presenced.exe /F` |
+| User `PATH` (Windows) | Settings, "Edit environment variables for your account", `Path`: delete the `%LOCALAPPDATA%\Programs\claude-presence` entry |
 
 ## Extra platform notes
 
@@ -182,12 +196,13 @@ Re-running `claude-presence install` is safe. For the service step it:
 3. On Windows, copies the binaries (now replaceable because the old daemon exited; see [Windows](#windows) for retry, `.old` and rollback).
 4. Keeps an existing `config.toml` (`keeping existing config <path>`); otherwise writes the default.
 5. Rewrites the hooks (idempotent: our old entries are removed and all 10 current events are written, so events added by a newer version appear without duplicates; first run saves `settings.json.bak` next to `settings.json` if it did not exist). Output: `wired 10 hook events into <path>`.
-6. Writes the service file and starts the new binary.
-7. Waits up to 5 s (20 x 250 ms) for the daemon: `daemon is running`, or ``daemon not reachable yet — check `"<exe>" status` in a moment`` (em dash and backticks as printed).
+6. On Windows, adds the install folder to the user `PATH` unless already there or `--no-path` ([User PATH](#user-path-windows)).
+7. Writes the service file and starts the new binary.
+8. Waits up to 5 s (20 x 250 ms) for the daemon: `daemon is running`, or ``daemon not reachable yet — check `"<exe>" status` in a moment`` (em dash and backticks as printed).
 
 A daemon that starts while the old one is still shutting down retries binding for up to 5 s (`bind_waiting`) before logging `another claude-presence daemon is already running` and exiting 0.
 
-`--no-service` skips steps 2, 6 and 7. On Windows the binaries are still copied: the running daemon is stopped, the binaries replaced, and the daemon restarted detached (see [Windows](#windows)).
+`--no-service` skips steps 2, 7 and 8. On Windows the binaries are still copied: the running daemon is stopped, the binaries replaced, and the daemon restarted detached (see [Windows](#windows)).
 
 Legacy socket path: older versions listened at `<tmp>/claude-presence-<uid>.sock` (or `<tmp>/claude-presence.sock` when `<tmp>` is not `/tmp`) when no per-user runtime directory exists. Only in that case is the legacy path also asked to stop.
 
@@ -198,7 +213,7 @@ If you replace the binaries (`cargo install ...`) but do not re-run `install`, a
 ## Uninstall
 
 ```sh
-claude-presence uninstall           # hooks and service
+claude-presence uninstall           # hooks, service and (Windows) the PATH entry
 claude-presence uninstall --purge   # also config dir and data dir
 ```
 
@@ -208,7 +223,7 @@ Order: remove our hooks from `settings.json` (`removed hooks from <path>` or `no
 |---|---|
 | Linux | systemd: `systemctl --user disable --now`, delete unit, `daemon-reload`. OpenRC: `rc-service --user ... stop`, `rc-update --user del ... default`, delete script. dinit: `dinitctl disable`, `dinitctl stop`, delete file. XDG: delete `.desktop` file. (All four are checked regardless of which one you used.) |
 | macOS | `launchctl bootout gui/<uid>/io.github.vx9k.claude-presence`, delete the plist |
-| Windows | `schtasks /End` and `/Delete /F` for the task, delete the Run value |
+| Windows | `schtasks /End` and `/Delete /F` for the task, delete the Run value; then the install folder's entry in the user `PATH` ([User PATH](#user-path-windows)) |
 
 Each removed item prints `removed <path>` (or `removed scheduled task "claude-presence"` / `removed Run registry key`). Only hook entries whose command contains `claude-presence` and ` hook ` are removed from `settings.json`; everything else stays. `--purge` deletes the config dir and the data dir ([ledger.md](ledger.md) lists them). Binaries are never deleted: `cargo uninstall claude-presence`, and on Windows remove `%LOCALAPPDATA%\Programs\claude-presence`.
 

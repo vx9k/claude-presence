@@ -87,7 +87,7 @@ Wine is a fast signal only; Windows CI is authoritative. Known Wine-only failure
 
 | Test | Why it fails only under Wine |
 |---|---|
-| `ledger::tests::counts_incrementally_and_dedups` | Wine reports the Unix ctime as the creation time, so the Windows `file_ident` (creation time) changes on every append and the file is re-read from the start. NTFS creation times don't change on append. |
+| `ledger::tests::counts_incrementally_and_dedups` | Seen when the Windows `file_ident` was the creation time: Wine reports the Unix ctime as the creation time, so it changed on every append. `file_ident` now uses `FileIdInfo`; whether Wine reports a stable file id (and passes `windows_file_ident_survives_append_not_recreate`) has not been rechecked. |
 | `ipc::tests::windows::our_pipe_passes_the_owner_check` | Wine's token default owner is its primary group `S-1-5-21-0-0-0-513`, so pipes are owned by that group rather than the user or Administrators. |
 | `discord::tests::a_fake_discord_cannot_impersonate_us` | Wine hands a pipe server an impersonation-level token whatever impersonation level the client asked for (`SECURITY_IDENTIFICATION`). |
 

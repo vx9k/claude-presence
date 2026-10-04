@@ -39,7 +39,9 @@ hooks) and `claude-presenced` (the background daemon). `install` then:
    Events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
    `PostToolUseFailure`, `Notification`, `PreCompact`, `Stop`, `SubagentStop`, `SessionEnd`
    (a Claude Code version that doesn't know an event ignores it),
-3. registers and starts `claude-presenced` as a per-user background service
+3. on Windows, adds `%LOCALAPPDATA%\Programs\claude-presence` (where it copies the
+   binaries) to your user `PATH`, so new terminals can run `claude-presence`,
+4. registers and starts `claude-presenced` as a per-user background service
    (see [Background service](#background-service)).
 
 It ends with `daemon is running` when everything worked. Then just use Claude Code.
@@ -59,8 +61,8 @@ Details: [docs/services.md](docs/services.md#reinstall-and-upgrade).
 
 | Command | What it does |
 |---|---|
-| `claude-presence install [--init <kind>] [--no-service] [--no-hooks]` | Set everything up (see above) |
-| `claude-presence uninstall [--purge]` | Remove hooks and service; `--purge` also deletes config and lifetime stats |
+| `claude-presence install [--init <kind>] [--no-service] [--no-hooks] [--no-path]` | Set everything up (see above) |
+| `claude-presence uninstall [--purge]` | Remove hooks, service and (Windows) the `PATH` entry; `--purge` also deletes config and lifetime stats |
 | `claude-presence status` | Daemon state, file locations, today/lifetime stats. Exit code 3 if the daemon is not running |
 | `claude-presence daemon` | Run the daemon in the foreground (for debugging) |
 | `claude-presence config` | Print the config file path |
@@ -70,7 +72,8 @@ Details: [docs/services.md](docs/services.md#reinstall-and-upgrade).
 `--init` picks the service manager instead of auto-detecting it: `systemd`, `openrc`,
 `dinit`, `xdg-autostart` (also `xdg`, `autostart`), `launchd`, `schtasks` (also
 `task-scheduler`), `run-key` (also `registry`) or `none`. `--no-service` skips step 3,
-`--no-hooks` skips step 2.
+`--no-hooks` skips step 2, `--no-path` skips step 4 (accepted and ignored outside Windows).
+Details: [docs/services.md](docs/services.md#user-path-windows).
 
 ## Background service
 
@@ -95,7 +98,7 @@ verified on real systems: **[docs/services.md](docs/services.md)**.
 ## Uninstall
 
 ```sh
-claude-presence uninstall          # remove hooks + service (all flavors)
+claude-presence uninstall          # remove hooks + service (all flavors) + PATH entry
 claude-presence uninstall --purge  # also delete config and lifetime stats
 ```
 

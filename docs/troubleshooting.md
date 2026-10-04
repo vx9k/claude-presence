@@ -51,6 +51,7 @@ The hook command prints nothing and always exits 0, even when the daemon is down
 | Config edit has no effect | Not reloaded, or file failed to parse (`error: <path>: ...; using defaults`) | Send SIGHUP or restart ([configuration.md](configuration.md#applying-changes)); fix the syntax error; a wrong-typed value discards the whole file |
 | Warning `idle_timeout = N is below the minimum; using 60` | Value clamped | Use `0` or `60..=604800` |
 | Lifetime stats are zero or low | `scan_history = false`, transcripts deleted before first run, or the ledger was rebuilt (`warn: <path> unreadable; rebuilding stats`) | See [ledger.md](ledger.md). Look for `info: scanned N transcripts` in the log |
+| Warning `<path>/seen.bin: ...; previously counted ids are forgotten` | `seen.bin` deleted or unreadable while `ledger.json` survived | Totals stay; history a `--resume` copies into a new transcript may count again ([ledger.md](ledger.md#save-order-and-crash-consistency)). Deleting both files rebuilds cleanly |
 | `error: saving stats: ...` | Data dir not writable or disk full | Fix permissions; the save retries every 60 s while dirty |
 | `{project}` shows an unexpected name | It is the git root's directory name, else the cwd's name | Or the project matches `hidden_projects` |
 | Windows: hooks do nothing | Daemon not running, pipe busy, or the pipe is owned by someone other than you, Administrators or SYSTEM (hooks then send nothing) | `status`; read `%LOCALAPPDATA%\claude-presence\daemon.log` |
