@@ -50,9 +50,10 @@ In the data dir (`claude-presence status` prints `stats:` path):
 | `offset` | Bytes already consumed; always the end of a complete line |
 | `ident` | File identity: inode xor rotated device on Unix; on Windows a never-zero hash of the volume serial number and the 128-bit file id (`FileIdInfo`), not the creation time, which NTFS tunneling carries over to a file recreated under the same name. 0 if it can't be read |
 | `last_ts` | Latest valid timestamp seen (ms), for active-time gaps |
-| `usage`, `prompts`, `turns` | Totals attributed to this file |
+| `usage`, `prompts`, `turns` | The file's own view of its conversation (what the card shows): everything the file contains, including history a resumed session copied from another transcript. Not globally deduped, so they can add up to more than the totals |
 | `model` | Latest assistant model id (ignores ids starting with `<`) |
-| `ring` | Up to 8 recent message-id entries `{id, usage, seen}`; `seen` is `"Counted"`, `"Dup"` or `{"Pending": n}` |
+| `ring` | Up to 8 recent message-id entries `{id, usage, seen}`; `seen` is `"Counted"` (new to the global set), `"Dup"` (counted in another file) or `{"Pending": n}` |
+| `schema` | Per-file counting rules the stats were built with; currently `1`. Missing (older ledgers) means `0` |
 
 Derived values (`Ledger::snapshot`): `total_time` is active minutes summed over all days; `today_*` use today's `Day`; `streak` counts consecutive active days ending today, or yesterday if today has no activity yet. A day is active if it has any turn, prompt or minute.
 
@@ -61,7 +62,8 @@ Derived values (`Ledger::snapshot`): `total_time` is active minutes summed over 
 Source: `<claude home>/projects/**/*.jsonl` (`$CLAUDE_CONFIG_DIR` or `~/.claude`).
 
 - Incremental: each file is opened, seeked to `offset`, and read in 1 MiB chunks. Only complete lines (up to the last `\n`) are consumed; a partial trailing line waits for the writer. A file with no newline is never consumed.
-- Replaced files: if `ident` changed or the file is shorter than `offset`, that file's state resets and it is read again from 0 (global dedup keeps totals correct). The same happens once per file when an upgrade changes how `ident` is computed (Windows moved from creation time to file id without a `VERSION` bump): totals are unchanged, but that file's own `usage`/`prompts`/`turns` restart from what is still new to the global set.
+- Re-reads: if `ident` changed, the file is shorter than `offset`, or `schema` is older than the current one, that file's state resets and it is read again from 0. Lines before the old `offset` were already counted, so during the re-read they mark no active minutes (the UTC offset may have changed since, which would land them on other minutes or days) and lines without an id or uuid rebuild only the file's own stats. Lines with an id are deduped globally as usual. If the content really is new (a replaced file), its id-less lines and minutes below the old `offset` are undercounted, never double counted. An upgrade that changes how `ident` is computed (Windows moved from creation time to file id without a `VERSION` bump) triggers this once per file.
+- Schema migration: ledgers written before per-file stats counted copied history have no `schema`; each such file is re-read once as above, which rebuilds its `usage`/`prompts`/`turns` without changing totals or days. No `VERSION` bump.
 - Malformed lines (invalid JSON, wrong types, negative numbers) are skipped.
 - Live sessions: `ingest(key)` on each hook and every 5 s while the displayed session is active. Background `scan` of everything at startup (if `scan_history`) and every `rescan_interval` seconds; scan uses up to 8 threads when there are 32 or more files.
 - `scan` forgets files that no longer exist (`pruned`); their totals stay.
@@ -74,7 +76,7 @@ Source: `<claude home>/projects/**/*.jsonl` (`$CLAUDE_CONFIG_DIR` or `~/.claude`
 | Messages with no `id` | Counted every time (no dedup possible). |
 | Prompts | Type `user` lines with real text, once per `uuid` globally. Excluded: `isMeta`, `isCompactSummary`, tool results, and text starting with `<local-command`, `<command-`, `<system-reminder`, `<bash-`. A prompt with no `uuid` is counted every time. |
 | Active time | Gap between consecutive timestamps under 5 minutes marks every minute between them; otherwise only the record's own minute. Timestamps before 2020-01-01 or more than 48 h in the future are ignored for time (tokens still count). |
-| Resumed or copied history | The id is already in the global set, so it is not counted again. |
+| Resumed or copied history | The id is already in the global set, so the totals and days do not count it again. The new file's own `usage`/`prompts`/`turns` do count it, so a resumed conversation shows its full history on the card. Usage growth on such a message grows only the file's own `usage`. |
 
 Ids are stored as 64-bit hashes (FNV-1a with a splitmix finalizer) of the `message.id` or `uuid` string.
 

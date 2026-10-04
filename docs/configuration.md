@@ -105,7 +105,7 @@ Missing keys fall back per key to that status's built-in default from the tables
 | | `{tokens}` | Session total tokens (input + output + cache read + cache write), compact (`12.3k`) |
 | | `{tokens_in}` | input + cache read + cache write |
 | | `{tokens_out}` | output |
-| | `{prompts}` | Session prompts (from the transcript, else counted from hooks) |
+| | `{prompts}` | Prompts in the conversation: the transcript's count (resumed history included), or the hooks' count if higher (a prompt just submitted and not yet written) |
 | | `{tools}` | Tool calls this session (from hooks) |
 | | `{session_time}` | Time since session start (`3h 12m`) |
 | | `{status}` | `Idle`, `Thinking`, `Working`, `Compacting` or `Waiting for input` |

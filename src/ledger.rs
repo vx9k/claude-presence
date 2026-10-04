@@ -10,7 +10,8 @@
 //! * Claude Code writes one line per content block and repeats the message's
 //!   `usage` on each, so tokens are counted once per `message.id`.
 //! * Resumed/forked sessions can copy history into a new file; a global set
-//!   of seen message ids (and prompt uuids) keeps those from double counting.
+//!   of seen message ids (and prompt uuids) keeps those from double counting
+//!   in the totals, while each file's own stats count all it contains.
 //! * Active time is stored as a per-day bitmap of active minutes, so parallel
 //!   sessions and copied history can't inflate "hours on Claude".
 //! * Totals only ever grow: Claude Code deletes old transcripts after a while,
@@ -28,6 +29,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const VERSION: u32 = 1;
+/// `FileState::schema` of the current per-file counting rules.
+const SCHEMA: u8 = 1;
 /// Gaps between consecutive records shorter than this count as active time.
 const ACTIVE_GAP_MS: i64 = 5 * MINUTE_MS;
 const READ_CHUNK: usize = 1 << 20;
@@ -141,7 +144,9 @@ struct RingEntry {
     seen: Seen,
 }
 
-/// Per-transcript progress and totals.
+/// Per-transcript progress and the file's own view of its conversation:
+/// `usage`/`prompts`/`turns` count everything the file contains, including
+/// history copied from another transcript (which the totals count once).
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct FileState {
     pub offset: u64,
@@ -153,6 +158,10 @@ pub struct FileState {
     pub model: Option<String>,
     #[serde(default)]
     ring: Vec<RingEntry>,
+    /// Counting rules the per-file stats were built with (0: before
+    /// `SCHEMA`); an older state is re-read once from the start.
+    #[serde(default)]
+    schema: u8,
 }
 
 // ------------------------------------------------------------- id hashing --
@@ -371,6 +380,10 @@ struct Ctx<'a> {
     now: i64,
     pending: Vec<Pending>,
     delta: &'a mut Delta,
+    /// The line was already counted before the file was re-read: it marks no
+    /// minutes, and lines without an id (no dedup possible) only rebuild the
+    /// file's own view.
+    file_only: bool,
 }
 
 fn process_line(line: &[u8], st: &mut FileState, cx: &mut Ctx<'_>) {
@@ -386,10 +399,11 @@ fn process_line(line: &[u8], st: &mut FileState, cx: &mut Ctx<'_>) {
         .and_then(timeutil::parse_rfc3339_ms)
         .filter(|&t| t >= TS_FLOOR_MS && t <= cx.now + TS_SKEW_MS);
     if let Some(t) = ts {
-        if st.last_ts > 0 && t >= st.last_ts && t - st.last_ts < ACTIVE_GAP_MS {
-            cx.delta.mark_span(st.last_ts, t, cx.off);
-        } else {
-            cx.delta.mark_span(t, t, cx.off);
+        // A re-read line's minutes are already marked, possibly under another
+        // UTC offset: marking them again could add minutes or even days.
+        let from = if st.last_ts > 0 && t >= st.last_ts && t - st.last_ts < ACTIVE_GAP_MS { st.last_ts } else { t };
+        if !cx.file_only {
+            cx.delta.mark_span(from, t, cx.off);
         }
         st.last_ts = st.last_ts.max(t);
     }
@@ -409,7 +423,10 @@ fn process_line(line: &[u8], st: &mut FileState, cx: &mut Ctx<'_>) {
             };
             let u = raw.usage();
             let Some(id) = msg.id.as_deref() else {
-                count_turn(st, cx.delta, &u, day);
+                file_turn(st, &u);
+                if !cx.file_only {
+                    total_turn(cx.delta, &u, day);
+                }
                 return;
             };
             let h = id_hash(id.as_bytes());
@@ -428,7 +445,8 @@ fn process_line(line: &[u8], st: &mut FileState, cx: &mut Ctx<'_>) {
                             d.tokens = d.tokens.saturating_add(g.total());
                         }
                     }
-                    Seen::Dup => {}
+                    // Counted in another file: only this file's view grows.
+                    Seen::Dup => st.usage.add(&Usage::growth(&e.usage, &u)),
                 }
                 e.usage = e.usage.max(&u);
                 return;
@@ -454,16 +472,26 @@ fn process_line(line: &[u8], st: &mut FileState, cx: &mut Ctx<'_>) {
                     prompt: true,
                     fresh: false,
                 }),
-                None => count_prompt(st, cx.delta, day),
+                None => {
+                    st.prompts += 1;
+                    if !cx.file_only {
+                        total_prompt(cx.delta, day);
+                    }
+                }
             }
         }
         _ => {}
     }
 }
 
-fn count_turn(st: &mut FileState, d: &mut Delta, u: &Usage, day: i32) {
+/// A turn in this file's own view (copied history included).
+fn file_turn(st: &mut FileState, u: &Usage) {
     st.usage.add(u);
     st.turns += 1;
+}
+
+/// A turn in the lifetime and per-day counters.
+fn total_turn(d: &mut Delta, u: &Usage, day: i32) {
     d.totals.usage.add(u);
     d.totals.turns += 1;
     let day = d.day(day);
@@ -471,25 +499,31 @@ fn count_turn(st: &mut FileState, d: &mut Delta, u: &Usage, day: i32) {
     day.turns += 1;
 }
 
-fn count_prompt(st: &mut FileState, d: &mut Delta, day: i32) {
-    st.prompts += 1;
+/// A prompt in the lifetime and per-day counters.
+fn total_prompt(d: &mut Delta, day: i32) {
     d.totals.prompts += 1;
     d.day(day).prompts += 1;
 }
 
-/// Settle pending ids against the global set and count the fresh ones.
+/// Settle pending ids against the global set: every one counts in this
+/// file's view, only the fresh ones in the totals.
 fn settle(st: &mut FileState, cx: &mut Ctx<'_>, resolve: &mut dyn FnMut(&mut [Pending])) {
     if cx.pending.is_empty() {
         return;
     }
     resolve(&mut cx.pending);
     for p in &cx.pending {
+        if p.prompt {
+            st.prompts += 1;
+        } else {
+            file_turn(st, &p.usage);
+        }
         if p.fresh {
             cx.delta.new_ids.push(p.id);
             if p.prompt {
-                count_prompt(st, cx.delta, p.day);
+                total_prompt(cx.delta, p.day);
             } else {
-                count_turn(st, cx.delta, &p.usage, p.day);
+                total_turn(cx.delta, &p.usage, p.day);
             }
         }
         if !p.prompt {
@@ -514,8 +548,14 @@ fn ingest_file(
     let mut file = File::open(path)?;
     let meta = file.metadata()?;
     let ident = file_ident(&file, &meta);
-    if st.ident != ident || meta.len() < st.offset {
-        *st = FileState { ident, ..FileState::default() };
+    // Replaced, truncated, or counted under older per-file rules: start over.
+    // Lines below the old offset are already in the totals; their ids are
+    // deduped globally, and lines without one only rebuild this file's view
+    // (undercounts if the content really is new, never double counts).
+    let mut reread_end = 0;
+    if st.ident != ident || meta.len() < st.offset || st.schema < SCHEMA {
+        reread_end = st.offset;
+        *st = FileState { ident, schema: SCHEMA, ..FileState::default() };
     }
     if meta.len() == st.offset {
         return Ok(false);
@@ -523,7 +563,7 @@ fn ingest_file(
     file.seek(SeekFrom::Start(st.offset))?;
     buf.clear();
     let mut pos = st.offset;
-    let mut cx = Ctx { off, now, pending: Vec::new(), delta };
+    let mut cx = Ctx { off, now, pending: Vec::new(), delta, file_only: false };
     loop {
         let filled = buf.len();
         buf.resize(filled + READ_CHUNK, 0);
@@ -551,6 +591,7 @@ fn ingest_file(
         };
         let mut start = 0;
         for nl in memchr::memchr_iter(b'\n', &buf[..=last_nl]) {
+            cx.file_only = pos + (start as u64) < reread_end;
             process_line(&buf[start..nl], st, &mut cx);
             start = nl + 1;
         }
@@ -695,8 +736,10 @@ impl Ledger {
 
     /// Ingest one transcript incrementally (used for live sessions).
     pub fn ingest(&mut self, key: &str) -> bool {
-        let now = timeutil::now_ms();
-        let off = timeutil::local_offset_secs();
+        self.ingest_at(key, timeutil::local_offset_secs(), timeutil::now_ms())
+    }
+
+    fn ingest_at(&mut self, key: &str, off: i64, now: i64) -> bool {
         let mut delta = Delta::default();
         let is_new = !self.files.contains_key(key);
         let mut st = self.files.remove(key).unwrap_or_default();
@@ -1294,6 +1337,175 @@ mod tests {
         assert_eq!(l.file(&key).unwrap().offset, content.len() as u64);
         assert_eq!(l.totals, before);
         assert_eq!(l.days, days_before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A prompt with no `uuid` and a turn with no `message.id`: counted every
+    /// time they are read.
+    fn no_id_lines(ts: &str) -> String {
+        format!(
+            "{}\n{}\n",
+            r#"{"type":"user","timestamp":"TS","message":{"role":"user","content":"no uuid"}}"#.replace("TS", ts),
+            r#"{"type":"assistant","timestamp":"TS","message":{"usage":{"input_tokens":3,"output_tokens":4}}}"#
+                .replace("TS", ts)
+        )
+    }
+
+    fn file_view(st: &FileState) -> (u32, u32, Usage) {
+        (st.prompts, st.turns, st.usage)
+    }
+
+    #[test]
+    fn copied_history_counts_in_the_new_file_not_in_totals() {
+        // `claude --resume` writes a new transcript that copies the earlier
+        // conversation (same uuids and message ids).
+        let lines = [
+            user("p1", "2026-10-04T10:00:00Z", "hello"),
+            asst("m1", "2026-10-04T10:00:05Z", 100, 1),
+            asst("m1", "2026-10-04T10:00:06Z", 100, 50),
+            user("p2", "2026-10-04T10:01:00Z", "more"),
+            asst("m2", "2026-10-04T10:02:00Z", 200, 20),
+        ];
+        let content = lines.join("\n") + "\n";
+        let (dir, _, a, mut l) = one_file("copied", content.as_bytes());
+        l.ingest(&a);
+        let (totals, days) = (l.totals.clone(), l.days.clone());
+        let fb = dir.join("b.jsonl");
+        fs::write(&fb, &content).unwrap();
+        let b = key_for(&fb).unwrap();
+        l.ingest(&b);
+        assert_eq!(l.totals.usage, totals.usage);
+        assert_eq!((l.totals.prompts, l.totals.turns), (totals.prompts, totals.turns));
+        assert_eq!(l.days, days);
+        let view = file_view(l.file(&a).unwrap());
+        assert_eq!(view, (2, 2, Usage { input: 300, output: 70, cache_read: 20, cache_write: 10 }));
+        assert_eq!(file_view(l.file(&b).unwrap()), view, "the copy shows the conversation's own stats");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn known_id_streamed_again_counts_once_per_file() {
+        let (dir, _, a, mut l) =
+            one_file("stream-dup", format!("{}\n", asst("m1", "2026-10-04T10:00:00Z", 10, 50)).as_bytes());
+        l.ingest(&a);
+        let (totals, days) = (l.totals.clone(), l.days.clone());
+        // A second file streams the same message: partial usage, then final.
+        let fb = dir.join("b.jsonl");
+        fs::write(
+            &fb,
+            format!("{}\n{}\n", asst("m1", "2026-10-04T10:00:00Z", 10, 1), asst("m1", "2026-10-04T10:00:01Z", 10, 50)),
+        )
+        .unwrap();
+        let b = key_for(&fb).unwrap();
+        l.ingest(&b);
+        assert_eq!(file_view(l.file(&b).unwrap()), file_view(l.file(&a).unwrap()));
+        assert_eq!(l.file(&b).unwrap().turns, 1);
+        assert_eq!((l.totals.usage, l.totals.turns), (totals.usage, totals.turns));
+        // Usage growth on a message already counted in another file, across
+        // separate reads: the file's view grows, the totals don't.
+        let fc = dir.join("c.jsonl");
+        fs::write(&fc, format!("{}\n", asst("m1", "2026-10-04T10:00:00Z", 10, 1))).unwrap();
+        let c = key_for(&fc).unwrap();
+        l.ingest(&c);
+        assert_eq!(l.file(&c).unwrap().usage.output, 1);
+        append_bytes(&fc, format!("{}\n", asst("m1", "2026-10-04T10:00:01Z", 10, 50)).as_bytes());
+        l.ingest(&c);
+        assert_eq!(file_view(l.file(&c).unwrap()), file_view(l.file(&a).unwrap()));
+        assert_eq!((l.totals.usage, l.totals.turns), (totals.usage, totals.turns));
+        assert_eq!(l.days, days);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn known_prompt_counts_in_the_file_only() {
+        let p = user("p1", "2026-10-04T10:00:00Z", "hello");
+        let (dir, _, a, mut l) = one_file("known-prompt", format!("{p}\n").as_bytes());
+        l.ingest(&a);
+        let fb = dir.join("b.jsonl");
+        fs::write(&fb, format!("{p}\n")).unwrap();
+        let b = key_for(&fb).unwrap();
+        l.ingest(&b);
+        assert_eq!(l.file(&b).unwrap().prompts, 1);
+        assert_eq!(l.totals.prompts, 1);
+        assert_eq!(l.days.values().map(|d| d.prompts).sum::<u32>(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_schema_file_state_is_reread_once_for_its_own_view() {
+        // Before schema 1, a file's own stats only counted globally fresh ids.
+        let content = [user("p1", "2026-10-04T10:00:00Z", "hello"), asst("m1", "2026-10-04T10:00:05Z", 100, 50)]
+            .join("\n")
+            + "\n"
+            + &no_id_lines("2026-10-04T10:00:06Z");
+        let (dir, _, key, mut l) = one_file("schema", content.as_bytes());
+        l.ingest(&key);
+        assert_eq!(l.file(&key).unwrap().schema, SCHEMA, "new files start at the current schema");
+        let view = file_view(l.file(&key).unwrap());
+        assert_eq!((view.0, view.1), (2, 2));
+        let (totals, days) = (l.totals.clone(), l.days.clone());
+        // What an older daemon stored for a resumed copy: nothing of its own.
+        let st = l.files.get_mut(&key).unwrap();
+        (st.schema, st.prompts, st.turns, st.usage) = (0, 0, 0, Usage::default());
+        assert!(l.ingest(&key), "an old schema re-reads the file");
+        assert_eq!(file_view(l.file(&key).unwrap()), view);
+        assert_eq!(l.file(&key).unwrap().schema, SCHEMA);
+        assert_eq!(l.file(&key).unwrap().offset, content.len() as u64);
+        assert_eq!(l.totals, totals, "no-id lines are not counted again");
+        assert_eq!(l.days, days);
+        // And only once.
+        assert!(!l.ingest(&key));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reread_after_an_offset_change_keeps_days() {
+        // Minutes already marked under one UTC offset must not be marked
+        // again under another (DST, travel) when the file is re-read.
+        let content = [
+            user("p1", "2026-10-04T23:30:00Z", "hello"),
+            asst("m1", "2026-10-04T23:31:00Z", 5, 5),
+            asst("m2", "2026-10-04T23:58:00Z", 5, 5),
+        ]
+        .join("\n")
+            + "\n"
+            + &no_id_lines("2026-10-04T23:59:00Z");
+        let (dir, _, key, mut l) = one_file("reread-off", content.as_bytes());
+        let now = timeutil::parse_rfc3339_ms("2026-10-05T12:00:00Z").unwrap();
+        l.ingest_at(&key, 0, now);
+        let (totals, days) = (l.totals.clone(), l.days.clone());
+        let st = l.files.get_mut(&key).unwrap();
+        (st.schema, st.prompts, st.turns, st.usage) = (0, 0, 0, Usage::default());
+        assert!(l.ingest_at(&key, 3600, now));
+        assert_eq!(l.totals, totals);
+        assert_eq!(l.days, days, "no minutes, days or counters added by the re-read");
+        let view = file_view(l.file(&key).unwrap());
+        assert_eq!((view.0, view.1), (2, 3));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reread_of_a_known_file_does_not_recount_no_id_lines() {
+        let content = asst("m1", "2026-10-04T10:00:00Z", 5, 5) + "\n" + &no_id_lines("2026-10-04T10:00:01Z");
+        let (dir, f, key, mut l) = one_file("reread-noid", content.as_bytes());
+        l.ingest(&key);
+        let (totals, days) = (l.totals.clone(), l.days.clone());
+        assert_eq!((totals.prompts, totals.turns), (1, 2));
+        // Ident mismatch (e.g. how identities are computed changed).
+        l.files.get_mut(&key).unwrap().ident ^= 0x5a5a;
+        assert!(l.ingest(&key));
+        assert_eq!((l.totals.clone(), l.days.clone()), (totals.clone(), days.clone()));
+        assert_eq!(file_view(l.file(&key).unwrap()).1, 2, "the file's own view is rebuilt");
+        // Rewritten shorter: also re-read from 0 without recounting.
+        let shorter = no_id_lines("2026-10-04T10:00:01Z");
+        fs::write(&f, &shorter).unwrap();
+        assert!(l.ingest(&key));
+        assert_eq!(l.totals, totals);
+        assert_eq!((l.file(&key).unwrap().prompts, l.file(&key).unwrap().turns), (1, 1));
+        // New content appended afterwards counts normally.
+        append_bytes(&f, no_id_lines("2026-10-04T10:00:02Z").as_bytes());
+        l.ingest(&key);
+        assert_eq!((l.totals.prompts, l.totals.turns), (totals.prompts + 1, totals.turns + 1));
         let _ = fs::remove_dir_all(&dir);
     }
 

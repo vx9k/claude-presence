@@ -81,7 +81,8 @@ Sessions are keyed by `session_id` (`"default"` if absent). A session is created
 | Event | Resulting status | Other effects |
 |---|---|---|
 | `SessionStart` (source `compact`) | Thinking | keeps counters; records model hint |
-| `SessionStart` (other) | Idle | resets `started`, prompts, tools, tool, file; records model hint |
+| `SessionStart` (source `resume`) | Idle | keeps `started`, prompts and tools (same conversation); clears tool and file; records model hint |
+| `SessionStart` (other: `startup`, `clear`) | Idle | resets `started`, prompts, tools, tool, file; records model hint |
 | `UserPromptSubmit` | Thinking | prompts +1, clears tool and file |
 | `PreToolUse` | Working | tools +1, tool name (`mcp__a__b` shown as `a:b`), file from `file_path`, `notebook_path` or `path` |
 | `PostToolUse`, `PostToolUseFailure` | Working | |
@@ -92,6 +93,8 @@ Sessions are keyed by `session_id` (`"default"` if absent). A session is created
 | anything else (e.g. `SubagentStop`) | unchanged | liveness only; `SubagentStop` also ingests `<transcript dir>/<session id>/subagents/*.jsonl` |
 
 Every event refreshes `last_activity`, `cwd` and `transcript_path`, then ingests the transcript.
+
+The card's `{prompts}` is the larger of the transcript's own count and the hook count. The transcript's count covers the whole conversation, including history that `--resume` copied into a new transcript (see [ledger.md](ledger.md#counting-rules)). The hook count covers prompts since the daemon first saw the session, and it can be one ahead while the latest prompt is not yet written.
 
 ### Expiry
 

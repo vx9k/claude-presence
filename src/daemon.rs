@@ -264,12 +264,17 @@ impl Daemon {
         }
         match event.as_str() {
             "SessionStart" => {
-                if input.source.as_deref() == Some("compact") {
+                let source = input.source.as_deref();
+                if source == Some("compact") {
                     s.status = Status::Thinking;
                 } else {
-                    s.started = now;
-                    s.prompts = 0;
-                    s.tools = 0;
+                    // A resume continues the same conversation; startup and
+                    // clear begin a new one.
+                    if source != Some("resume") {
+                        s.started = now;
+                        s.prompts = 0;
+                        s.tools = 0;
+                    }
                     s.status = Status::Idle;
                     s.tool = None;
                     s.file = None;
@@ -464,7 +469,10 @@ impl Daemon {
             .map(pretty_model)
             .unwrap_or_else(|| "Claude".into());
         let usage = fs.map(|f| f.usage).unwrap_or_default();
-        let prompts = fs.map(|f| f.prompts).filter(|&p| p > 0).unwrap_or(s.prompts);
+        // The transcript counts the whole conversation (resumed history
+        // included); the hook count covers prompts since we attached, which
+        // can be one ahead while the transcript catches up with the latest.
+        let prompts = fs.map_or(0, |f| f.prompts).max(s.prompts);
 
         let mut v = Vars::default();
         v.set("project", if hidden { self.cfg.hidden_project_name.clone() } else { name });
@@ -990,6 +998,76 @@ mod tests {
         // The event name is the first line only; payload contents don't count.
         assert!(matches!(route(b"Stop\n{\"hook_event_name\":\"__shutdown\"}".to_vec()), Some(Msg::Hook(_))));
         assert!(matches!(route(b"Stop\n{}".to_vec()), Some(Msg::Hook(_))));
+    }
+
+    fn hook(d: &mut Daemon, name: &str, sid: &str, extra: &str) {
+        d.handle_hook(format!("{name}\n{{\"session_id\":\"{sid}\",\"cwd\":\"/p/{sid}\"{extra}}}").as_bytes());
+    }
+
+    #[test]
+    fn resumed_conversation_shows_its_history_prompts() {
+        use std::io::Write;
+        let mut d = daemon();
+        let prompt = |u: &str| {
+            format!(r#"{{"type":"user","timestamp":"2026-10-04T10:00:00Z","uuid":"{u}","message":{{"content":"go"}}}}"#)
+        };
+        let history = format!("{}\n{}\n", prompt("rp1"), prompt("rp2"));
+        // The original conversation, already in the ledger.
+        let (orig, _) = transcript("resume-orig", &history);
+        assert!(d.ledger.ingest(&ledger::key_for(&orig).unwrap()));
+        // `--resume` copies it into a new transcript.
+        let (tp, tp_s) = transcript("resume-copy", &history);
+        let tp_field = format!(",\"transcript_path\":\"{tp_s}\"");
+        hook(&mut d, "SessionStart", "rs", &format!(",\"source\":\"resume\"{tp_field}"));
+        hook(&mut d, "Notification", "rs", &tp_field);
+        assert_eq!(activity(&mut d)["state"].as_str(), Some("Claude · 2 prompts"));
+        hook(&mut d, "UserPromptSubmit", "rs", &tp_field);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&tp)
+            .unwrap()
+            .write_all((prompt("rp3") + "\n").as_bytes())
+            .unwrap();
+        hook(&mut d, "Notification", "rs", &tp_field);
+        assert_eq!(activity(&mut d)["state"].as_str(), Some("Claude · 3 prompts"));
+        d.presenter.shutdown();
+        let _ = std::fs::remove_file(&orig);
+        let _ = std::fs::remove_file(&tp);
+    }
+
+    #[test]
+    fn submitted_prompt_shows_before_the_transcript_has_it() {
+        let mut d = daemon();
+        let line = r#"{"type":"user","timestamp":"2026-10-04T10:00:00Z","uuid":"lag1","message":{"content":"go"}}"#;
+        let (tp, tp_s) = transcript("prompt-lag", &format!("{line}\n"));
+        let tp_field = format!(",\"transcript_path\":\"{tp_s}\"");
+        hook(&mut d, "UserPromptSubmit", "lag", &tp_field);
+        // The second prompt is not written yet when its hook arrives.
+        hook(&mut d, "UserPromptSubmit", "lag", &tp_field);
+        assert_eq!(activity(&mut d)["state"].as_str(), Some("Claude · 2 prompts · 0 tokens"));
+        d.presenter.shutdown();
+        let _ = std::fs::remove_file(&tp);
+    }
+
+    #[test]
+    fn resume_keeps_session_counters_startup_resets_them() {
+        let mut d = daemon();
+        hook(&mut d, "SessionStart", "k", r#","source":"startup""#);
+        hook(&mut d, "UserPromptSubmit", "k", "");
+        hook(&mut d, "PreToolUse", "k", r#","tool_name":"Bash""#);
+        let started = d.sessions["k"].started - 60_000;
+        d.sessions.get_mut("k").unwrap().started = started;
+        hook(&mut d, "SessionStart", "k", r#","source":"resume""#);
+        let s = &d.sessions["k"];
+        assert_eq!((s.started, s.prompts, s.tools, s.status), (started, 1, 1, Status::Idle));
+        hook(&mut d, "SessionStart", "k", r#","source":"clear""#);
+        let s = &d.sessions["k"];
+        assert!(s.started > started);
+        assert_eq!((s.prompts, s.tools), (0, 0));
+        hook(&mut d, "UserPromptSubmit", "k", "");
+        hook(&mut d, "SessionStart", "k", r#","source":"startup""#);
+        assert_eq!(d.sessions["k"].prompts, 0);
+        d.presenter.shutdown();
     }
 
     #[test]
