@@ -6,8 +6,9 @@ Work items are ordered by priority. Delete an entry once its fix is merged.
 
 ## Status
 
-- CI (fmt, clippy, test, release build on Linux/macOS/Windows) is green; the
-  unit tests (≈75) also run on Windows and macOS there.
+- CI (fmt, clippy, test, release build on Linux/macOS/Windows) is green.
+  Unit tests: 76 on Linux/macOS, about 65 on Windows (socket and POSIX
+  permission tests are Unix-only).
 - **Verified on Windows by hand:** `install` (Task Scheduler), `status`, the
   hook named pipe, connecting to Discord and setting an activity (via a
   hand-fed `UserPromptSubmit` hook).

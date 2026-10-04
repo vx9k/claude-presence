@@ -458,6 +458,8 @@ mod tests {
             "idle_timeout = \"900\"\n",
             "activity_type = 300\n",
             "buttons = [{ label = \"x\" }]\n",
+            "[status.idle]\ndetails = 1\n",
+            "[status.idle]\nrotation = \"x\"\n",
             "this is not toml",
         ] {
             assert_eq!(load_str("bad", bad), Config::default(), "{bad:?}");

@@ -107,7 +107,7 @@ Keep any other trailers your harness requires.
 
 ## CI
 
-`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests, on `ubuntu-latest`, `macos-latest` and `windows-latest` (not fail-fast): `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo build --release`. It uses the stable toolchain with clippy and rustfmt, and `Swatinem/rust-cache` (cache saved only on `main`). The cross clippy targets are not in CI; run them locally. Tests gated `cfg(unix)` (the socket tests in `src/ipc.rs` and `src/discord.rs`, and `stops_a_running_daemon` in `src/install.rs`) do not run on Windows, so the Windows pipe code has no automated runtime coverage. The whole `src/ipc.rs` test module is Unix-gated, including the `pipe_sddl` test, which therefore runs only on Linux and macOS.
+`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests, on `ubuntu-latest`, `macos-latest` and `windows-latest` (not fail-fast): `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo build --release`. It uses the stable toolchain with clippy and rustfmt, and `Swatinem/rust-cache` (cache saved only on `main`). The cross clippy targets are not in CI; run them locally. Each test module compiles on every platform; only tests that need a real Unix socket or POSIX permissions sit in an inner `#[cfg(unix)] mod unix` (or are gated per test, like `stops_a_running_daemon` in `src/install.rs`). Pure tests such as `pipe_sddl_grants_only_the_user`, `rejected_activity_is_not_kept_alive` and the presenter shutdown tests therefore also run on Windows CI, but the Windows pipe I/O itself has no automated runtime coverage. Put new pure tests in the outer module.
 
 ## Release build
 
