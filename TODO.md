@@ -57,3 +57,25 @@ Line numbers are approximate.
     (`src/ledger.rs`): when `FileIdInfo` fails, the identity comes from
     `GetFileInformationByHandle` (`fold_index`, unit-tested). Not run on a
     file system without `FileIdInfo` (FAT, some network shares).
+17. **`{prompts}` in-flight +1 is approximate** (`src/daemon.rs` `render`).
+    The +1 applies while Thinking/Working whenever the hook count is ahead
+    of the transcript: after a custom slash command in a fresh session it
+    stays +1 for every later turn; in a resumed session (hook count below
+    the transcript's) it never applies; it drops during Notification and
+    Compacting. Fix: record the transcript's count at `UserPromptSubmit`
+    (`prompts_at_submit`) and add 1 only while the transcript hasn't passed
+    it, until `Stop`. Then tighten the wording in docs/configuration.md.
+18. **Spurious `seen.bin` warning** (`src/ledger.rs` `load`):
+    `append_seen` never creates `seen.bin` while every tracked file is
+    id-less, so a new user whose only transcript has no prompts gets
+    "previously counted ids are forgotten" on every start. Fix: warn on
+    `NotFound` only if `totals.turns + totals.prompts > 0`.
+19. **Healed ids can recount growth** (`src/ledger.rs` `settle`): after
+    `seen.bin` is lost, a healed id becomes `Seen::Counted`, so growth on
+    its lines past `counted_to` goes to totals even if the message was a
+    copy counted elsewhere. Very narrow. Optional fix: `e.seen = Seen::Dup`
+    when `p.counted`.
+20. **docs/ledger.md "Known per-file overcount" is imprecise**: it applies
+    to any message evicted from the ring (not only ones counted
+    elsewhere), and the evicted message's later growth is lost from
+    totals (a small undercount).
