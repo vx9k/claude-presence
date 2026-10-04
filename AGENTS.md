@@ -45,7 +45,17 @@ fix or discover something.
 ## Invariants — don't break these
 
 - **Hook wire format:** `<EventName>\n<raw JSON from Claude Code>`. The hook
-  process never parses JSON.
+  process never parses JSON. Event names starting with `__` are reserved
+  control messages sent only by claude-presence itself (`__shutdown`, used
+  by `install`/`uninstall` to stop a running daemon); `hook` never forwards
+  them and the daemon ignores unknown ones.
+- **Hook endpoint:** Unix socket `0600` in an OS-private runtime dir, or else
+  in `<tmp>/claude-presence-<uid>/`, which the daemon creates `0700` and
+  refuses to use unless it is a real directory owned by it with no
+  group/other bits (never chmod/remove it). Hook clients `lstat`-check that
+  dir the same way before connecting (only on this fallback path) and
+  silently skip sending if it fails. Windows: named pipe with an
+  owner-only DACL and `FILE_FLAG_FIRST_PIPE_INSTANCE`.
 - **Ledger** (`ledger.json` + append-only `seen.bin`): totals only grow;
   tokens counted once per `message.id`, prompts once per `uuid`, globally.
   `seen.bin` is appended and synced before `ledger.json` is atomically

@@ -1,6 +1,6 @@
 use claude_presence::install::{self, Init};
 use claude_presence::{config, daemon, ipc, ledger, paths, timeutil};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -59,12 +59,24 @@ fn main() -> ExitCode {
 /// Runs on every Claude Code hook: forward stdin to the daemon and get out of
 /// the way. Never fails loudly — presence must not break the user's session.
 fn hook(event: &str) -> ExitCode {
+    if !forwardable(event) {
+        // Drain stdin so Claude Code never sees a broken pipe.
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+        return ExitCode::SUCCESS;
+    }
     let mut msg = Vec::with_capacity(4096);
     msg.extend_from_slice(event.as_bytes());
     msg.push(b'\n');
     let _ = std::io::stdin().lock().read_to_end(&mut msg);
-    let _ = ipc::send(&paths::hook_socket(), &msg);
+    let (sock, in_private_dir) = paths::hook_endpoint();
+    let _ = ipc::send_to(&sock, in_private_dir, &msg);
     ExitCode::SUCCESS
+}
+
+/// Reserved `__` control events are only sent by claude-presence itself, so
+/// a `settings.json` hook entry can't, say, stop the daemon.
+fn forwardable(event: &str) -> bool {
+    !ipc::is_control(event.as_bytes())
 }
 
 fn exe_name(base: &str) -> String {
@@ -229,35 +241,84 @@ fn uninstall_cmd(args: &[String]) -> ExitCode {
 fn status() -> ExitCode {
     let sock = paths::hook_socket();
     let running = ipc::daemon_running(&sock);
-    println!("daemon:   {}", if running { "running" } else { "not running" });
-    println!("socket:   {}", sock.display());
-    println!("config:   {}", paths::config_file().display());
-    println!("stats:    {}", paths::ledger_file().display());
     let l = ledger::Ledger::load(paths::ledger_file(), paths::seen_file());
+    // A reader that quit early (`status | head -1`) is not an error.
+    let _ = write_status(&mut std::io::stdout().lock(), running, &sock, &l);
+    if running { ExitCode::SUCCESS } else { ExitCode::from(3) }
+}
+
+/// The `status` report. `writeln!` instead of `println!`, which panics when
+/// stdout is closed.
+fn write_status(w: &mut impl Write, running: bool, sock: &Path, l: &ledger::Ledger) -> std::io::Result<()> {
+    writeln!(w, "daemon:   {}", if running { "running" } else { "not running" })?;
+    writeln!(w, "socket:   {}", sock.display())?;
+    writeln!(w, "config:   {}", paths::config_file().display())?;
+    writeln!(w, "stats:    {}", paths::ledger_file().display())?;
     let s = l.snapshot(timeutil::now_ms(), timeutil::local_offset_secs());
     let u = &l.totals.usage;
-    println!();
-    println!(
+    writeln!(w)?;
+    writeln!(
+        w,
         "today:    {} active · {} prompts · {} tokens",
         timeutil::fmt_hours_ms(s.today_ms),
         s.today_prompts,
         timeutil::fmt_count(s.today_tokens)
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "lifetime: {} active · {} sessions · {} prompts · {} turns",
         timeutil::fmt_hours_ms(s.total_ms),
         s.total_sessions,
         s.total_prompts,
         l.totals.turns
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "tokens:   {} total ({} in · {} out · {} cache read · {} cache write)",
         timeutil::fmt_count(u.total()),
         timeutil::fmt_count(u.input),
         timeutil::fmt_count(u.output),
         timeutil::fmt_count(u.cache_read),
         timeutil::fmt_count(u.cache_write)
-    );
-    println!("streak:   {} day{}", s.streak, if s.streak == 1 { "" } else { "s" });
-    if running { ExitCode::SUCCESS } else { ExitCode::from(3) }
+    )?;
+    writeln!(w, "streak:   {} day{}", s.streak, if s.streak == 1 { "" } else { "s" })?;
+    w.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// stdout closed early, as in `claude-presence status | head -1`.
+    struct ClosedPipe;
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn status_survives_a_closed_stdout() {
+        let dir = std::env::temp_dir().join(format!("cp-status-{}", std::process::id()));
+        let l = ledger::Ledger::load(dir.join("l.json"), dir.join("s.bin"));
+        let sock = Path::new("/x.sock");
+        assert!(write_status(&mut ClosedPipe, false, sock, &l).is_err());
+        let mut out = Vec::new();
+        write_status(&mut out, true, sock, &l).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.starts_with("daemon:   running\nsocket:   /x.sock\n"));
+        assert!(out.contains("streak:   0 days"));
+    }
+
+    #[test]
+    fn hook_never_forwards_control_events() {
+        assert!(!forwardable("__shutdown"));
+        assert!(!forwardable("__x"));
+        assert!(forwardable("Stop"));
+        assert!(forwardable("UserPromptSubmit"));
+        assert!(forwardable(""));
+    }
 }

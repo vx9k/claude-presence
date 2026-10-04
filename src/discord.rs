@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -263,22 +264,36 @@ struct Shared {
     cv: Condvar,
 }
 
+/// How long `Presenter::shutdown` waits for the worker to clear the
+/// activity. A worker stuck in blocking I/O (Windows pipes have no timeout)
+/// is left behind; process exit ends it.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
+
 /// Handle to the Discord worker thread.
 pub struct Presenter {
     shared: Arc<Shared>,
-    thread: Option<JoinHandle<()>>,
+    /// The worker and a channel it signals right before exiting.
+    thread: Option<(JoinHandle<()>, Receiver<()>)>,
 }
 
 impl Presenter {
     pub fn spawn(client_id: String) -> Presenter {
+        Presenter::spawn_with(move |s| worker(s, &client_id))
+    }
+
+    fn spawn_with(work: impl FnOnce(&Shared) + Send + 'static) -> Presenter {
         let shared = Arc::new(Shared::default());
         let s2 = shared.clone();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("discord".into())
             .stack_size(256 * 1024)
-            .spawn(move || worker(&s2, &client_id))
+            .spawn(move || {
+                work(&s2);
+                let _ = done_tx.send(());
+            })
             .expect("spawn discord thread");
-        Presenter { shared, thread: Some(thread) }
+        Presenter { shared, thread: Some((thread, done_rx)) }
     }
 
     /// A presenter without a worker thread, so tests never reach Discord.
@@ -302,14 +317,25 @@ impl Presenter {
     }
 
     /// Clear the activity (if connected) and stop the worker.
-    pub fn shutdown(mut self) {
+    pub fn shutdown(self) {
+        self.shutdown_within(SHUTDOWN_WAIT);
+    }
+
+    /// Like `shutdown`, but give up on the worker after `wait`.
+    fn shutdown_within(mut self, wait: Duration) {
         {
             let mut w = self.shared.want.lock().unwrap_or_else(|e| e.into_inner());
             w.stop = true;
             self.shared.cv.notify_one();
         }
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        if let Some((t, done)) = self.thread.take() {
+            // Disconnected means the worker is gone too (it panicked).
+            match done.recv_timeout(wait) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                    let _ = t.join();
+                }
+                Err(RecvTimeoutError::Timeout) => crate::warn!("Discord worker did not stop in time; leaving it"),
+            }
         }
     }
 }
@@ -558,6 +584,31 @@ mod tests {
         p.set(Some("x".into()));
         assert_eq!(p.wanted().as_deref(), Some("x"));
         p.shutdown();
+    }
+
+    #[test]
+    fn shutdown_does_not_wait_forever() {
+        // A worker stuck in blocking I/O (e.g. a frozen Discord pipe on Windows).
+        let p = Presenter::spawn_with(|_| std::thread::sleep(Duration::from_secs(5)));
+        let t = Instant::now();
+        p.shutdown_within(Duration::from_millis(100));
+        assert!(t.elapsed() < Duration::from_secs(2), "shutdown hung: {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn shutdown_joins_a_finishing_worker() {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f2 = finished.clone();
+        let p = Presenter::spawn_with(move |shared| {
+            let mut g = shared.want.lock().unwrap();
+            while !g.stop {
+                g = shared.cv.wait(g).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            f2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        p.shutdown_within(Duration::from_secs(5));
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

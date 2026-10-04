@@ -711,11 +711,28 @@ fn install_signals(tx: Sender<Msg>) {
     unsafe { SetConsoleCtrlHandler(Some(handler), 1) };
 }
 
+/// Turn a message from the hook channel into a loop message. `__shutdown`
+/// stops the daemon like SIGTERM (sent by `install`/`uninstall`); other
+/// reserved `__` events are ignored, so newer clients can't confuse older
+/// daemons.
+fn route(m: Vec<u8>) -> Option<Msg> {
+    let event = ipc::event_name(&m);
+    if !ipc::is_control(event) {
+        return Some(Msg::Hook(m));
+    }
+    if event == ipc::SHUTDOWN.as_bytes() {
+        crate::info!("shutdown requested");
+        return Some(Msg::Shutdown);
+    }
+    crate::debug!("ignoring control event {}", String::from_utf8_lossy(event));
+    None
+}
+
 pub struct Options {
     pub log_file: Option<PathBuf>,
 }
 
-/// Run the daemon until SIGINT/SIGTERM. Returns the process exit code.
+/// Run the daemon until SIGINT/SIGTERM or `__shutdown`. Returns the process exit code.
 pub fn run(opts: Options) -> i32 {
     crate::log::init(opts.log_file.as_deref());
     let addr = paths::hook_socket();
@@ -737,7 +754,7 @@ pub fn run(opts: Options) -> i32 {
     std::thread::Builder::new()
         .name("hooks".into())
         .stack_size(128 * 1024)
-        .spawn(move || listener.serve(move |m| htx.send(Msg::Hook(m)).is_ok()))
+        .spawn(move || listener.serve(move |m| route(m).is_none_or(|msg| htx.send(msg).is_ok())))
         .expect("spawn hook listener");
     drop(tx);
 
@@ -930,6 +947,19 @@ mod tests {
         assert!(s.last_activity <= now, "a skewed clock must not keep a session alive for a day");
         d.presenter.shutdown();
         let _ = std::fs::remove_file(&tp);
+    }
+
+    #[test]
+    fn control_events_are_routed() {
+        assert!(matches!(route(b"__shutdown\n".to_vec()), Some(Msg::Shutdown)));
+        assert!(matches!(route(b"__shutdown\n{}".to_vec()), Some(Msg::Shutdown)));
+        assert!(matches!(route(b"__shutdown".to_vec()), Some(Msg::Shutdown)));
+        // Other reserved names are dropped without error.
+        assert!(route(b"__reload\n{}".to_vec()).is_none());
+        assert!(route(b"__shutdownx\n{}".to_vec()).is_none());
+        // The event name is the first line only; payload contents don't count.
+        assert!(matches!(route(b"Stop\n{\"hook_event_name\":\"__shutdown\"}".to_vec()), Some(Msg::Hook(_))));
+        assert!(matches!(route(b"Stop\n{}".to_vec()), Some(Msg::Hook(_))));
     }
 
     #[test]

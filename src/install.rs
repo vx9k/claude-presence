@@ -6,12 +6,13 @@
 //!   macOS:   launchd LaunchAgent
 //!   Windows: Task Scheduler logon task (falls back to the HKCU Run key)
 
-use crate::paths;
+use crate::{ipc, paths};
 use serde_json::{Map, Value, json};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 pub const HOOK_EVENTS: &[&str] = &[
     "SessionStart",
@@ -582,9 +583,36 @@ pub fn install_service(init: Init, daemon: &Path) -> io::Result<String> {
 #[cfg(windows)]
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
-/// Stop and remove every service flavor we might have installed.
+/// Ask a daemon listening at `addr` to shut down and wait up to `wait` for
+/// it to go away. `None` if none was running, else whether it stopped.
+fn stop_daemon(addr: &Path, wait: Duration) -> Option<bool> {
+    ipc::send(addr, &ipc::shutdown_request()).ok()?;
+    let deadline = Instant::now() + wait;
+    loop {
+        if !ipc::daemon_running(addr) {
+            return Some(true);
+        }
+        if Instant::now() >= deadline {
+            return Some(false);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Stop the running daemon and remove every service flavor we might have
+/// installed.
 pub fn uninstall_service() -> Vec<String> {
     let mut done = Vec::new();
+    // Asked first so it saves stats and clears the card itself, and so
+    // daemons no service manager tracks (XDG autostart, the Run key, a
+    // detached spawn) stop too. systemd, launchd and Task Scheduler don't
+    // restart a clean exit; OpenRC and dinit respawn after 5 s, but are
+    // stopped right below.
+    match stop_daemon(&paths::hook_socket(), Duration::from_secs(2)) {
+        Some(true) => done.push("stopped the running daemon".into()),
+        Some(false) => crate::warn!("the running daemon did not stop within 2 s (an older version?)"),
+        None => {}
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let ch = config_home();
@@ -688,6 +716,24 @@ mod tests {
         let fresh = wire_hooks("", exe).unwrap();
         let un = unwire_hooks(&fresh).unwrap();
         assert_eq!(un.trim(), "{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stops_a_running_daemon() {
+        let p = std::env::temp_dir().join(format!("cp-stop-{}.sock", std::process::id()));
+        assert_eq!(stop_daemon(&p, Duration::from_millis(100)), None, "nothing running");
+
+        // A daemon that honors the request: stops serving and unbinds.
+        let l = ipc::Listener::bind(&p).unwrap();
+        let t = std::thread::spawn(move || l.serve(|m| ipc::event_name(&m) != ipc::SHUTDOWN.as_bytes()));
+        assert_eq!(stop_daemon(&p, Duration::from_secs(2)), Some(true));
+        t.join().unwrap();
+
+        // An old daemon that ignores it.
+        let l = ipc::Listener::bind(&p).unwrap();
+        std::thread::spawn(move || l.serve(|_| true));
+        assert_eq!(stop_daemon(&p, Duration::from_millis(200)), Some(false));
     }
 
     #[test]
