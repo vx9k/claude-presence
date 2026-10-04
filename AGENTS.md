@@ -34,6 +34,13 @@ A lean alternative to the Node.js [claude-rpc](https://github.com/rar-file/claud
 | `src/paths.rs` | Per-OS directories and socket/pipe names |
 | `src/timeutil.rs` | Time helpers (RFC 3339 parsing, local offset, formatting) |
 | `src/log.rs` | Minimal leveled logger (`CLAUDE_PRESENCE_LOG`) |
+| `TODO.md` | Handoff: open audit findings and verification status |
+
+## Current state
+
+Open work (audit findings, unverified platforms, decisions already made) is
+tracked in [`TODO.md`](TODO.md). Read it before starting; update it when you
+fix or discover something.
 
 ## Invariants — don't break these
 

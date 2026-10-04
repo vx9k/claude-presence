@@ -29,6 +29,13 @@ from `advisor`, `auditor`, `developer`, `docs-writer`:
 
 Keep any other trailers your harness requires.
 
+## Resuming work
+
+Start from `TODO.md`. The usual loop for an item: advisor (if the item
+touches IPC, the ledger format, config schema or services) → developer →
+auditor until no high/medium findings → docs-writer if user-facing behavior
+changed → commit with a `Sub-agent:` trailer → push → check CI.
+
 ## Gotchas
 
 - The hook path must stay fast and silent: no config loading, no JSON
@@ -37,3 +44,6 @@ Keep any other trailers your harness requires.
   use quoted absolute paths with forward slashes.
 - Windows named pipe and Task Scheduler code can only be type-checked here;
   reason about it carefully and say so in the PR when behavior is unverified.
+- Only local Claude Code sessions reach the daemon. A cloud session (including
+  one opened from the desktop app) runs its hooks remotely, so when testing,
+  feed hooks by hand: `echo '{"session_id":"t","cwd":"/"}' | claude-presence hook UserPromptSubmit`.
