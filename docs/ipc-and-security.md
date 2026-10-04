@@ -91,7 +91,7 @@ Assumption: one trusted user per account; other local users are untrusted; the m
 | create `<tmp>/claude-presence-<uid>` before you (shared `/tmp`) | make the daemon or hooks use it: the checks reject it and nothing is sent; the daemon refuses to start (denial of service until you choose another `TMPDIR`) |
 | (Windows) create the pipe name before you | receive your hooks (the hook checks the pipe owner); only block the daemon from starting |
 | swap the directory after the checks | rename it away: parent is sticky or not writable by others |
-| read `ledger.json` or `config.toml` if your home directory permissions allow it (the tool does not change them) | |
+| read `ledger.db` or `config.toml` if your home directory permissions allow it (the tool does not change them) | |
 | | send hooks, send `__shutdown`, or read hook payloads (these include `cwd` and tool inputs, e.g. file contents for Write) |
 
 The same user's processes can always talk to the daemon; that is by design. Hook payloads stay on the local machine: the daemon sends only the rendered card to Discord.

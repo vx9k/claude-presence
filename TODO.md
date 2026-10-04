@@ -65,10 +65,6 @@ Line numbers are approximate.
     Compacting. Fix: record the transcript's count at `UserPromptSubmit`
     (`prompts_at_submit`) and add 1 only while the transcript hasn't passed
     it, until `Stop`. Then tighten the wording in docs/configuration.md.
-20. **docs/ledger.md "Known per-file overcount" is imprecise**: it applies
-    to any message evicted from the ring (not only ones counted
-    elsewhere), and the evicted message's later growth is lost from
-    totals (a small undercount).
 21. **Drop the legacy ledger import** (`src/ledger.rs` `import_legacy`,
     `read_legacy`, `Stored`, `LEGACY_*`, and `load_stats`' legacy
     fallback): a couple of releases after `ledger.db` shipped, stop reading

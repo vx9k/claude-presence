@@ -19,7 +19,9 @@ Focus, in priority order:
 
 You may run `cargo test`, `cargo clippy --all-targets`, and
 `cargo clippy --target x86_64-pc-windows-gnu --all-targets` /
-`--target aarch64-apple-darwin` to check other platforms.
+`--target aarch64-apple-darwin` to check other platforms (they need a C
+cross toolchain for bundled SQLite; without one, reason about the cfg code
+and note that only CI checks it).
 
 Report each finding as: file:line, severity (high/medium/low), what is wrong,
 a concrete failing scenario, and a suggested fix. Only report issues you have
