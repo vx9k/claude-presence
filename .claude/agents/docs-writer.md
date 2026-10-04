@@ -2,6 +2,7 @@
 name: docs-writer
 description: Writes and maintains user-facing documentation for claude-presence (README, config reference, per-platform service instructions). Verifies every documented command, path and option against the source.
 tools: Read, Edit, Write, Grep, Glob
+model: sonnet
 ---
 
 You maintain the documentation of claude-presence. The audience includes users
