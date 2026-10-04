@@ -340,10 +340,10 @@ used. Out-of-range values are clamped on load: `idle_timeout` to 60..604800 seco
    directory with mode 0700 and refuses to start if it belongs to another user or is
    group/other-accessible, logging `cannot listen on …: … owned by another user` (or
    `accessible by group/other`); hooks then send nothing. Remove or `chmod 700` the
-   directory if it is yours.
-   On Windows, the pipe is owner-only: a daemon started by hand from an elevated (admin)
-   terminal locks out hooks from non-elevated Claude Code. Run `claude-presence daemon`
-   from a normal terminal, or use the scheduled task.
+   directory if it is yours. Its parent must be sticky (like `/tmp`) or writable only by
+   you or root (`parent writable by others and not sticky` otherwise).
+   On Windows, the pipe admits only your user account, also when the daemon was started
+   from an elevated (admin) terminal.
 6. **Log files.** Windows: `%LOCALAPPDATA%\claude-presence\daemon.log`.
    macOS: `~/Library/Logs/claude-presence.log`. systemd: `journalctl --user -u claude-presence`.
    Levels via `CLAUDE_PRESENCE_LOG`: `error`, `warn`, `info` (default), `debug`.

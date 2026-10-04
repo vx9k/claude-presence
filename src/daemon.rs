@@ -739,7 +739,8 @@ pub fn run(opts: Options) -> i32 {
     let (tx, rx) = mpsc::channel::<Msg>();
     install_signals(tx.clone());
 
-    let listener = match ipc::Listener::bind(&addr) {
+    // Wait out a daemon that was just asked to stop (reinstall).
+    let listener = match ipc::bind_waiting(&addr, Duration::from_secs(5)) {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             crate::info!("another claude-presence daemon is already running");

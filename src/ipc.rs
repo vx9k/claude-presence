@@ -2,7 +2,8 @@
 //! `<EventName>\n<raw JSON from Claude Code>`, and disconnects. The daemon
 //! does all parsing, so the hook process stays a few hundred microseconds of
 //! work. Unix domain socket (mode 0600, in a directory only we can enter) on
-//! Linux/macOS, a local-only named pipe with an owner-only DACL on Windows.
+//! Linux/macOS, a local-only named pipe whose DACL admits only the current
+//! user on Windows.
 //!
 //! Event names starting with `__` are reserved for control messages sent by
 //! claude-presence itself (`__shutdown`); the `hook` command never forwards
@@ -51,11 +52,12 @@ pub fn send(addr: &Path, msg: &[u8]) -> io::Result<()> {
 }
 
 /// `send` for hook events. When `addr` is in the fallback
-/// `paths::private_socket_dir()` (`in_private_dir`), first check with one
-/// `lstat` that the directory is ours: a squatter who pre-created it must not
-/// receive hook payloads. Once it passes, nobody else can swap it: it is
-/// owned by us with mode 0700, and in the usual sticky `/tmp` only its owner
-/// may rename or remove it. OS-provided runtime dirs cost nothing extra.
+/// `paths::private_socket_dir()` (`in_private_dir`), first check that the
+/// directory is ours (one `lstat`, one `stat` of its parent): a squatter who
+/// pre-created it must not receive hook payloads. Once it passes, nobody
+/// else can swap it: it is ours with mode 0700, and its parent is sticky
+/// (only the owner may rename entries) or writable only by us/root.
+/// OS-provided runtime dirs cost nothing extra.
 #[cfg(unix)]
 pub fn send_to(addr: &Path, in_private_dir: bool, msg: &[u8]) -> io::Result<()> {
     if let (true, Some(dir)) = (in_private_dir, addr.parent()) {
@@ -97,6 +99,30 @@ pub fn daemon_running(addr: &Path) -> bool {
 
 // ------------------------------------------------------------------ server --
 
+/// `Listener::bind`, but while another daemon still owns `addr` keep
+/// retrying for up to `wait`: on reinstall the old one may still be saving
+/// stats after being asked to shut down.
+pub fn bind_waiting(addr: &Path, wait: std::time::Duration) -> io::Result<Listener> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + wait;
+    loop {
+        match Listener::bind(addr) {
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            r => return r,
+        }
+    }
+}
+
+/// SDDL for the hook pipe: a protected DACL whose single ACE grants the
+/// user `sid` full access. The user's SID, not `OW` (owner rights): an
+/// elevated token makes `Administrators` the owner, which would lock out
+/// the same user's non-elevated hooks.
+pub fn pipe_sddl(sid: &str) -> String {
+    format!("D:P(A;;GA;;;{sid})")
+}
+
 /// Bind the listening endpoint. Fails with `AddrInUse` if another daemon
 /// already owns it.
 #[cfg(unix)]
@@ -108,22 +134,52 @@ pub struct Listener(std::os::unix::net::UnixListener, std::path::PathBuf);
 #[cfg(unix)]
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::PermissionsExt;
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => {}
+        // Exactly 0700 whatever the (process-wide) umask is right now. Fine
+        // to chmod: we just created it.
+        Ok(()) => std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?,
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
     verify_private_dir(dir)
 }
 
-/// `lstat` `dir` and apply `check_private`, without creating anything.
+/// Check `dir` with `check_private` and its parent with `check_parent`,
+/// without creating anything.
 #[cfg(unix)]
 fn verify_private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let m = std::fs::symlink_metadata(dir)?;
     // SAFETY: geteuid never fails.
-    check_private(m.file_type().is_dir(), m.uid(), m.mode(), unsafe { libc::geteuid() })
-        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", dir.display())))
+    let euid = unsafe { libc::geteuid() };
+    let at = |p: &Path, e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", p.display()));
+    // The parent is followed (`stat`): `/tmp` may be a symlink (macOS), and
+    // what matters is who can rename entries in the directory it points to.
+    let parent = match dir.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let m = std::fs::metadata(parent)?;
+    check_parent(m.is_dir(), m.uid(), m.mode(), euid).map_err(|e| at(parent, e))?;
+    let m = std::fs::symlink_metadata(dir)?;
+    check_private(m.file_type().is_dir(), m.uid(), m.mode(), euid).map_err(|e| at(dir, e))
+}
+
+/// Nobody else may be able to rename our directory away and put their own
+/// in its place: the parent must be ours or root's, and either sticky (like
+/// `/tmp`) or not writable by group/other.
+#[cfg(unix)]
+fn check_parent(is_dir: bool, uid: u32, mode: u32, euid: u32) -> io::Result<()> {
+    let why = if !is_dir {
+        "not a directory"
+    } else if uid != euid && uid != 0 {
+        "parent owned by another user"
+    } else if mode & 0o1000 == 0 && mode & 0o022 != 0 {
+        "parent writable by others and not sticky"
+    } else {
+        return Ok(());
+    };
+    Err(io::Error::new(io::ErrorKind::PermissionDenied, why))
 }
 
 /// The `lstat` facts `ensure_private_dir` requires.
@@ -135,6 +191,8 @@ fn check_private(is_dir: bool, uid: u32, mode: u32, euid: u32) -> io::Result<()>
         "owned by another user"
     } else if mode & 0o077 != 0 {
         "accessible by group/other"
+    } else if mode & 0o700 != 0o700 {
+        "not rwx for its owner"
     } else {
         return Ok(());
     };
@@ -203,11 +261,56 @@ impl Drop for Listener {
     }
 }
 
-/// An owner-only security descriptor, `D:P(A;;GA;;;OW)`: a protected DACL
-/// whose single ACE grants the object's owner full access. Other users can
-/// neither connect to our pipe nor add instances to it.
+/// A security descriptor granting only the current user access (see
+/// `pipe_sddl`). Other users can neither connect to our pipe nor add
+/// instances to it.
 #[cfg(windows)]
 struct OwnerOnly(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
+
+/// The current process token's user SID as a string (`S-1-5-21-…`).
+#[cfg(windows)]
+fn current_user_sid() -> io::Result<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the pseudo-handle from GetCurrentProcess needs no closing;
+    // `token` is a valid out-pointer.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // TOKEN_USER plus the SID it points into; a SID is at most 68 bytes.
+    // usize elements keep the buffer pointer-aligned for TOKEN_USER.
+    let mut buf = [0usize; 32];
+    let mut len = 0u32;
+    // SAFETY: `buf` is writable for the length passed; `token` is open.
+    let ok = unsafe {
+        GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), std::mem::size_of_val(&buf) as u32, &mut len)
+    };
+    let err = io::Error::last_os_error();
+    // SAFETY: closing the token we opened, once.
+    unsafe { CloseHandle(token) };
+    if ok == 0 {
+        return Err(err);
+    }
+    // SAFETY: on success the buffer starts with an initialized, aligned TOKEN_USER.
+    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let mut wide = std::ptr::null_mut();
+    // SAFETY: `sid` points into `buf`, which is still alive; `wide` is a valid out-pointer.
+    if unsafe { ConvertSidToStringSidW(sid, &mut wide) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: ConvertSidToStringSidW returned a NUL-terminated wide string,
+    // which we read up to the NUL and then LocalFree exactly once.
+    let s = unsafe {
+        let n = (0..).take_while(|&i| *wide.add(i) != 0).count();
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(wide, n));
+        LocalFree(wide.cast());
+        s
+    };
+    Ok(s)
+}
 
 #[cfg(windows)]
 impl OwnerOnly {
@@ -215,7 +318,7 @@ impl OwnerOnly {
         use windows_sys::Win32::Security::Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
         };
-        let sddl: Vec<u16> = "D:P(A;;GA;;;OW)".encode_utf16().chain(Some(0)).collect();
+        let sddl: Vec<u16> = pipe_sddl(&current_user_sid()?).encode_utf16().chain(Some(0)).collect();
         let mut sd = std::ptr::null_mut();
         // SAFETY: NUL-terminated wide string and a valid out-pointer; the
         // size out-parameter is optional. On success `sd` is a LocalAlloc'd
@@ -458,8 +561,71 @@ mod tests {
         assert!(check_private(true, 2, 0o40700, 2).is_ok());
         assert!(check_private(false, 2, 0o700, 2).is_err());
         assert!(check_private(true, 2, 0o40701, 2).is_err());
+        // Owner must have rwx (a concurrent umask can't leave it unusable).
+        assert!(check_private(true, 2, 0o40500, 2).is_err());
+        assert!(check_private(true, 2, 0o40600, 2).is_err());
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn parent_must_not_let_others_swap_the_dir() {
+        // Ours or root's, and sticky or not writable by others.
+        assert!(check_parent(true, 0, 0o41777, 5).is_ok()); // /tmp
+        assert!(check_parent(true, 5, 0o40755, 5).is_ok()); // ~/tmp
+        assert!(check_parent(true, 5, 0o40700, 5).is_ok());
+        assert!(check_parent(true, 5, 0o40777, 5).is_err()); // world-writable, not sticky
+        assert!(check_parent(true, 0, 0o40777, 5).is_err());
+        assert!(check_parent(true, 5, 0o40775, 5).is_err()); // group-writable
+        assert!(check_parent(true, 7, 0o41777, 5).is_err()); // another user's: they can rename anyway
+        assert!(check_parent(false, 5, 0o100700, 5).is_err());
+    }
+
+    #[test]
+    fn non_sticky_world_writable_parent_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("cp-ww-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ww = base.join("ww");
+        std::fs::create_dir(&ww).unwrap();
+        let good = ww.join("good");
+        std::fs::create_dir(&good).unwrap();
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let l = Listener::bind_with(&good.join("s"), false).unwrap();
+        std::thread::spawn(move || l.serve(|_| true));
+
+        std::fs::set_permissions(&ww, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ensure_private_dir(&good).is_err(), "daemon side");
+        assert!(send_to(&good.join("s"), true, b"Stop\n{}").is_err(), "client side");
+        std::fs::set_permissions(&ww, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        ensure_private_dir(&good).unwrap();
+        send_to(&good.join("s"), true, b"Stop\n{}").unwrap();
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bind_waits_for_a_stopping_daemon() {
+        use std::time::{Duration, Instant};
+        let p = std::env::temp_dir().join(format!("cp-ipc-wait-{}.sock", std::process::id()));
+        let l = Listener::bind(&p).unwrap();
+        // Still held after the wait: gives up with AddrInUse.
+        let t = Instant::now();
+        let e = bind_waiting(&p, Duration::from_millis(300)).err().unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::AddrInUse);
+        assert!(t.elapsed() >= Duration::from_millis(250));
+        // Released while waiting (old daemon finished shutting down).
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(l);
+        });
+        drop(bind_waiting(&p, Duration::from_secs(5)).unwrap());
+    }
+
+    #[test]
+    fn pipe_sddl_grants_only_the_user() {
+        assert_eq!(pipe_sddl("S-1-5-21-1-2-3-1001"), "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)");
     }
 
     #[test]

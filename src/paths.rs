@@ -172,7 +172,45 @@ pub fn hook_socket() -> PathBuf {
     PathBuf::from(format!(r"\\.\pipe\{APP}-{user}"))
 }
 
+/// Where versions before the private socket dir listened, if that differs
+/// from today's path: `install`/`uninstall` stop a daemon found there too.
+// TODO: remove a couple of releases after the private socket dir shipped.
+#[cfg(unix)]
+pub fn legacy_hook_socket() -> Option<PathBuf> {
+    match user_runtime_dir() {
+        Some(_) => None, // unchanged
+        // SAFETY: getuid never fails.
+        None => Some(legacy_socket_in(&tmp_dir(), unsafe { libc::getuid() })),
+    }
+}
+
+#[cfg(unix)]
+fn legacy_socket_in(tmp: &std::path::Path, uid: u32) -> PathBuf {
+    if tmp == std::path::Path::new("/tmp") {
+        tmp.join(format!("{APP}-{uid}.sock"))
+    } else {
+        tmp.join(format!("{APP}.sock"))
+    }
+}
+
+#[cfg(windows)]
+pub fn legacy_hook_socket() -> Option<PathBuf> {
+    None
+}
+
 #[cfg(windows)]
 pub fn hook_endpoint() -> (PathBuf, bool) {
     (hook_socket(), false)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn legacy_socket_names() {
+        assert_eq!(legacy_socket_in(Path::new("/tmp"), 1000), Path::new("/tmp/claude-presence-1000.sock"));
+        assert_eq!(legacy_socket_in(Path::new("/var/tmp/me"), 1000), Path::new("/var/tmp/me/claude-presence.sock"));
+    }
 }

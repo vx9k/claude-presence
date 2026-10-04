@@ -32,12 +32,11 @@ Line numbers are approximate.
 ### Low / unverified
 
 10. **Windows changes are type-checked only**: the `ERROR_NO_DATA` handling
-    and error-path read in `Listener::serve`, the owner-only DACL
-    (`D:P(A;;GA;;;OW)`), and the `__shutdown` reinstall path (copying over
-    the `.exe` once the old daemon exits). Verify by hand. Note: a daemon
-    started elevated gets `Administrators` as the pipe owner, so the `OW`
-    ACE would lock out non-elevated hooks (Task Scheduler uses
-    `LeastPrivilege`, so only a manual elevated `daemon` run is affected).
+    and error-path read in `Listener::serve`, the user-SID DACL
+    (`D:P(A;;GA;;;<user SID>)` from `TokenUser`; check an elevated daemon
+    accepts non-elevated hooks), the bind retry while the old daemon exits,
+    and the `__shutdown` reinstall path (copying over the `.exe` once the old
+    daemon exits). Verify by hand.
 11. **A wedged Discord worker is abandoned, not killed**
     (`src/discord.rs` `Presenter::shutdown`). After 1 s it is left running;
     fine at exit, but a `client_id` reload leaves the old thread (and its

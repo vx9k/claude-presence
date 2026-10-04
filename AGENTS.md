@@ -52,10 +52,13 @@ fix or discover something.
 - **Hook endpoint:** Unix socket `0600` in an OS-private runtime dir, or else
   in `<tmp>/claude-presence-<uid>/`, which the daemon creates `0700` and
   refuses to use unless it is a real directory owned by it with no
-  group/other bits (never chmod/remove it). Hook clients `lstat`-check that
-  dir the same way before connecting (only on this fallback path) and
-  silently skip sending if it fails. Windows: named pipe with an
-  owner-only DACL and `FILE_FLAG_FIRST_PIPE_INSTANCE`.
+  group/other bits and owner rwx (never chmod/remove it), and whose parent
+  is ours or root's and sticky or not writable by others. Hook clients run
+  the same checks before connecting (only on this fallback path) and
+  silently skip sending if they fail. Windows: named pipe whose DACL grants
+  only the current user's SID (not `OW`, which breaks under elevation) and
+  `FILE_FLAG_FIRST_PIPE_INSTANCE`. A starting daemon retries a busy endpoint
+  for 5 s so a reinstall can replace a daemon that is still shutting down.
 - **Ledger** (`ledger.json` + append-only `seen.bin`): totals only grow;
   tokens counted once per `message.id`, prompts once per `uuid`, globally.
   `seen.bin` is appended and synced before `ledger.json` is atomically

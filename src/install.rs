@@ -608,10 +608,18 @@ pub fn uninstall_service() -> Vec<String> {
     // detached spawn) stop too. systemd, launchd and Task Scheduler don't
     // restart a clean exit; OpenRC and dinit respawn after 5 s, but are
     // stopped right below.
-    match stop_daemon(&paths::hook_socket(), Duration::from_secs(2)) {
-        Some(true) => done.push("stopped the running daemon".into()),
-        Some(false) => crate::warn!("the running daemon did not stop within 2 s (an older version?)"),
-        None => {}
+    let sock = paths::hook_socket();
+    // TODO: drop the legacy path a couple of releases after the private
+    // socket dir shipped.
+    let legacy = paths::legacy_hook_socket().filter(|old| *old != sock && old.exists());
+    for addr in std::iter::once(sock.clone()).chain(legacy) {
+        match stop_daemon(&addr, Duration::from_secs(2)) {
+            Some(true) => done.push("stopped the running daemon".into()),
+            Some(false) => crate::warn!(
+                "the running daemon has not stopped after 2 s (still busy, or a version without __shutdown)"
+            ),
+            None => {}
+        }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
