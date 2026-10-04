@@ -6,8 +6,8 @@
 //!
 //! All socket I/O happens on one worker thread that owns the connection, so a
 //! wedged Discord client can never stall hook processing. The worker also
-//! enforces Discord's activity rate limit (≈5 updates / 20 s): rapid changes
-//! coalesce to the latest one.
+//! enforces Discord's activity rate limit (≤ 4 updates / 20 s, ≥ 4 s apart):
+//! rapid changes coalesce to the latest one.
 
 use serde::Deserialize;
 use sonic_rs::{JsonValueTrait, LazyValue};
@@ -481,65 +481,9 @@ fn worker(shared: &Shared, client_id: &str) {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixListener;
-
-    fn read_frame(s: &mut std::os::unix::net::UnixStream) -> (u32, String) {
-        let mut h = [0u8; 8];
-        s.read_exact(&mut h).unwrap();
-        let op = u32::from_le_bytes(h[..4].try_into().unwrap());
-        let len = u32::from_le_bytes(h[4..].try_into().unwrap()) as usize;
-        let mut b = vec![0; len];
-        s.read_exact(&mut b).unwrap();
-        (op, String::from_utf8(b).unwrap())
-    }
-
-    fn write_frame(s: &mut std::os::unix::net::UnixStream, op: u32, body: &str) {
-        let mut f = op.to_le_bytes().to_vec();
-        f.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        f.extend_from_slice(body.as_bytes());
-        s.write_all(&f).unwrap();
-    }
-
-    #[test]
-    fn talks_to_fake_discord() {
-        let p = std::env::temp_dir().join(format!("cp-discord-{}", std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        let l = UnixListener::bind(&p).unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut s, _) = l.accept().unwrap();
-            let (op, body) = read_frame(&mut s);
-            assert_eq!(op, OP_HANDSHAKE);
-            assert!(body.contains(r#""client_id":"123""#));
-            write_frame(
-                &mut s,
-                OP_FRAME,
-                r#"{"cmd":"DISPATCH","evt":"READY","data":{"user":{"id":"1045800378228281345"}}}"#,
-            );
-            let (op, body) = read_frame(&mut s);
-            assert_eq!(op, OP_FRAME);
-            assert!(body.contains(r#""activity":{"details":"x"}"#));
-            write_frame(&mut s, OP_PING, "{}");
-            assert_eq!(read_frame(&mut s).0, OP_PONG);
-            write_frame(&mut s, OP_FRAME, r#"{"cmd": "SET_ACTIVITY", "nonce": "0", "data": {}}"#);
-            write_frame(&mut s, OP_FRAME, r#"{"cmd": "SET_ACTIVITY", "nonce": "1", "data": {}}"#);
-            let (_, body) = read_frame(&mut s);
-            assert!(!body.contains("activity"));
-            write_frame(
-                &mut s,
-                OP_FRAME,
-                r#"{"cmd":"SET_ACTIVITY","evt":"ERROR","nonce":"2","data":{"message":"bad"}}"#,
-            );
-        });
-        let mut c = Conn::connect("123", std::slice::from_ref(&p)).unwrap();
-        assert!(c.bridge);
-        c.set_activity(Some(r#"{"details":"x"}"#)).unwrap();
-        assert_eq!(c.set_activity(None).unwrap_err().kind(), io::ErrorKind::InvalidData);
-        server.join().unwrap();
-        let _ = std::fs::remove_file(&p);
-    }
 
     #[test]
     fn rejected_activity_is_not_kept_alive() {
@@ -621,5 +565,67 @@ mod tests {
         }
         let last = *w.back().unwrap();
         assert_eq!(next_allowed(&w, Some(last)), Some(t0 + WINDOW));
+    }
+
+    /// Tests that need a real socket.
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        fn read_frame(s: &mut UnixStream) -> (u32, String) {
+            let mut h = [0u8; 8];
+            s.read_exact(&mut h).unwrap();
+            let op = u32::from_le_bytes(h[..4].try_into().unwrap());
+            let len = u32::from_le_bytes(h[4..].try_into().unwrap()) as usize;
+            let mut b = vec![0; len];
+            s.read_exact(&mut b).unwrap();
+            (op, String::from_utf8(b).unwrap())
+        }
+
+        fn write_frame(s: &mut UnixStream, op: u32, body: &str) {
+            let mut f = op.to_le_bytes().to_vec();
+            f.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            f.extend_from_slice(body.as_bytes());
+            s.write_all(&f).unwrap();
+        }
+
+        #[test]
+        fn talks_to_fake_discord() {
+            let p = std::env::temp_dir().join(format!("cp-discord-{}", std::process::id()));
+            let _ = std::fs::remove_file(&p);
+            let l = UnixListener::bind(&p).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut s, _) = l.accept().unwrap();
+                let (op, body) = read_frame(&mut s);
+                assert_eq!(op, OP_HANDSHAKE);
+                assert!(body.contains(r#""client_id":"123""#));
+                write_frame(
+                    &mut s,
+                    OP_FRAME,
+                    r#"{"cmd":"DISPATCH","evt":"READY","data":{"user":{"id":"1045800378228281345"}}}"#,
+                );
+                let (op, body) = read_frame(&mut s);
+                assert_eq!(op, OP_FRAME);
+                assert!(body.contains(r#""activity":{"details":"x"}"#));
+                write_frame(&mut s, OP_PING, "{}");
+                assert_eq!(read_frame(&mut s).0, OP_PONG);
+                write_frame(&mut s, OP_FRAME, r#"{"cmd": "SET_ACTIVITY", "nonce": "0", "data": {}}"#);
+                write_frame(&mut s, OP_FRAME, r#"{"cmd": "SET_ACTIVITY", "nonce": "1", "data": {}}"#);
+                let (_, body) = read_frame(&mut s);
+                assert!(!body.contains("activity"));
+                write_frame(
+                    &mut s,
+                    OP_FRAME,
+                    r#"{"cmd":"SET_ACTIVITY","evt":"ERROR","nonce":"2","data":{"message":"bad"}}"#,
+                );
+            });
+            let mut c = Conn::connect("123", std::slice::from_ref(&p)).unwrap();
+            assert!(c.bridge);
+            c.set_activity(Some(r#"{"details":"x"}"#)).unwrap();
+            assert_eq!(c.set_activity(None).unwrap_err().kind(), io::ErrorKind::InvalidData);
+            server.join().unwrap();
+            let _ = std::fs::remove_file(&p);
+        }
     }
 }

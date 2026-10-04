@@ -61,8 +61,10 @@ pub struct Assets {
     pub idle: String,
 }
 
+/// Each `[status.*]` table is merged key by key onto that status's built-in
+/// template, so a partial table keeps the remaining defaults.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(from = "RawStatusTemplates")]
 pub struct StatusTemplates {
     pub working: Template,
     pub thinking: Template,
@@ -71,8 +73,54 @@ pub struct StatusTemplates {
     pub idle: Template,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[derive(Deserialize, Default)]
 #[serde(default)]
+struct RawStatusTemplates {
+    working: RawTemplate,
+    thinking: RawTemplate,
+    compacting: RawTemplate,
+    notification: RawTemplate,
+    idle: RawTemplate,
+}
+
+/// `None` = key absent; an explicit `""` or `rotation = []` is kept.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawTemplate {
+    details: Option<String>,
+    state: Option<String>,
+    rotation: Option<Vec<Frame>>,
+}
+
+impl RawTemplate {
+    fn merge_onto(self, mut t: Template) -> Template {
+        if let Some(v) = self.details {
+            t.details = v;
+        }
+        if let Some(v) = self.state {
+            t.state = v;
+        }
+        if let Some(v) = self.rotation {
+            t.rotation = v;
+        }
+        t
+    }
+}
+
+impl From<RawStatusTemplates> for StatusTemplates {
+    fn from(r: RawStatusTemplates) -> Self {
+        let d = StatusTemplates::default();
+        StatusTemplates {
+            working: r.working.merge_onto(d.working),
+            thinking: r.thinking.merge_onto(d.thinking),
+            compacting: r.compacting.merge_onto(d.compacting),
+            notification: r.notification.merge_onto(d.notification),
+            idle: r.idle.merge_onto(d.idle),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Template {
     pub details: String,
     pub state: String,
@@ -316,6 +364,52 @@ mod tests {
         assert_eq!(c.assets, Assets::default());
     }
 
+    #[test]
+    fn partial_status_table_keeps_that_status_defaults() {
+        let d = Config::default();
+        let c: Config = toml::from_str("[status.idle]\ndetails = \"zzz\"\n[status.thinking]\nstate = \"s\"").unwrap();
+        assert_eq!(c.status.idle.details, "zzz");
+        assert_eq!(c.status.idle.state, d.status.idle.state);
+        assert_eq!(c.status.idle.rotation, d.status.idle.rotation);
+        assert!(!c.status.idle.rotation.is_empty());
+        assert_eq!(c.status.thinking.details, d.status.thinking.details);
+        assert_eq!(c.status.thinking.state, "s");
+        assert_eq!(c.status.thinking.rotation, d.status.thinking.rotation);
+        assert_eq!(c.status.working, d.status.working);
+        assert_eq!(c.status.compacting, d.status.compacting);
+        assert_eq!(c.status.notification, d.status.notification);
+        // An empty table changes nothing.
+        let c: Config = toml::from_str("[status.idle]\n[status]\n").unwrap();
+        assert_eq!(c, d);
+    }
+
+    #[test]
+    fn explicit_empty_status_values_win() {
+        let c: Config = toml::from_str("[status.idle]\ndetails = \"\"\nrotation = []\n").unwrap();
+        assert_eq!(c.status.idle.details, "");
+        assert_eq!(c.status.idle.state, Config::default().status.idle.state);
+        assert!(c.status.idle.rotation.is_empty(), "rotation = [] disables rotation");
+
+        let c: Config = toml::from_str("[status.working]\nrotation = [{ details = \"r\" }]\n").unwrap();
+        assert_eq!(c.status.working.details, Config::default().status.working.details);
+        assert_eq!(c.status.working.rotation, vec![f("r", "")]);
+    }
+
+    #[test]
+    fn partial_assets_and_buttons_keep_defaults() {
+        let d = Config::default();
+        let c: Config = toml::from_str("[assets]\nidle = \"x\"\nlarge_text = \"\"\n").unwrap();
+        assert_eq!(c.assets.idle, "x");
+        assert_eq!(c.assets.large_text, "", "explicit empty string wins");
+        assert_eq!(c.assets.working, d.assets.working);
+        assert_eq!(c.assets.notification, d.assets.notification);
+        assert_eq!(c.buttons, d.buttons);
+
+        let c: Config = toml::from_str("buttons = [{ label = \"a\", url = \"https://e.com\" }]\n").unwrap();
+        assert_eq!(c.buttons, vec![Button { label: "a".into(), url: "https://e.com".into() }]);
+        assert_eq!(c.assets, d.assets);
+    }
+
     fn load_str(name: &str, toml: &str) -> Config {
         let p = std::env::temp_dir().join(format!("cp-config-{name}-{}.toml", std::process::id()));
         std::fs::write(&p, toml).unwrap();
@@ -364,6 +458,8 @@ mod tests {
             "idle_timeout = \"900\"\n",
             "activity_type = 300\n",
             "buttons = [{ label = \"x\" }]\n",
+            "[status.idle]\ndetails = 1\n",
+            "[status.idle]\nrotation = \"x\"\n",
             "this is not toml",
         ] {
             assert_eq!(load_str("bad", bad), Config::default(), "{bad:?}");

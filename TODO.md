@@ -1,11 +1,14 @@
 # TODO / handoff
 
-State of the project as of PR #1 (`claude/rust-claude-presence-p1vb5y`).
+State of the project after the hardening PRs #3 (core fixes), #4 (IPC and
+lifecycle) and #5 (docs).
 Work items are ordered by priority. Delete an entry once its fix is merged.
 
 ## Status
 
 - CI (fmt, clippy, test, release build on Linux/macOS/Windows) is green.
+  Unit tests: 76 on Linux/macOS, about 65 on Windows (socket and POSIX
+  permission tests are Unix-only).
 - **Verified on Windows by hand:** `install` (Task Scheduler), `status`, the
   hook named pipe, connecting to Discord and setting an activity (via a
   hand-fed `UserPromptSubmit` hook).
@@ -26,8 +29,9 @@ Line numbers are approximate.
 9. **Windows pipe name can be pre-created by another user** (`src/ipc.rs`).
    Our pipe now has an owner-only DACL, but a squatter who creates
    `\\.\pipe\claude-presence-<user>` first still receives hooks; the daemon
-   then logs "already running". Fix: client-side
-   `GetNamedPipeServerProcessId` + compare the server's token user SID.
+   then logs "another claude-presence daemon is already running". Fix:
+   client-side `GetNamedPipeServerProcessId` + compare the server's token
+   user SID.
 
 ### Low / unverified
 
@@ -41,9 +45,12 @@ Line numbers are approximate.
     (`src/discord.rs` `Presenter::shutdown`). After 1 s it is left running;
     fine at exit, but a `client_id` reload leaves the old thread (and its
     pipe) behind until its I/O returns.
+12. **`PostToolUseFailure` is handled but never wired** (`src/daemon.rs`
+    vs `install::HOOK_EVENTS`). Either add it to `HOOK_EVENTS` (check the
+    event exists in current Claude Code first) or drop the handler.
+13. **`install --no-service` on Windows still copies the binaries**, which
+    fails if the old daemon holds the `.exe`, and skips the old-daemon stop.
 
 ## Nice to have
 
 - Optionally add the Windows install dir to the user `PATH` on install.
-- PR #1 description footer: replace "Generated with Claude Code" with
-  `🤖 Written by the <sub-agent> sub-agent` (see CLAUDE.md).

@@ -481,37 +481,9 @@ impl Listener {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn roundtrip() {
-        let p = std::env::temp_dir().join(format!("cp-ipc-{}.sock", std::process::id()));
-        let l = Listener::bind(&p).unwrap();
-        assert_eq!(Listener::bind(&p).err().map(|e| e.kind()), Some(io::ErrorKind::AddrInUse));
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || l.serve(move |m| tx.send(m).is_ok()));
-        send(&p, b"Stop\n{}").unwrap();
-        assert!(daemon_running(&p));
-        send(&p, b"PreToolUse\n{\"a\":1}").unwrap();
-        assert_eq!(rx.recv().unwrap(), b"Stop\n{}");
-        assert_eq!(rx.recv().unwrap(), b"PreToolUse\n{\"a\":1}");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn shutdown_request_roundtrip() {
-        let p = std::env::temp_dir().join(format!("cp-ipc-stop-{}.sock", std::process::id()));
-        let l = Listener::bind(&p).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || l.serve(move |m| tx.send(m).is_ok()));
-        send(&p, &shutdown_request()).unwrap();
-        let m = rx.recv().unwrap();
-        assert_eq!(event_name(&m), SHUTDOWN.as_bytes());
-        assert!(is_control(event_name(&m)));
-        let _ = std::fs::remove_file(&p);
-    }
 
     #[test]
     fn control_event_names() {
@@ -523,112 +495,8 @@ mod tests {
         assert_eq!(event_name(b"Stop\n{}"), b"Stop");
         assert_eq!(event_name(b"__shutdown"), b"__shutdown");
         assert_eq!(event_name(b""), b"");
-    }
-
-    #[test]
-    fn private_dir_is_verified() {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
-        let base = std::env::temp_dir().join(format!("cp-priv-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        // Another test's bind may have the process umask at 0o177 right now.
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-        // Fresh: created owner-only; an existing good dir is accepted again.
-        let fresh = base.join("fresh");
-        ensure_private_dir(&fresh).unwrap();
-        assert_eq!(mode(&fresh), 0o700);
-        ensure_private_dir(&fresh).unwrap();
-
-        // Group/other access: rejected and left untouched.
-        let open = base.join("open");
-        std::fs::create_dir(&open).unwrap();
-        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(ensure_private_dir(&open).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(mode(&open), 0o755);
-        // ...and the daemon refuses to put its socket there.
-        let sock = open.join("hook.sock");
-        assert!(Listener::bind_with(&sock, true).is_err());
-        assert!(!sock.exists());
-        // Without the private-dir requirement (XDG_RUNTIME_DIR etc.) it binds.
-        drop(Listener::bind_with(&sock, false).unwrap());
-
-        // A symlink, even to a good dir, and a plain file are rejected.
-        let link = base.join("link");
-        std::os::unix::fs::symlink(&fresh, &link).unwrap();
-        assert!(ensure_private_dir(&link).is_err());
-        let file = base.join("file");
-        std::fs::write(&file, "").unwrap();
-        assert!(ensure_private_dir(&file).is_err());
-
-        // Someone else's dir.
-        assert!(check_private(true, 1, 0o40700, 2).is_err());
-        assert!(check_private(true, 2, 0o40700, 2).is_ok());
-        assert!(check_private(false, 2, 0o700, 2).is_err());
-        assert!(check_private(true, 2, 0o40701, 2).is_err());
-        // Owner must have rwx (a concurrent umask can't leave it unusable).
-        assert!(check_private(true, 2, 0o40500, 2).is_err());
-        assert!(check_private(true, 2, 0o40600, 2).is_err());
-
-        std::fs::remove_dir_all(&base).unwrap();
-    }
-
-    #[test]
-    fn parent_must_not_let_others_swap_the_dir() {
-        // Ours or root's, and sticky or not writable by others.
-        assert!(check_parent(true, 0, 0o41777, 5).is_ok()); // /tmp
-        assert!(check_parent(true, 5, 0o40755, 5).is_ok()); // ~/tmp
-        assert!(check_parent(true, 5, 0o40700, 5).is_ok());
-        assert!(check_parent(true, 5, 0o40777, 5).is_err()); // world-writable, not sticky
-        assert!(check_parent(true, 0, 0o40777, 5).is_err());
-        assert!(check_parent(true, 5, 0o40775, 5).is_err()); // group-writable
-        assert!(check_parent(true, 7, 0o41777, 5).is_err()); // another user's: they can rename anyway
-        assert!(check_parent(false, 5, 0o100700, 5).is_err());
-    }
-
-    #[test]
-    fn non_sticky_world_writable_parent_is_refused() {
-        use std::os::unix::fs::PermissionsExt;
-        let base = std::env::temp_dir().join(format!("cp-ww-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        // Another test's bind may have the process umask at 0o177 right now.
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let ww = base.join("ww");
-        std::fs::create_dir(&ww).unwrap();
-        let good = ww.join("good");
-        std::fs::create_dir(&good).unwrap();
-        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let l = Listener::bind_with(&good.join("s"), false).unwrap();
-        std::thread::spawn(move || l.serve(|_| true));
-
-        std::fs::set_permissions(&ww, std::fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(ensure_private_dir(&good).is_err(), "daemon side");
-        assert!(send_to(&good.join("s"), true, b"Stop\n{}").is_err(), "client side");
-        std::fs::set_permissions(&ww, std::fs::Permissions::from_mode(0o1777)).unwrap();
-        ensure_private_dir(&good).unwrap();
-        send_to(&good.join("s"), true, b"Stop\n{}").unwrap();
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn bind_waits_for_a_stopping_daemon() {
-        use std::time::{Duration, Instant};
-        let p = std::env::temp_dir().join(format!("cp-ipc-wait-{}.sock", std::process::id()));
-        let l = Listener::bind(&p).unwrap();
-        // Still held after the wait: gives up with AddrInUse.
-        let t = Instant::now();
-        let e = bind_waiting(&p, Duration::from_millis(300)).err().unwrap();
-        assert_eq!(e.kind(), io::ErrorKind::AddrInUse);
-        assert!(t.elapsed() >= Duration::from_millis(250));
-        // Released while waiting (old daemon finished shutting down).
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(400));
-            drop(l);
-        });
-        drop(bind_waiting(&p, Duration::from_secs(5)).unwrap());
+        assert_eq!(event_name(&shutdown_request()), SHUTDOWN.as_bytes());
+        assert!(is_control(event_name(&shutdown_request())));
     }
 
     #[test]
@@ -636,44 +504,187 @@ mod tests {
         assert_eq!(pipe_sddl("S-1-5-21-1-2-3-1001"), "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)");
     }
 
-    #[test]
-    fn client_refuses_unverified_fallback_dir() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::time::Duration;
-        let base = std::env::temp_dir().join(format!("cp-cli-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        // Another test's bind may have the process umask at 0o177 right now.
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let serve = |sock: &Path| {
-            let l = Listener::bind_with(sock, false).unwrap();
+    /// Tests that need a Unix socket or POSIX permissions.
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+
+        #[test]
+        fn roundtrip() {
+            let p = std::env::temp_dir().join(format!("cp-ipc-{}.sock", std::process::id()));
+            let l = Listener::bind(&p).unwrap();
+            assert_eq!(Listener::bind(&p).err().map(|e| e.kind()), Some(io::ErrorKind::AddrInUse));
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || l.serve(move |m| tx.send(m).is_ok()));
-            rx
-        };
+            send(&p, b"Stop\n{}").unwrap();
+            assert!(daemon_running(&p));
+            send(&p, b"PreToolUse\n{\"a\":1}").unwrap();
+            assert_eq!(rx.recv().unwrap(), b"Stop\n{}");
+            assert_eq!(rx.recv().unwrap(), b"PreToolUse\n{\"a\":1}");
+            let _ = std::fs::remove_file(&p);
+        }
 
-        // A squatter's open dir with a live listener: nothing is sent.
-        let open = base.join("open");
-        std::fs::create_dir(&open).unwrap();
-        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let rx = serve(&open.join("s"));
-        assert!(send_to(&open.join("s"), true, b"Stop\n{}").is_err());
-        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
-        // Outside the fallback dir no check is made.
-        send_to(&open.join("s"), false, b"Stop\n{}").unwrap();
-        assert_eq!(rx.recv().unwrap(), b"Stop\n{}");
+        #[test]
+        fn shutdown_request_roundtrip() {
+            let p = std::env::temp_dir().join(format!("cp-ipc-stop-{}.sock", std::process::id()));
+            let l = Listener::bind(&p).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || l.serve(move |m| tx.send(m).is_ok()));
+            send(&p, &shutdown_request()).unwrap();
+            let m = rx.recv().unwrap();
+            assert_eq!(event_name(&m), SHUTDOWN.as_bytes());
+            assert!(is_control(event_name(&m)));
+            let _ = std::fs::remove_file(&p);
+        }
 
-        // A good dir works; a symlink to it is refused.
-        let good = base.join("good");
-        ensure_private_dir(&good).unwrap();
-        let rx = serve(&good.join("s"));
-        send_to(&good.join("s"), true, b"Stop\n{}").unwrap();
-        assert_eq!(rx.recv().unwrap(), b"Stop\n{}");
-        let link = base.join("link");
-        std::os::unix::fs::symlink(&good, &link).unwrap();
-        assert!(send_to(&link.join("s"), true, b"Stop\n{}").is_err());
-        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        #[test]
+        fn private_dir_is_verified() {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+            let base = std::env::temp_dir().join(format!("cp-priv-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            // Another test's bind may have the process umask at 0o177 right now.
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        let _ = std::fs::remove_dir_all(&base);
+            // Fresh: created owner-only; an existing good dir is accepted again.
+            let fresh = base.join("fresh");
+            ensure_private_dir(&fresh).unwrap();
+            assert_eq!(mode(&fresh), 0o700);
+            ensure_private_dir(&fresh).unwrap();
+
+            // Group/other access: rejected and left untouched.
+            let open = base.join("open");
+            std::fs::create_dir(&open).unwrap();
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(ensure_private_dir(&open).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(mode(&open), 0o755);
+            // ...and the daemon refuses to put its socket there.
+            let sock = open.join("hook.sock");
+            assert!(Listener::bind_with(&sock, true).is_err());
+            assert!(!sock.exists());
+            // Without the private-dir requirement (XDG_RUNTIME_DIR etc.) it binds.
+            drop(Listener::bind_with(&sock, false).unwrap());
+
+            // A symlink, even to a good dir, and a plain file are rejected.
+            let link = base.join("link");
+            std::os::unix::fs::symlink(&fresh, &link).unwrap();
+            assert!(ensure_private_dir(&link).is_err());
+            let file = base.join("file");
+            std::fs::write(&file, "").unwrap();
+            assert!(ensure_private_dir(&file).is_err());
+
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+
+        #[test]
+        fn private_dir_rules() {
+            // Someone else's dir.
+            assert!(check_private(true, 1, 0o40700, 2).is_err());
+            assert!(check_private(true, 2, 0o40700, 2).is_ok());
+            assert!(check_private(false, 2, 0o700, 2).is_err());
+            assert!(check_private(true, 2, 0o40701, 2).is_err());
+            // Owner must have rwx (a concurrent umask can't leave it unusable).
+            assert!(check_private(true, 2, 0o40500, 2).is_err());
+            assert!(check_private(true, 2, 0o40600, 2).is_err());
+        }
+
+        #[test]
+        fn parent_must_not_let_others_swap_the_dir() {
+            // Ours or root's, and sticky or not writable by others.
+            assert!(check_parent(true, 0, 0o41777, 5).is_ok()); // /tmp
+            assert!(check_parent(true, 5, 0o40755, 5).is_ok()); // ~/tmp
+            assert!(check_parent(true, 5, 0o40700, 5).is_ok());
+            assert!(check_parent(true, 5, 0o40777, 5).is_err()); // world-writable, not sticky
+            assert!(check_parent(true, 0, 0o40777, 5).is_err());
+            assert!(check_parent(true, 5, 0o40775, 5).is_err()); // group-writable
+            assert!(check_parent(true, 7, 0o41777, 5).is_err()); // another user's: they can rename anyway
+            assert!(check_parent(false, 5, 0o100700, 5).is_err());
+        }
+
+        #[test]
+        fn non_sticky_world_writable_parent_is_refused() {
+            use std::os::unix::fs::PermissionsExt;
+            let base = std::env::temp_dir().join(format!("cp-ww-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            // Another test's bind may have the process umask at 0o177 right now.
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let ww = base.join("ww");
+            std::fs::create_dir(&ww).unwrap();
+            let good = ww.join("good");
+            std::fs::create_dir(&good).unwrap();
+            std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let l = Listener::bind_with(&good.join("s"), false).unwrap();
+            std::thread::spawn(move || l.serve(|_| true));
+
+            std::fs::set_permissions(&ww, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(ensure_private_dir(&good).is_err(), "daemon side");
+            assert!(send_to(&good.join("s"), true, b"Stop\n{}").is_err(), "client side");
+            std::fs::set_permissions(&ww, std::fs::Permissions::from_mode(0o1777)).unwrap();
+            ensure_private_dir(&good).unwrap();
+            send_to(&good.join("s"), true, b"Stop\n{}").unwrap();
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn bind_waits_for_a_stopping_daemon() {
+            use std::time::{Duration, Instant};
+            let p = std::env::temp_dir().join(format!("cp-ipc-wait-{}.sock", std::process::id()));
+            let l = Listener::bind(&p).unwrap();
+            // Still held after the wait: gives up with AddrInUse.
+            let t = Instant::now();
+            let e = bind_waiting(&p, Duration::from_millis(300)).err().unwrap();
+            assert_eq!(e.kind(), io::ErrorKind::AddrInUse);
+            assert!(t.elapsed() >= Duration::from_millis(250));
+            // Released while waiting (old daemon finished shutting down).
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(400));
+                drop(l);
+            });
+            drop(bind_waiting(&p, Duration::from_secs(5)).unwrap());
+        }
+
+        #[test]
+        fn client_refuses_unverified_fallback_dir() {
+            use std::os::unix::fs::PermissionsExt;
+            use std::time::Duration;
+            let base = std::env::temp_dir().join(format!("cp-cli-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            // Another test's bind may have the process umask at 0o177 right now.
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let serve = |sock: &Path| {
+                let l = Listener::bind_with(sock, false).unwrap();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || l.serve(move |m| tx.send(m).is_ok()));
+                rx
+            };
+
+            // A squatter's open dir with a live listener: nothing is sent.
+            let open = base.join("open");
+            std::fs::create_dir(&open).unwrap();
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let rx = serve(&open.join("s"));
+            assert!(send_to(&open.join("s"), true, b"Stop\n{}").is_err());
+            assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+            // Outside the fallback dir no check is made.
+            send_to(&open.join("s"), false, b"Stop\n{}").unwrap();
+            assert_eq!(rx.recv().unwrap(), b"Stop\n{}");
+
+            // A good dir works; a symlink to it is refused.
+            let good = base.join("good");
+            ensure_private_dir(&good).unwrap();
+            let rx = serve(&good.join("s"));
+            send_to(&good.join("s"), true, b"Stop\n{}").unwrap();
+            assert_eq!(rx.recv().unwrap(), b"Stop\n{}");
+            let link = base.join("link");
+            std::os::unix::fs::symlink(&good, &link).unwrap();
+            assert!(send_to(&link.join("s"), true, b"Stop\n{}").is_err());
+            assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }

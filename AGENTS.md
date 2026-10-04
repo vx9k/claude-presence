@@ -8,7 +8,10 @@ A lean alternative to the Node.js [claude-rpc](https://github.com/rar-file/claud
 
 1. **Low resource usage** — the daemon runs all day. No async runtime, no
    polling loops, no needless threads or allocations on hot paths. Target:
-   single-digit MB RSS, zero CPU while nothing happens.
+   single-digit MB RSS, near-zero CPU while nothing happens (the daemon only
+   wakes for hooks, signals and deadline-driven timers: background rescan,
+   card rotation and Discord keepalive while a card is shown, transcript
+   tail while a session is active, pending ledger save).
 2. **Performance** — SIMD JSON (`sonic-rs`), SIMD line splitting (`memchr`),
    incremental transcript reads (only newly appended bytes).
 3. **Never break the user's Claude Code session** — hooks must always exit 0
@@ -34,13 +37,18 @@ A lean alternative to the Node.js [claude-rpc](https://github.com/rar-file/claud
 | `src/paths.rs` | Per-OS directories and socket/pipe names |
 | `src/timeutil.rs` | Time helpers (RFC 3339 parsing, local offset, formatting) |
 | `src/log.rs` | Minimal leveled logger (`CLAUDE_PRESENCE_LOG`) |
+| `docs/` | In-depth docs: architecture, IPC/security, ledger, config, services, troubleshooting, development |
 | `TODO.md` | Handoff: open audit findings and verification status |
 
 ## Current state
 
 Open work (audit findings, unverified platforms, decisions already made) is
 tracked in [`TODO.md`](TODO.md). Read it before starting; update it when you
-fix or discover something.
+fix or discover something. How the pieces fit together is in
+[`docs/architecture.md`](docs/architecture.md); the reasoning behind the IPC
+checks and the ledger's crash rules is in
+[`docs/ipc-and-security.md`](docs/ipc-and-security.md) and
+[`docs/ledger.md`](docs/ledger.md).
 
 ## Invariants — don't break these
 
@@ -63,14 +71,20 @@ fix or discover something.
   tokens counted once per `message.id`, prompts once per `uuid`, globally.
   `seen.bin` is appended and synced before `ledger.json` is atomically
   replaced; a crash between them (or a failing ledger write) undercounts
-  everything since the last successful ledger write, never double counts. `seen.bin` is truncated to a multiple of 8 bytes on load and
-  before appending. Bump `VERSION` in `src/ledger.rs` on incompatible changes.
+  everything since the last successful ledger write, never double counts.
+  `seen.bin` is truncated to a multiple of 8 bytes on load and before
+  appending. Token arithmetic saturates. Bump `VERSION` in `src/ledger.rs` on incompatible changes.
 - **Discord rate limit:** ≤ 4 `SET_ACTIVITY` per 20 s, ≥ 4 s apart; bursts
   coalesce to the latest state. All Discord I/O stays on its worker thread.
 - **`settings.json`:** only touch hook entries whose command contains
   `claude-presence` and ` hook `; preserve everything else and key order.
-- **Config:** every key optional; `Config::default()` must equal
-  `DEFAULT_TOML`.
+- **Config:** every key optional (a partial `[status.*]` table falls back per
+  key to that status's defaults); `Config::default()` must equal
+  `DEFAULT_TOML`; `idle_timeout` and `rotation_interval` are clamped on load
+  (`Config::sanitized`).
+- **Tests never touch the real world:** no real Discord (use
+  `Presenter::inert` / `Daemon::with_presenter`), no real `settings.json`,
+  services or user dirs; temp paths are unique per test and per pid.
 
 ## Commands
 
@@ -95,7 +109,12 @@ short (AF_UNIX limit ~100 bytes) when overriding `XDG_RUNTIME_DIR`.
 
 - Match surrounding style; `rustfmt.toml` sets width 120.
 - Every `unsafe` block gets a `// SAFETY:` comment.
-- Testable fixes come with a unit test (tests live in each module).
+- **Test-driven:** write the failing unit test first, run it and confirm it
+  fails for the intended reason, then fix. Tests live in each module. Factor
+  decisions out of FFI/IO into pure functions so they are testable on Linux
+  (e.g. `check_private`, `pipe_sddl`, `Wire::record`, `read_frame_from`).
+  Bugs found while adding tests are fixed in the same change. See
+  [`docs/development.md`](docs/development.md).
 - Platform code is gated with `cfg(unix)`, `cfg(windows)`,
   `cfg(target_os = "macos")`, `cfg(all(unix, not(target_os = "macos")))`.
 - Commits: imperative subject; end with a `Sub-agent: <name>` trailer naming
