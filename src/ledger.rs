@@ -567,7 +567,9 @@ fn settle(st: &mut FileState, cx: &mut Ctx<'_>, resolve: &mut dyn FnMut(&mut [Pe
         }
         if !p.prompt {
             if let Some(e) = st.ring.iter_mut().find(|e| e.id == p.id) {
-                e.seen = if p.fresh { Seen::Counted } else { Seen::Dup };
+                // A healed id (fresh in an already counted region) may be a
+                // copy counted elsewhere: its later growth stays out of the totals.
+                e.seen = if p.fresh && !p.counted { Seen::Counted } else { Seen::Dup };
             }
         }
     }
@@ -1671,6 +1673,27 @@ mod tests {
         assert_eq!(l.file(&key).unwrap().usage.output, 50);
         l.save().unwrap();
         assert_eq!(seen_len(&dir), 16, "seen.bin is rebuilt");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn healed_id_growth_does_not_recount() {
+        // m1 is counted, then its id is forgotten (`seen.bin` lost) and the
+        // file re-read: the healed id must not let later
+        // usage growth on m1 into the totals, as it may be a copy counted
+        // elsewhere. The pad puts the growth line in a separate read.
+        let pad = format!(r#"{{"type":"x","pad":"{}"}}"#, "a".repeat(READ_CHUNK + 1024));
+        let content = asst("m1", "2026-10-04T10:00:05Z", 100, 1) + "\n" + &pad + "\n";
+        let (dir, f, key, mut l) = one_file("healed-growth", content.as_bytes());
+        l.ingest(&key);
+        let totals = l.totals.clone();
+        l.seen.clear();
+        l.files.get_mut(&key).unwrap().schema = 0;
+        append_bytes(&f, format!("{}\n", asst("m1", "2026-10-04T10:00:06Z", 100, 50)).as_bytes());
+        assert!(l.ingest(&key));
+        assert!(l.seen.contains(&id_hash(b"m1")), "the id is recorded again");
+        assert_eq!(l.file(&key).unwrap().usage.output, 50, "the file's own view grows");
+        assert_eq!(l.totals, totals, "a healed id's growth is not counted");
         let _ = fs::remove_dir_all(&dir);
     }
 

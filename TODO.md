@@ -70,11 +70,6 @@ Line numbers are approximate.
     id-less, so a new user whose only transcript has no prompts gets
     "previously counted ids are forgotten" on every start. Fix: warn on
     `NotFound` only if `totals.turns + totals.prompts > 0`.
-19. **Healed ids can recount growth** (`src/ledger.rs` `settle`): after
-    `seen.bin` is lost, a healed id becomes `Seen::Counted`, so growth on
-    its lines past `counted_to` goes to totals even if the message was a
-    copy counted elsewhere. Very narrow. Optional fix: `e.seen = Seen::Dup`
-    when `p.counted`.
 20. **docs/ledger.md "Known per-file overcount" is imprecise**: it applies
     to any message evicted from the ring (not only ones counted
     elsewhere), and the evicted message's later growth is lost from
