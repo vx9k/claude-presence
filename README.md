@@ -42,8 +42,9 @@ hooks) and `claude-presenced` (the background daemon). `install` then:
 It ends with `daemon is running` when everything worked. Then just use Claude Code.
 Check on it any time with `claude-presence status`.
 
-Re-running `install` is safe (e.g. after upgrading): it stops the old service, rewrites
-the hooks and service file, and starts the new binary.
+Re-running `install` is safe (e.g. after upgrading): it asks a running daemon to stop
+cleanly (it saves your stats; waits up to 2 s; prints `stopped the running daemon`),
+stops the old service, rewrites the hooks and service file, and starts the new binary.
 
 ### Commands
 
@@ -168,8 +169,8 @@ nohup claude-presenced >/dev/null 2>&1 &         # start again (if it's on your 
 ```
 
 Remove manually: `rm ~/.config/autostart/claude-presence.desktop`, then
-`pkill -x claude-presenced`. (`uninstall` deletes the file but does **not** stop the
-running process; it ends at logout or with `pkill`.)
+`pkill -x claude-presenced`. (`uninstall` also asks the running daemon to stop; the
+manual `rm` does not.)
 
 ### macOS (launchd)
 
@@ -245,8 +246,8 @@ reg delete HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v claude-presence
 taskkill /IM claude-presenced.exe /F
 ```
 
-(`uninstall` removes the value but does not stop an already running daemon; it ends at
-sign-out or with `taskkill`.)
+(`uninstall` removes the value and also asks the running daemon to stop; the manual
+`reg delete` does not.)
 
 ## Uninstall
 
@@ -254,6 +255,9 @@ sign-out or with `taskkill`.)
 claude-presence uninstall          # remove hooks + service (all flavors listed above)
 claude-presence uninstall --purge  # also delete config and lifetime stats
 ```
+
+`uninstall` first asks a running daemon to stop cleanly (saving stats, waiting up to 2 s)
+and prints `stopped the running daemon`, whatever started it.
 
 `uninstall` doesn't delete the binaries: `cargo uninstall claude-presence`, and on Windows
 also delete `%LOCALAPPDATA%\Programs\claude-presence`.
@@ -331,6 +335,15 @@ used. Out-of-range values are clamped on load: `idle_timeout` to 60..604800 seco
    `first hook received (<event>)` (visible at the default `info` level). If you never see
    it after using Claude Code, the hooks are not reaching the daemon: recheck steps 3 and 4.
    Press Ctrl+C to quit, then start the service again.
+   On Linux without `$XDG_RUNTIME_DIR` or `/run/user/<uid>`, the hook socket is
+   `<tmp>/claude-presence-<uid>/hook.sock` (normally `/tmp/...`). The daemon creates that
+   directory with mode 0700 and refuses to start if it belongs to another user or is
+   group/other-accessible, logging `cannot listen on …: … owned by another user` (or
+   `accessible by group/other`); hooks then send nothing. Remove or `chmod 700` the
+   directory if it is yours.
+   On Windows, the pipe is owner-only: a daemon started by hand from an elevated (admin)
+   terminal locks out hooks from non-elevated Claude Code. Run `claude-presence daemon`
+   from a normal terminal, or use the scheduled task.
 6. **Log files.** Windows: `%LOCALAPPDATA%\claude-presence\daemon.log`.
    macOS: `~/Library/Logs/claude-presence.log`. systemd: `journalctl --user -u claude-presence`.
    Levels via `CLAUDE_PRESENCE_LOG`: `error`, `warn`, `info` (default), `debug`.
