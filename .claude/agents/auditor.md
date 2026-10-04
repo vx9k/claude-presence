@@ -23,6 +23,13 @@ You may run `cargo test`, `cargo clippy --all-targets`, and
 cross toolchain for bundled SQLite; without one, reason about the cfg code
 and note that only CI checks it).
 
+If the diff comes with proposed commit messages, check them against
+Conventional Commits (docs/development.md#commit-messages): right type and
+scope, one logical change per commit, and `!` plus a `BREAKING CHANGE:`
+footer whenever the change breaks the hook wire format, the ledger or
+config format, the CLI or service names. A missing breaking marker is a
+medium finding; other message problems are low.
+
 Report each finding as: file:line, severity (high/medium/low), what is wrong,
 a concrete failing scenario, and a suggested fix. Only report issues you have
 verified by reading the code; say "no findings" rather than padding the list.

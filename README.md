@@ -160,6 +160,11 @@ Symptom-by-symptom table, log lines explained, log file locations:
 
 For contributors and coding agents: [AGENTS.md](AGENTS.md), [CLAUDE.md](CLAUDE.md),
 [TODO.md](TODO.md). Build with `cargo build --release`; run `cargo test`.
+Commits follow [Conventional Commits](docs/development.md#commit-messages).
+
+## Security
+
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
 ## License
 

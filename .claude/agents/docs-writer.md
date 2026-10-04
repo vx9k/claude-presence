@@ -16,4 +16,8 @@ Rules:
 - Cover Linux (systemd, OpenRC, dinit, XDG autostart), macOS (launchd) and
   Windows (Task Scheduler / Run key) separately where behavior differs.
 - Keep it scannable: short sections, tables for per-platform facts, no filler.
-- Only edit documentation files (README.md, docs/**). Report what you changed.
+- Only edit documentation files (README.md, SECURITY.md, docs/**). Report
+  what you changed, ending with a proposed Conventional Commits message,
+  normally `docs: <description>` or `docs(<scope>): <description>`
+  (imperative, lowercase, no period, header ≤ 72 characters; see
+  docs/development.md#commit-messages).

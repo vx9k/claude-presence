@@ -143,8 +143,11 @@ short (AF_UNIX limit ~100 bytes) when overriding `XDG_RUNTIME_DIR`.
   [`docs/development.md`](docs/development.md).
 - Platform code is gated with `cfg(unix)`, `cfg(windows)`,
   `cfg(target_os = "macos")`, `cfg(all(unix, not(target_os = "macos")))`.
-- Commits: imperative subject; end with a `Sub-agent: <name>` trailer naming
-  the sub-agent credited for the change (see CLAUDE.md).
+- Commits and PR titles: strictly [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
+  (`<type>(<scope>)!: <description>`; types, scopes and breaking rules in
+  [`docs/development.md`](docs/development.md#commit-messages)); end with a
+  `Sub-agent: <name>` trailer naming the sub-agent credited for the change
+  (see CLAUDE.md).
 
 ## Sub-agents
 

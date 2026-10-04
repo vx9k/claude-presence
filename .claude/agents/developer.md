@@ -19,4 +19,9 @@ Rules:
   and `--target aarch64-apple-darwin` when a C cross toolchain for that
   target is installed (bundled SQLite needs one); otherwise say they were
   skipped and that CI's native clippy covers them.
-- Do not commit or push; report what you changed and why.
+- Do not commit or push; report what you changed and why, and end the report
+  with the proposed commit message(s) in Conventional Commits form
+  (`<type>(<scope>)!: <description>`; types, scopes and breaking rules in
+  docs/development.md#commit-messages). Propose one commit per logical
+  change; mark anything that breaks the hook wire format, ledger/config
+  format or CLI with `!` and a `BREAKING CHANGE:` footer.

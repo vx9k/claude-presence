@@ -115,7 +115,7 @@ Loop for a change:
 2. `developer`: implement with tests; run all checks; the two cross clippy targets are optional (they need a C cross toolchain), so say in the PR which platforms were only checked by CI.
 3. `auditor`: review the diff; hand findings back to `developer` until it reports no high or medium findings.
 4. `docs-writer`: update README and `docs/` when commands, config keys, template variables, paths or service behavior changed. This and the audit can run in parallel.
-5. Commit, push, check CI.
+5. Commit with a [Conventional Commits](#commit-messages) message, push, check CI.
 
 Start new work from [TODO.md](../TODO.md); update it when you fix or discover something.
 
@@ -123,10 +123,73 @@ Start new work from [TODO.md](../TODO.md); update it when you fix or discover so
 
 Commits and PR descriptions are credited to one sub-agent picked at random from `advisor`, `auditor`, `developer`, `docs-writer`:
 
-- commit: imperative subject and a `Sub-agent: <name>` trailer;
+- commit: a `Sub-agent: <name>` trailer (see [Commit messages](#commit-messages));
 - PR description: end with `🤖 Written by the <name> sub-agent`.
 
 Keep any other trailers your harness requires.
+
+### Commit messages
+
+Every commit, and every PR title, strictly follows
+[Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/):
+
+```
+<type>(<scope>)!: <description>
+
+<body>
+
+<footers>
+```
+
+- **type** (required), one of:
+
+  | Type | Use for |
+  |---|---|
+  | `feat` | A new user-visible feature (command, flag, config key, template variable, card behavior) |
+  | `fix` | A bug fix |
+  | `perf` | A change that only improves speed or resource usage |
+  | `refactor` | A code change that neither fixes a bug nor adds a feature |
+  | `test` | Adding or correcting tests only |
+  | `docs` | README, `docs/`, `SECURITY.md`, `AGENTS.md`, `CLAUDE.md`, `TODO.md`, agent definitions |
+  | `build` | `Cargo.toml`, `Cargo.lock`, `.cargo/`, dependency changes |
+  | `ci` | `.github/` |
+  | `style` | Formatting only (`cargo fmt`) |
+  | `chore` | Anything else that touches no source or docs |
+  | `revert` | Reverting a commit; the body says `This reverts commit <sha>.` |
+
+  A commit that fixes a bug and adds its test is `fix`, not `test`.
+- **scope** (optional): the module or area, lowercase: `daemon`, `discord`,
+  `ipc`, `ledger`, `presence`, `config`, `install`, `git`, `paths`, `log`,
+  `timeutil`, `cli` (`src/main.rs`), `deps`, `agents`. Omit it when a change
+  spans many areas.
+- **`!`** after the type/scope, plus a `BREAKING CHANGE: <what and how to
+  migrate>` footer, when a change breaks users: the hook wire format, the
+  ledger or config format without automatic migration, a removed command,
+  flag or config key, or changed service names.
+- **description**: imperative mood, lowercase first letter, no trailing
+  period, the whole header at most 72 characters. `fix(ipc): reject pipes
+  owned by other users`, not `Fixed pipe owner check.`
+- **body** (optional, after a blank line): what and why, wrapped at 72.
+- **footers** (after a blank line), in this order: `BREAKING CHANGE:`, `Refs: #<n>` /
+  `Closes: #<n>`, `Sub-agent: <name>`, then any trailers your harness
+  requires (e.g. `Co-Authored-By:`).
+
+One logical change per commit; split mixed work (e.g. `fix(ledger): ...` and
+`docs: ...`) rather than picking one type. PRs are squash-merged, so the PR
+title becomes the commit on `main` and must follow the same rules.
+
+Example:
+
+```
+feat(ledger)!: store lifetime stats in sqlite
+
+Ids, totals and file offsets now commit in one transaction, so a crash
+can no longer undercount.
+
+BREAKING CHANGE: ledger.json and seen.bin are imported once into
+ledger.db and renamed to *.bak; older versions cannot read ledger.db.
+Sub-agent: developer
+```
 
 ## CI
 
