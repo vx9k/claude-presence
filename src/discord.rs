@@ -6,8 +6,8 @@
 //!
 //! All socket I/O happens on one worker thread that owns the connection, so a
 //! wedged Discord client can never stall hook processing. The worker also
-//! enforces Discord's activity rate limit (≈5 updates / 20 s): rapid changes
-//! coalesce to the latest one.
+//! enforces Discord's activity rate limit (≤ 4 updates / 20 s, ≥ 4 s apart):
+//! rapid changes coalesce to the latest one.
 
 use serde::Deserialize;
 use sonic_rs::{JsonValueTrait, LazyValue};
