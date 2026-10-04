@@ -130,7 +130,8 @@ borrowed from claude-rpc; see the note there.
    activities* on.
 3. Only local Claude Code sessions can be shown (not cloud sessions). Test without Claude
    Code: `echo '{"session_id":"test","cwd":"/"}' | claude-presence hook UserPromptSubmit`
-   should make a card appear.
+   should make a card appear (with `cwd` `/` only the second line shows; use a real project
+   directory to see the full card).
 4. Watch it live: stop the service, then `CLAUDE_PRESENCE_LOG=debug claude-presence daemon`.
    The log line `first hook received (<event>)` proves hooks reach the daemon.
 

@@ -9,8 +9,9 @@ A lean alternative to the Node.js [claude-rpc](https://github.com/rar-file/claud
 1. **Low resource usage** — the daemon runs all day. No async runtime, no
    polling loops, no needless threads or allocations on hot paths. Target:
    single-digit MB RSS, near-zero CPU while nothing happens (the daemon only
-   wakes for hooks and a few timers: background rescan, Discord keepalive
-   while a card is shown, pending ledger save).
+   wakes for hooks, signals and deadline-driven timers: background rescan,
+   card rotation and Discord keepalive while a card is shown, transcript
+   tail while a session is active, pending ledger save).
 2. **Performance** — SIMD JSON (`sonic-rs`), SIMD line splitting (`memchr`),
    incremental transcript reads (only newly appended bytes).
 3. **Never break the user's Claude Code session** — hooks must always exit 0
@@ -79,7 +80,8 @@ checks and the ledger's crash rules is in
   `claude-presence` and ` hook `; preserve everything else and key order.
 - **Config:** every key optional (a partial `[status.*]` table falls back per
   key to that status's defaults); `Config::default()` must equal
-  `DEFAULT_TOML`; numeric durations are clamped on load (`Config::sanitized`).
+  `DEFAULT_TOML`; `idle_timeout` and `rotation_interval` are clamped on load
+  (`Config::sanitized`).
 - **Tests never touch the real world:** no real Discord (use
   `Presenter::inert` / `Daemon::with_presenter`), no real `settings.json`,
   services or user dirs; temp paths are unique per test and per pid.

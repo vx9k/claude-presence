@@ -18,13 +18,13 @@ Bypasses Claude Code and proves daemon, socket and Discord work:
 echo '{"session_id":"t","cwd":"/"}' | claude-presence hook UserPromptSubmit
 ```
 
-A "Thinking in ..." card should appear within a few seconds. Remove it with:
+A card should appear within a few seconds. With `cwd` set to `/` the project name is empty, so the first line (`Thinking in {project}`) is dropped and only the second line shows, for example `Claude · 1 prompt · 0 tokens`. To see the full card, use a real project directory as `cwd`, for example `{"session_id":"t","cwd":"/path/to/your/project"}` (the card then reads `Thinking in project`). Remove the card with:
 
 ```sh
 echo '{"session_id":"t"}' | claude-presence hook SessionEnd
 ```
 
-The hook command prints nothing and always exits 0, even when the daemon is down, so use `status` to see whether it arrived (or the `first hook received` log line).
+The hook command prints nothing and always exits 0, even when the daemon is down, and `status` does not show whether a hook arrived. Look at the card in Discord, or at the `first hook received (<event>)` log line (logged once per daemon run).
 
 ## Symptom, cause, fix
 
@@ -40,11 +40,11 @@ The hook command prints nothing and always exits 0, even when the daemon is down
 | Log: `warn: Discord rejected the activity: <message>` | Discord refused the payload (for example a bad button URL or an `activity_type` it does not accept) | Fix the offending `config.toml` value; the card is not retried until the activity changes |
 | Log: `info: Discord connection lost: ...` | Discord restarted | Nothing; it reconnects and resends |
 | Card never appears; no `first hook received (<event>)` line | Hooks are not reaching the daemon | Local session? Hooks wired? Daemon running? See next rows |
-| Cloud session (claude.ai/code, or a cloud environment in the desktop app) shows nothing | The hooks run in a remote container, not on your machine. There is no fallback detection (decided in TODO.md). | Use the `claude` CLI or a local session. Plain chat has no hooks. |
+| Cloud session (claude.ai/code, or a cloud environment in the desktop app) shows nothing | The hooks run in a remote container, not on your machine. There is no fallback detection (decided in TODO.md). | Use a local session: the `claude` CLI, or a session in the desktop app's Code tab that uses your local machine. Plain chat in the Claude app has no hooks. |
 | Hooks missing | `install` was run with `--no-hooks`, or Claude Code was open during install | Check `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) for commands ending in `hook SessionStart`, `hook PreToolUse`, and so on; run `claude-presence install --no-service`; restart Claude Code |
 | Hooks stopped working after moving or deleting the binary | Hook commands hold the absolute path of the executable used at install time | Re-run `claude-presence install` from the new location |
 | `install` fails with `failed to update Claude Code settings: settings.json: ...` | `settings.json` is not valid JSON or not an object, or `hooks`/`hooks.<Event>` has an unexpected type | Fix the file by hand (the first install keeps `settings.json.bak`), then re-run |
-| `install` ends with `daemon not reachable yet` | Service manager is slow or the service failed | Wait a few seconds and run `status`; if still down, see the service logs. Note the printed commands for OpenRC, dinit, systemd or launchd when it says `wrote <file> - enable it with ...` |
+| `install` ends with `daemon not reachable yet` | Service manager is slow or the service failed | Wait a few seconds and run `status`; if still down, see the service logs. Note the printed commands for OpenRC, dinit, systemd or launchd when it says `wrote <file> — enable it with ...` (launchd: `wrote <file> — load it with ...`) |
 | `install` prints `note: installing from a debug build directory` | Running `target/debug/claude-presence` | `cargo install --path .` first, so hooks do not point into `target/` |
 | Card disappears after a while | Expected: `idle_timeout` (default 900 s) with no activity and no transcript writes. Sessions that are Thinking, Working or Compacting (mid-task) are kept at least one hour; a session waiting on you (Notification) uses the plain `idle_timeout`. A closed Claude Code clears it immediately via `SessionEnd`. | `idle_timeout = 0` to keep it until Claude Code exits |
 | Card shows the wrong session with several open | The card sticks to the shown session while it is as active as any other; it switches when it goes idle and another is working | Expected ([architecture.md](architecture.md#which-session-is-shown-sticky-choice)) |

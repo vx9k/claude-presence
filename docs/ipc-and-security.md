@@ -33,7 +33,7 @@ Event names starting with `__` are reserved (`ipc::is_control`).
 | OS | Hook endpoint | Verified before use |
 |---|---|---|
 | Linux | `$XDG_RUNTIME_DIR/claude-presence.sock`, else `/run/user/<uid>/claude-presence.sock` if that directory exists | no (OS-provided private dir is trusted) |
-| Linux, no runtime dir | `<tmp>/claude-presence-<uid>/hook.sock`; `<tmp>` is `$TMPDIR`, `$TMP`, `$TEMP`, else `/tmp` | yes, by daemon and client |
+| Linux or macOS, no per-user runtime dir | `<tmp>/claude-presence-<uid>/hook.sock`; `<tmp>` is `$TMPDIR`, `$TMP`, `$TEMP`, else `/tmp` | yes, by daemon and client |
 | macOS | `<per-user temp dir>/claude-presence.sock` (`confstr(_CS_DARWIN_USER_TEMP_DIR)`, then `$XDG_RUNTIME_DIR`) | no |
 | Windows | `\\.\pipe\claude-presence-<USERNAME>` (characters other than ASCII letters, digits, `-`, `_` become `_`) | by DACL |
 
@@ -63,7 +63,7 @@ Daemon failure logs `cannot listen on <path>: <path>: <reason>` and exits 1. Fix
 
 `CreateNamedPipeW` with:
 
-- `FILE_FLAG_FIRST_PIPE_INSTANCE` on the first instance; if it fails with access denied the daemon reports `daemon already running`.
+- `FILE_FLAG_FIRST_PIPE_INSTANCE` on the first instance; if it fails with access denied, bind reports "daemon already running", and the daemon logs `another claude-presence daemon is already running` and exits 0.
 - a protected DACL `D:P(A;;GA;;;<your user SID>)` built from the process token's `TokenUser`. It uses the SID, not owner rights, so an elevated daemon still accepts your non-elevated hooks.
 - `PIPE_REJECT_REMOTE_CLIENTS`, inbound only, byte mode.
 - a new instance is created before the current client is read, so the name is never free between clients.
@@ -89,7 +89,7 @@ Not covered:
 
 ### Unverified on Windows (TODO.md items 9 and 10)
 
-- Pipe squatting (open item 9): the DACL is owner-only, but another user who creates `\\.\pipe\claude-presence-<user>` first still receives your hooks; the daemon then logs "already running". Proposed fix (not implemented): client checks `GetNamedPipeServerProcessId` against the token user SID.
+- Pipe squatting (open item 9): the DACL is owner-only, but another user who creates `\\.\pipe\claude-presence-<user>` first still receives your hooks; the daemon then logs `another claude-presence daemon is already running` and exits 0. Proposed fix (not implemented): client checks `GetNamedPipeServerProcessId` against the token user SID.
 - Type-checked only, not run: the `ERROR_NO_DATA` handling and error-path read in `Listener::serve`, the user-SID DACL (including an elevated daemon accepting non-elevated hooks), the bind retry while the old daemon exits, and the `__shutdown` reinstall path.
 - Verified by hand on Windows: `install` via Task Scheduler, `status`, the hook named pipe, and setting an activity from a hand-fed `UserPromptSubmit`.
 

@@ -29,7 +29,7 @@ The service name is `claude-presence` everywhere; the process is `claude-presenc
 | Windows | always `schtasks` (falls back to `run-key` if registration fails) |
 | Linux | 1. `/run/systemd/system` exists: `systemd`. 2. PID 1 is `dinit`, or `dinitctl` is on `PATH` and `rc-service` is not: `dinit`. 3. `/run/openrc` exists or `openrc` is on `PATH`: `openrc`. 4. otherwise `xdg-autostart`. |
 
-An `--init` for another OS (for example `launchd` on Linux) fails with `... is not available on this platform`.
+On Linux and Windows, an `--init` kind for another OS (for example `launchd` on Linux) fails after the hooks step with `service setup failed: <Kind> is not available on this platform`. On macOS the Linux kinds (`systemd`, `openrc`, `dinit`, `xdg-autostart`) are not rejected; they would write files nothing reads, so don't use them.
 
 ### Verification status
 
@@ -119,7 +119,7 @@ Plist keys: `Label` = `io.github.vx9k.claude-presence`, `ProgramArguments` = the
 
 ### Windows
 
-1. Install copies `claude-presence.exe` and `claude-presenced.exe` from where you ran them to `%LOCALAPPDATA%\Programs\claude-presence` (unless already there) and points hooks and the task at that copy. Only add that folder to `PATH` yourself if you want to type `claude-presence` anywhere (a PATH step is listed as nice-to-have in TODO.md).
+1. Install copies `claude-presence.exe` and `claude-presenced.exe` from where you ran them to `%LOCALAPPDATA%\Programs\claude-presence` (unless already there) and points hooks and the task at that copy, so you can delete the download. Only add that folder to `PATH` yourself if you want to type `claude-presence` anywhere (a PATH step is listed as nice-to-have in TODO.md).
 2. Task XML (UTF-16, written to `%TEMP%\claude-presence-task.xml`, deleted after): logon trigger for your account, `InteractiveToken`, `LeastPrivilege`, `MultipleInstancesPolicy` `IgnoreNew`, runs on battery, no execution time limit (`PT0S`), hidden, `RestartOnFailure` `PT1M` x 999, action = the daemon exe.
 3. `schtasks /End /TN claude-presence` (quiet), `schtasks /Create /TN claude-presence /XML <file> /F`. If Create fails, it prints `Task Scheduler registration failed; using the Run registry key instead` and uses the Run key. On success it removes any old Run value, then `schtasks /Run /TN claude-presence` (or starts the daemon detached if that fails).
 4. Run key: `reg add HKCU\...\Run /v claude-presence /t REG_SZ /d "<exe>" /f`, then the daemon is started detached.
@@ -130,12 +130,12 @@ The daemon is a GUI-subsystem binary (no console window). Its log lines are `<un
 
 | Platform | Status | Stop | Start / restart | Logs |
 |---|---|---|---|---|
-| systemd | `systemctl --user status claude-presence` | `systemctl --user stop claude-presence` | `systemctl --user restart claude-presence` | `journalctl --user -u claude-presence -f` |
-| OpenRC | `rc-service --user claude-presence status` | `rc-service --user claude-presence stop` | `rc-service --user claude-presence restart` | none; run in the foreground |
-| dinit | `dinitctl status claude-presence` | `dinitctl stop claude-presence` | `dinitctl restart claude-presence` | none; run in the foreground |
+| systemd | `systemctl --user status claude-presence` (look for `active (running)`) | `systemctl --user stop claude-presence` | `systemctl --user restart claude-presence` | `journalctl --user -u claude-presence -f` |
+| OpenRC | `rc-service --user claude-presence status` (look for `started`) | `rc-service --user claude-presence stop` | `rc-service --user claude-presence restart` | none; run in the foreground |
+| dinit | `dinitctl status claude-presence` (look for `STARTED`) | `dinitctl stop claude-presence` | `dinitctl restart claude-presence` | none; run in the foreground |
 | XDG autostart | `pgrep -a claude-presenced` | `pkill -x claude-presenced` | `nohup claude-presenced >/dev/null 2>&1 &` | none |
-| launchd | `launchctl print gui/$(id -u)/io.github.vx9k.claude-presence \| grep state` | `launchctl bootout gui/$(id -u)/io.github.vx9k.claude-presence` | `launchctl kickstart -k gui/$(id -u)/io.github.vx9k.claude-presence` (after bootout: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.vx9k.claude-presence.plist`) | `tail -f ~/Library/Logs/claude-presence.log` |
-| Task Scheduler | `schtasks /Query /TN claude-presence /V /FO LIST` | `schtasks /End /TN claude-presence` | `schtasks /Run /TN claude-presence` | `type %LOCALAPPDATA%\claude-presence\daemon.log` |
+| launchd | `launchctl print gui/$(id -u)/io.github.vx9k.claude-presence \| grep state` (look for `state = running`) | `launchctl bootout gui/$(id -u)/io.github.vx9k.claude-presence` | `launchctl kickstart -k gui/$(id -u)/io.github.vx9k.claude-presence` (after bootout: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.vx9k.claude-presence.plist`) | `tail -f ~/Library/Logs/claude-presence.log` |
+| Task Scheduler | `schtasks /Query /TN claude-presence /V /FO LIST` (`Running` or `Ready`); process check: `tasklist /FI "IMAGENAME eq claude-presenced.exe"` | `schtasks /End /TN claude-presence` | `schtasks /Run /TN claude-presence` | `type %LOCALAPPDATA%\claude-presence\daemon.log` |
 | Run key | `tasklist /FI "IMAGENAME eq claude-presenced.exe"` | `taskkill /IM claude-presenced.exe /F` | `start "" "%LOCALAPPDATA%\Programs\claude-presence\claude-presenced.exe"` | same `daemon.log` |
 
 There is no stop-only command in `claude-presence`; use the table. A service that respawns (OpenRC, dinit) must be stopped through its manager, not killed.
@@ -178,7 +178,7 @@ Re-running `claude-presence install` is safe. For the service step it:
 4. Keeps an existing `config.toml` (`keeping existing config <path>`); otherwise writes the default.
 5. Rewrites the hooks (idempotent; first run saves `settings.json.bak` next to `settings.json` if it did not exist).
 6. Writes the service file and starts the new binary.
-7. Waits up to 5 s (20 x 250 ms) for the daemon: `daemon is running`, or `daemon not reachable yet - check "<exe>" status in a moment`.
+7. Waits up to 5 s (20 x 250 ms) for the daemon: `daemon is running`, or ``daemon not reachable yet — check `"<exe>" status` in a moment`` (em dash and backticks as printed).
 
 A daemon that starts while the old one is still shutting down retries binding for up to 5 s (`bind_waiting`) before logging `another claude-presence daemon is already running` and exiting 0.
 

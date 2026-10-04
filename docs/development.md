@@ -52,7 +52,7 @@ Conventions the existing tests follow:
 | No real Discord: `Presenter::inert()` (no worker thread) plus `Presenter::wanted()` to read what was set; a fake Discord server on a `UnixListener` for protocol tests | `talks_to_fake_discord`, `tick_pushes_to_presenter_only` |
 | No real services or settings: render service files and settings as strings (`systemd_unit`, `wire_hooks(&str, &Path)`) instead of running `systemctl` or touching `~/.claude` | `service_files_render`, `wires_and_unwires_hooks_preserving_settings` |
 | Daemon without a Discord client: `Daemon::with_presenter(cfg, ledger, Presenter::inert())` and `handle_hook(...)`, `render(...)`, `pick()`, `tick()`, `expire(...)` called directly | `state_machine_and_render`, `sticky_session_choice` |
-| Pure logic split out of FFI so it runs on Linux: `check_private` and `check_parent` take plain uid/mode numbers; `pipe_sddl(sid)` is a string function; `Wire::record` and `next_allowed` hold the rate-limit logic; `route` and `expiry_secs` are free functions | `private_dir_is_verified`, `pipe_sddl_grants_only_the_user`, `throttle_window` |
+| Pure logic split out of FFI so it runs on Linux: `check_private` and `check_parent` take plain uid/mode numbers; `pipe_sddl(sid)` is a string function; `next_allowed` is the rate-limit logic and `Wire::record` the send-outcome and keepalive bookkeeping; `route` and `expiry_secs` are free functions | `private_dir_is_verified`, `pipe_sddl_grants_only_the_user`, `throttle_window` |
 | Output generic over `Write` so failures can be injected | `write_status` with a `ClosedPipe` writer in `src/main.rs` |
 | Regression tests named for the property | `crash_between_seen_and_ledger_never_double_counts`, `live_transcript_does_not_spin_expiry` |
 | Shift time instead of sleeping where possible | `d.rotation.since -= ...`, `sessions.get_mut(..).last_activity = ...`, then `tick()` |
@@ -107,7 +107,7 @@ Keep any other trailers your harness requires.
 
 ## CI
 
-`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests, on `ubuntu-latest`, `macos-latest` and `windows-latest` (not fail-fast): `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo build --release`. It uses the stable toolchain with clippy and rustfmt, and `Swatinem/rust-cache` (cache saved only on `main`). The cross clippy targets are not in CI; run them locally.
+`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests, on `ubuntu-latest`, `macos-latest` and `windows-latest` (not fail-fast): `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo build --release`. It uses the stable toolchain with clippy and rustfmt, and `Swatinem/rust-cache` (cache saved only on `main`). The cross clippy targets are not in CI; run them locally. Tests gated `cfg(unix)` (the socket tests in `src/ipc.rs` and `src/discord.rs`, and `stops_a_running_daemon` in `src/install.rs`) do not run on Windows, so the Windows pipe code has no automated runtime coverage. The whole `src/ipc.rs` test module is Unix-gated, including the `pipe_sddl` test, which therefore runs only on Linux and macOS.
 
 ## Release build
 

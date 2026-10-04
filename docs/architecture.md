@@ -44,7 +44,7 @@ flowchart LR
 | `hooks` | 128 KiB | always | `accept()` |
 | `discord` | 256 KiB | always (respawned if `client_id` changes on reload) | condvar, with a timed wait only when something is due |
 | `signals` | 64 KiB | Unix only; blocks SIGINT/SIGTERM/SIGHUP in all threads and `sigwait`s | `sigwait` |
-| scan workers | default | transient, only during a rescan of 32 or more transcripts; up to 8 | n/a |
+| scan workers | default | transient, during each scan: one scoped thread below 32 transcripts, otherwise up to 8 (limited by available parallelism) | n/a |
 
 On Windows there is no signals thread: a console control handler sends `Shutdown` and sleeps 1.5 s so the loop can clear the card and save.
 
@@ -60,7 +60,17 @@ Nothing polls. `Daemon::tick` returns how long the loop may sleep: the minimum o
 
 The Discord worker has its own deadlines: the next allowed send (rate limit), the reconnect retry, and a keepalive resend while a card is shown (60 s; 20 s against an arRPC bridge).
 
-There is no polling loop: the daemon wakes only for these timers (and for hooks and signals), so CPU use is near zero. With no sessions, a clean ledger and `rescan_interval = 0`, it sleeps until a hook or signal arrives. With defaults it wakes once per `rescan_interval` (30 min) for the background rescan, every 60 s while the ledger has a pending save, and (in the Discord worker) for the keepalive resend while a card is shown.
+There is no polling loop: the daemon wakes only for these timers (and for hooks and signals), so CPU use is near zero. Concretely:
+
+- every `rotation_interval` (default 15 s) while the shown card has rotation frames (by default only Idle does);
+- every 5 s to tail the transcript while the shown session is Thinking, Working or Compacting;
+- every 60 s while the ledger has a pending save;
+- once per `rescan_interval` (default 30 min) for the background rescan;
+- at a session's expiry time;
+- in the Discord worker, for the keepalive resend while a card is shown;
+- a 24 h fallback wake when nothing is pending.
+
+With no sessions, a clean ledger and `rescan_interval = 0`, only the 24 h fallback wake remains.
 
 Discord limits (`src/discord.rs`): at most 4 `SET_ACTIVITY` per 20 s window (`MAX_PER_WINDOW`, `WINDOW`) and at least 4 s apart (`MIN_GAP`); bursts coalesce to the latest wanted activity. Reconnect backoff starts at 2 s and doubles to 60 s; a refused handshake (bad `client_id`) waits 300 s.
 
@@ -70,7 +80,7 @@ Sessions are keyed by `session_id` (`"default"` if absent). A session is created
 
 | Event | Resulting status | Other effects |
 |---|---|---|
-| `SessionStart` (source `compact`) | Thinking | keeps counters |
+| `SessionStart` (source `compact`) | Thinking | keeps counters; records model hint |
 | `SessionStart` (other) | Idle | resets `started`, prompts, tools, tool, file; records model hint |
 | `UserPromptSubmit` | Thinking | prompts +1, clears tool and file |
 | `PreToolUse` | Working | tools +1, tool name (`mcp__a__b` shown as `a:b`), file from `file_path`, `notebook_path` or `path` |

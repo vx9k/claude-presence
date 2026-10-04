@@ -99,8 +99,8 @@ Missing keys fall back per key to that status's built-in default from the tables
 |---|---|---|
 | Session | `{project}` | Git root directory name, else the cwd's name; or `hidden_project_name` |
 | | `{branch}` | Git branch; empty when not a repo or hidden |
-| | `{model}` | Prettified model (`Opus 5.5`, `Sonnet 4.5`), else the SessionStart model hint, else `Claude` |
-| | `{tool}` | Current tool (`mcp__server__tool` shown as `server:tool`); empty unless Working |
+| | `{model}` | Prettified model (`Opus 5.5`, `Sonnet 4.5`) from the transcript, else from the SessionStart model hint, else `Claude` |
+| | `{tool}` | Last tool from PreToolUse (`mcp__server__tool` shown as `server:tool`); cleared by UserPromptSubmit, Stop and a new session |
 | | `{file}` | File name of the tool's `file_path`, `notebook_path` or `path`; empty when hidden |
 | | `{tokens}` | Session total tokens (input + output + cache read + cache write), compact (`12.3k`) |
 | | `{tokens_in}` | input + cache read + cache write |
