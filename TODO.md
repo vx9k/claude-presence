@@ -7,7 +7,7 @@ Work items are ordered by priority. Delete an entry once its fix is merged.
 ## Status
 
 - CI (fmt, clippy, test, release build on Linux/macOS/Windows) is green.
-  Unit tests: 86 on Linux, 84 on Windows (socket and POSIX permission tests
+  Unit tests: 90 on Linux, 88 on Windows (socket and POSIX permission tests
   are Unix-only; named pipe tests Windows-only).
 - **Verified on Windows by hand:** `install` (Task Scheduler), `status`, the
   hook named pipe, connecting to Discord and setting an activity (via a
@@ -40,8 +40,12 @@ Line numbers are approximate.
 
 ### Low / unverified
 
-None open.
-
-## Nice to have
-
-- Optionally add the Windows install dir to the user `PATH` on install.
+15. **Windows user `PATH` edit is only type-checked** (`src/install.rs`,
+    `edit_user_path`, `broadcast_environment_change`). The string logic
+    (`add_path_entry`, `remove_path_entry`, the 2047-character limit) is
+    unit-tested; the `HKCU\Environment` read/write and the
+    `WM_SETTINGCHANGE` broadcast have not run against a real registry. To
+    verify by hand: `install` adds the folder once (re-run says "already in
+    your user PATH"), a new terminal finds `claude-presence`, the value
+    type (`REG_EXPAND_SZ`) and `%vars%` survive, `uninstall` removes only
+    that entry, `--no-path` leaves `Path` alone.

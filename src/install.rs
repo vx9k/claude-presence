@@ -761,9 +761,230 @@ pub fn uninstall_service() -> Vec<String> {
     done
 }
 
+// ---------------------------------------------------------------- user PATH --
+
+/// Whether two `PATH` entries name the same directory: compared trimmed,
+/// case-insensitively and without trailing slashes. `%vars%` stay as written.
+#[cfg(any(windows, test))]
+fn same_path_entry(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> impl Iterator<Item = char> + '_ {
+        s.trim().trim_end_matches(['\\', '/']).chars().flat_map(char::to_lowercase)
+    }
+    norm(a).eq(norm(b))
+}
+
+/// `cur` with `dir` appended, or `None` if it is already there.
+#[cfg(any(windows, test))]
+pub fn add_path_entry(cur: &str, dir: &str) -> Option<String> {
+    if dir.trim().trim_end_matches(['\\', '/']).is_empty() || cur.split(';').any(|e| same_path_entry(e, dir)) {
+        return None;
+    }
+    let base = cur.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+    Some(if base.is_empty() { dir.to_owned() } else { format!("{base};{dir}") })
+}
+
+/// `cur` without the entries naming `dir`, or `None` if there are none.
+/// Every other entry is kept verbatim.
+#[cfg(any(windows, test))]
+pub fn remove_path_entry(cur: &str, dir: &str) -> Option<String> {
+    if !cur.split(';').any(|e| same_path_entry(e, dir)) {
+        return None;
+    }
+    Some(cur.split(';').filter(|e| !same_path_entry(e, dir)).collect::<Vec<_>>().join(";"))
+}
+
+/// Longest user `PATH` we write, in UTF-16 units: past 2047 characters
+/// Windows tools start to truncate or refuse it.
+pub const PATH_MAX_CHARS: usize = 2047;
+
+#[cfg(any(windows, test))]
+fn path_too_long(path: &str) -> bool {
+    path.encode_utf16().count() > PATH_MAX_CHARS
+}
+
+/// Outcome of editing the user `PATH`.
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum PathEdit {
+    /// Already as wanted; nothing written.
+    Unchanged,
+    /// Written. Running programs (open terminals) keep their old copy.
+    Written,
+    /// Skipped: the new value would be longer than [`PATH_MAX_CHARS`].
+    TooLong,
+}
+
+/// Append `dir` to the user `PATH` (`HKCU\Environment\Path`) unless present.
+#[cfg(windows)]
+pub fn add_to_user_path(dir: &Path) -> io::Result<PathEdit> {
+    let dir = dir.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "path is not valid Unicode"))?;
+    edit_user_path(|cur| add_path_entry(cur, dir))
+}
+
+/// Remove `dir` from the user `PATH`, leaving every other entry as it is.
+#[cfg(windows)]
+pub fn remove_from_user_path(dir: &Path) -> io::Result<PathEdit> {
+    let dir = dir.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "path is not valid Unicode"))?;
+    edit_user_path(|cur| remove_path_entry(cur, dir))
+}
+
+/// Read `HKCU\Environment\Path`, apply `edit` and write the result back
+/// with the value's own type (`REG_SZ` or `REG_EXPAND_SZ`; a missing value
+/// is created as `REG_EXPAND_SZ`). `%vars%` are never expanded. Only the
+/// per-user key is touched, never the machine-wide one.
+#[cfg(windows)]
+fn edit_user_path(edit: impl FnOnce(&str) -> Option<String>) -> io::Result<PathEdit> {
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ, REG_SZ, RegCloseKey, RegOpenKeyExW,
+        RegQueryValueExW, RegSetValueExW,
+    };
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(Some(0)).collect()
+    }
+    fn check(r: u32) -> io::Result<()> {
+        if r == ERROR_SUCCESS { Ok(()) } else { Err(io::Error::from_raw_os_error(r as i32)) }
+    }
+    struct Key(HKEY);
+    impl Drop for Key {
+        fn drop(&mut self) {
+            // SAFETY: the key was opened by RegOpenKeyExW and is closed only here.
+            unsafe { RegCloseKey(self.0) };
+        }
+    }
+
+    let (subkey, name) = (wide("Environment"), wide("Path"));
+    let mut raw: HKEY = std::ptr::null_mut();
+    // SAFETY: `subkey` is NUL-terminated and `raw` is a valid out pointer.
+    check(unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &mut raw) })?;
+    let key = Key(raw);
+
+    let mut ty = 0;
+    let mut buf: Vec<u16> = Vec::new();
+    let found = loop {
+        let mut bytes = (buf.len() * 2) as u32;
+        let data = if buf.is_empty() { std::ptr::null_mut() } else { buf.as_mut_ptr().cast() };
+        // SAFETY: `name` is NUL-terminated; `data` is null (size query) or
+        // points to `bytes` writable bytes; `ty` and `bytes` are valid out pointers.
+        let r = unsafe { RegQueryValueExW(key.0, name.as_ptr(), std::ptr::null(), &mut ty, data, &mut bytes) };
+        match r {
+            ERROR_FILE_NOT_FOUND => break false,
+            ERROR_SUCCESS if !buf.is_empty() || bytes == 0 => {
+                buf.truncate(bytes as usize / 2);
+                break true;
+            }
+            // Size known (or the value grew meanwhile): make room and read again.
+            ERROR_SUCCESS | ERROR_MORE_DATA => buf.resize((bytes as usize).div_ceil(2) + 1, 0),
+            r => return Err(io::Error::from_raw_os_error(r as i32)),
+        }
+    };
+    if !found {
+        ty = REG_EXPAND_SZ;
+    } else if ty != REG_SZ && ty != REG_EXPAND_SZ {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "HKCU\\Environment\\Path is not a string value"));
+    }
+    // The stored data may or may not include its terminator.
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let cur = String::from_utf16(&buf[..end])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "HKCU\\Environment\\Path is not valid UTF-16"))?;
+
+    let Some(new) = edit(&cur) else {
+        return Ok(PathEdit::Unchanged);
+    };
+    if path_too_long(&new) {
+        return Ok(PathEdit::TooLong);
+    }
+    let data = wide(&new);
+    // SAFETY: `data` is NUL-terminated and the length passed is its size in
+    // bytes, terminator included, as REG_SZ / REG_EXPAND_SZ require.
+    check(unsafe { RegSetValueExW(key.0, name.as_ptr(), 0, ty, data.as_ptr().cast(), (data.len() * 2) as u32) })?;
+    drop(key);
+    broadcast_environment_change();
+    Ok(PathEdit::Written)
+}
+
+/// Tell running programs (Explorer, so new terminals) that the environment
+/// changed. Best effort: hung windows are skipped, failures ignored.
+#[cfg(windows)]
+fn broadcast_environment_change() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
+    };
+    let area: Vec<u16> = "Environment".encode_utf16().chain(Some(0)).collect();
+    let mut result = 0;
+    // SAFETY: `area` is a NUL-terminated string that outlives the call (the
+    // system marshals WM_SETTINGCHANGE strings to other processes), and
+    // `result` is a valid out pointer.
+    unsafe {
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            area.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            2000,
+            &mut result,
+        )
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_entry_is_added_once() {
+        let dir = r"C:\Users\me\AppData\Local\Programs\claude-presence";
+        assert_eq!(add_path_entry("", dir).as_deref(), Some(dir));
+        assert_eq!(add_path_entry("  ", dir).as_deref(), Some(dir));
+        assert_eq!(add_path_entry(r"C:\a", dir), Some(format!(r"C:\a;{dir}")));
+        // No empty segment from a trailing separator.
+        assert_eq!(add_path_entry(r"C:\a;", dir), Some(format!(r"C:\a;{dir}")));
+        assert_eq!(add_path_entry(r"C:\a;; ", dir), Some(format!(r"C:\a;{dir}")));
+        // %vars% are kept as written, never expanded.
+        assert_eq!(add_path_entry(r"%USERPROFILE%\bin", dir), Some(format!(r"%USERPROFILE%\bin;{dir}")));
+        // Already present: case, surrounding blanks and a trailing slash don't matter.
+        for cur in [
+            dir.to_owned(),
+            format!(r"C:\a;{dir};C:\b"),
+            format!(r"C:\a; {} ", dir.to_uppercase()),
+            format!(r"{dir}\;C:\b"),
+            format!("C:\\a;{dir}/"),
+        ] {
+            assert_eq!(add_path_entry(&cur, dir), None, "{cur}");
+        }
+        assert_eq!(add_path_entry(&format!(r"C:\a;{dir}x"), dir), Some(format!(r"C:\a;{dir}x;{dir}")));
+        // A trailing separator on `dir` itself is tolerated too.
+        assert_eq!(add_path_entry(dir, &format!(r"{dir}\")), None);
+    }
+
+    #[test]
+    fn path_entry_is_removed_alone() {
+        let dir = r"C:\Users\me\AppData\Local\Programs\claude-presence";
+        assert_eq!(remove_path_entry("", dir), None);
+        assert_eq!(remove_path_entry(r"C:\a;C:\b", dir), None);
+        assert_eq!(remove_path_entry(&format!(r"C:\a;{dir}x"), dir), None, "prefix is not a match");
+        assert_eq!(remove_path_entry(dir, dir).as_deref(), Some(""));
+        assert_eq!(remove_path_entry(&format!(r"C:\a;{dir}"), dir).as_deref(), Some(r"C:\a"));
+        assert_eq!(remove_path_entry(&format!(r"{dir};C:\a"), dir).as_deref(), Some(r"C:\a"));
+        assert_eq!(
+            remove_path_entry(&format!(r"%X%\bin;{}\;C:\b;{dir}/", dir.to_lowercase()), dir).as_deref(),
+            Some(r"%X%\bin;C:\b")
+        );
+        // Everything else is kept verbatim.
+        assert_eq!(remove_path_entry(&format!(r" C:\a ;{dir};;C:\b"), dir).as_deref(), Some(r" C:\a ;;C:\b"));
+        // Round trip.
+        let cur = r"C:\a;%USERPROFILE%\bin";
+        assert_eq!(remove_path_entry(&add_path_entry(cur, dir).unwrap(), dir).as_deref(), Some(cur));
+    }
+
+    #[test]
+    fn path_length_limit() {
+        assert!(!path_too_long(&"a".repeat(PATH_MAX_CHARS)));
+        assert!(path_too_long(&"a".repeat(PATH_MAX_CHARS + 1)));
+        // Counted in UTF-16 units, as Windows does.
+        assert!(path_too_long(&"\u{1F600}".repeat(PATH_MAX_CHARS / 2 + 1)));
+    }
 
     #[test]
     fn wires_and_unwires_hooks_preserving_settings() {

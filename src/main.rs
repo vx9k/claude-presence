@@ -11,14 +11,16 @@ USAGE:
     claude-presence <COMMAND>
 
 COMMANDS:
-    install [--init <kind>] [--no-service] [--no-hooks]
+    install [--init <kind>] [--no-service] [--no-hooks] [--no-path]
                      Wire Claude Code hooks, write a default config and
                      register + start the background service. <kind> is one
                      of: systemd, openrc, dinit, xdg-autostart, launchd,
-                     schtasks, run-key, none (default: auto-detect)
+                     schtasks, run-key, none (default: auto-detect). On
+                     Windows, also adds the install dir to the user PATH
+                     (--no-path skips that)
     uninstall [--purge]
-                     Remove hooks and service (--purge also deletes config
-                     and lifetime stats)
+                     Remove hooks, service and (Windows) the PATH entry
+                     (--purge also deletes config and lifetime stats)
     status           Show daemon state and lifetime stats
     daemon           Run the daemon in the foreground
     hook <Event>     Forward a Claude Code hook event (used by Claude Code)
@@ -83,6 +85,28 @@ fn exe_name(base: &str) -> String {
     format!("{base}{}", std::env::consts::EXE_SUFFIX)
 }
 
+/// The standard per-user programs folder `install` copies binaries to.
+#[cfg(windows)]
+fn install_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| paths::home().join("AppData").join("Local"))
+        .join("Programs")
+        .join(paths::APP)
+}
+
+/// Whether `exe` sits directly in `dir`. `exe` is canonical (`\\?\C:\...`
+/// on Windows) and `dir` may not be, so compare canonical forms too:
+/// otherwise a reinstall from the installed copy copies the running exe
+/// onto itself and fails.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn lives_in(exe: &Path, dir: &Path) -> bool {
+    let Some(parent) = exe.parent() else {
+        return false;
+    };
+    parent == dir || std::fs::canonicalize(dir).is_ok_and(|d| d == parent)
+}
+
 /// On Windows, binaries are often run from Downloads; copy them to the
 /// standard per-user programs folder so hooks keep working.
 ///
@@ -91,13 +115,10 @@ fn exe_name(base: &str) -> String {
 /// and start the new binary detached, so it isn't left stopped.
 #[cfg(windows)]
 fn stable_location(exe: &Path, service: bool) -> std::io::Result<PathBuf> {
-    let dir = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| paths::home().join("AppData").join("Local"))
-        .join("Programs")
-        .join(paths::APP);
-    if exe.parent() == Some(dir.as_path()) {
-        return Ok(exe.to_path_buf());
+    let dir = install_dir();
+    if lives_in(exe, &dir) {
+        // Not `exe`: hooks and the task get the plain path, not `\\?\C:\...`.
+        return Ok(dir.join(exe.file_name().unwrap_or_default()));
     }
     std::fs::create_dir_all(&dir)?;
     // With a service the service manager starts the new daemon; without one,
@@ -135,9 +156,40 @@ fn stable_location(exe: &Path, _service: bool) -> std::io::Result<PathBuf> {
     Ok(exe.to_path_buf())
 }
 
+/// Put the install dir on the user `PATH` so `claude-presence` works from
+/// new terminals. Never fatal.
+#[cfg(windows)]
+fn add_install_dir_to_path() {
+    let dir = install_dir();
+    match install::add_to_user_path(&dir) {
+        Ok(install::PathEdit::Written) => {
+            println!("  added {} to your user PATH (restart open terminals to pick it up)", dir.display())
+        }
+        Ok(install::PathEdit::Unchanged) => println!("  {} is already in your user PATH", dir.display()),
+        Ok(install::PathEdit::TooLong) => eprintln!(
+            "  warning: not adding {} to your user PATH: it would exceed {} characters",
+            dir.display(),
+            install::PATH_MAX_CHARS
+        ),
+        Err(e) => eprintln!("  could not update your user PATH: {e}"),
+    }
+}
+
+#[cfg(windows)]
+fn remove_install_dir_from_path() {
+    let dir = install_dir();
+    match install::remove_from_user_path(&dir) {
+        Ok(install::PathEdit::Written) => {
+            println!("removed {} from your user PATH (restart open terminals to pick it up)", dir.display())
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("could not update your user PATH: {e}"),
+    }
+}
+
 fn install_cmd(args: &[String]) -> ExitCode {
     let mut init = None;
-    let (mut service, mut hooks) = (true, true);
+    let (mut service, mut hooks, mut path) = (true, true, true);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -152,6 +204,7 @@ fn install_cmd(args: &[String]) -> ExitCode {
             },
             "--no-service" => service = false,
             "--no-hooks" => hooks = false,
+            "--no-path" => path = false,
             other => {
                 eprintln!("unknown option: {other}");
                 return ExitCode::from(2);
@@ -205,6 +258,13 @@ fn install_cmd(args: &[String]) -> ExitCode {
         }
     }
 
+    #[cfg(windows)]
+    if path {
+        add_install_dir_to_path();
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+
     if service {
         let daemon = exe.with_file_name(exe_name("claude-presenced"));
         if !daemon.exists() {
@@ -251,6 +311,8 @@ fn uninstall_cmd(args: &[String]) -> ExitCode {
     for line in install::uninstall_service() {
         println!("{line}");
     }
+    #[cfg(windows)]
+    remove_install_dir_from_path();
     if purge {
         for d in [paths::config_dir(), paths::data_dir()] {
             if d.exists() && std::fs::remove_dir_all(&d).is_ok() {
@@ -321,6 +383,20 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn exe_in_install_dir_is_recognized() {
+        let dir = std::env::temp_dir().join(format!("cp-lives-in-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // `install` canonicalizes its own path (`\\?\C:\...` on Windows); the
+        // install dir it compares against is not canonical.
+        let exe = std::fs::canonicalize(&dir).unwrap().join(exe_name("claude-presence"));
+        assert!(lives_in(&exe, &dir));
+        assert!(lives_in(&dir.join("x"), &dir));
+        assert!(!lives_in(&exe, &dir.join("sub")));
+        assert!(!lives_in(&exe, &std::env::temp_dir()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
