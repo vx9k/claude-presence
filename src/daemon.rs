@@ -189,6 +189,10 @@ const GIT_TTL: Duration = Duration::from_secs(60);
 impl Daemon {
     fn new(cfg: Config, ledger: Ledger) -> Daemon {
         let presenter = Presenter::spawn(cfg.client_id.clone());
+        Daemon::with_presenter(cfg, ledger, presenter)
+    }
+
+    fn with_presenter(cfg: Config, ledger: Ledger, presenter: Presenter) -> Daemon {
         let now = Instant::now();
         Daemon {
             cfg,
@@ -362,7 +366,8 @@ impl Daemon {
             } else {
                 // A transcript still being written counts as activity, so the
                 // next expiry deadline moves forward instead of staying past.
-                s.last_activity = s.last_activity.max(modified);
+                // A future mtime (clock skew) counts as now.
+                s.last_activity = s.last_activity.max(modified.min(now));
             }
         }
         for id in dead {
@@ -468,7 +473,7 @@ impl Daemon {
         v.set("tool", s.tool.clone().unwrap_or_default());
         v.set("file", if hidden { String::new() } else { s.file.clone().unwrap_or_default() });
         v.set("tokens", fmt_count(usage.total()));
-        v.set("tokens_in", fmt_count(usage.input + usage.cache_read + usage.cache_write));
+        v.set("tokens_in", fmt_count(usage.input.saturating_add(usage.cache_read).saturating_add(usage.cache_write)));
         v.set("tokens_out", fmt_count(usage.output));
         v.set("prompts", prompts.to_string());
         v.set("tools", s.tools.to_string());
@@ -582,7 +587,7 @@ impl Daemon {
 
     fn save(&mut self) {
         if let Err(e) = self.ledger.save() {
-            crate::warn!("saving stats: {e}");
+            crate::error!("saving stats: {e}");
         }
         self.last_save = Instant::now();
     }
@@ -798,7 +803,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cp-daemon-{}", std::process::id()));
         let ledger = Ledger::load(dir.join("l.json"), dir.join("s.bin"));
         let cfg = Config { client_id: "0".into(), ..Config::default() };
-        Daemon::new(cfg, ledger)
+        // Inert presenter: tests must never talk to a real Discord client.
+        Daemon::with_presenter(cfg, ledger, Presenter::inert())
+    }
+
+    fn transcript(name: &str, content: &str) -> (PathBuf, String) {
+        let tp = std::env::temp_dir().join(format!("cp-{name}-{}.jsonl", std::process::id()));
+        std::fs::write(&tp, content).unwrap();
+        let tp_s = tp.to_string_lossy().replace('\\', "\\\\");
+        (tp, tp_s)
     }
 
     fn activity(d: &mut Daemon) -> sonic_rs::Value {
@@ -878,9 +891,7 @@ mod tests {
     #[test]
     fn live_transcript_does_not_spin_expiry() {
         let mut d = daemon();
-        let tp = std::env::temp_dir().join(format!("cp-expiry-{}.jsonl", std::process::id()));
-        std::fs::write(&tp, "").unwrap();
-        let tp_s = tp.to_string_lossy().replace('\\', "\\\\");
+        let (tp, tp_s) = transcript("expiry", "");
         d.handle_hook(
             format!("Stop\n{{\"session_id\":\"e\",\"cwd\":\"/p/e\",\"transcript_path\":\"{tp_s}\"}}").as_bytes(),
         );
@@ -892,6 +903,50 @@ mod tests {
         assert!(d.next_expiry().unwrap() > now);
         let wait = d.tick();
         assert!(wait > Duration::from_secs(1), "tick spins: {wait:?}");
+        d.presenter.shutdown();
+        let _ = std::fs::remove_file(&tp);
+    }
+
+    #[test]
+    fn tick_pushes_to_presenter_only() {
+        let mut d = daemon();
+        d.handle_hook(b"UserPromptSubmit\n{\"session_id\":\"p\",\"cwd\":\"/p/p\"}");
+        d.tick();
+        assert!(d.presenter.wanted().is_some_and(|a| a.contains("Thinking in p")));
+        d.presenter.shutdown();
+    }
+
+    #[test]
+    fn future_transcript_mtime_is_clamped() {
+        let mut d = daemon();
+        let (tp, tp_s) = transcript("future", "");
+        let future = std::time::SystemTime::now() + Duration::from_secs(24 * 3600);
+        std::fs::File::options().write(true).open(&tp).unwrap().set_modified(future).unwrap();
+        d.handle_hook(format!("Stop\n{{\"session_id\":\"f\",\"transcript_path\":\"{tp_s}\"}}").as_bytes());
+        let now = timeutil::now_ms();
+        d.sessions.get_mut("f").unwrap().last_activity = now - (d.cfg.idle_timeout as i64 + 60) * 1000;
+        d.expire(now);
+        let s = &d.sessions["f"];
+        assert!(s.last_activity <= now, "a skewed clock must not keep a session alive for a day");
+        d.presenter.shutdown();
+        let _ = std::fs::remove_file(&tp);
+    }
+
+    #[test]
+    fn huge_usage_renders() {
+        let mut d = daemon();
+        let m = u64::MAX;
+        let line = format!(
+            r#"{{"type":"assistant","timestamp":"2026-10-04T10:00:00Z","message":{{"id":"h","model":"claude-opus-5-5","usage":{{"input_tokens":{m},"output_tokens":{m},"cache_read_input_tokens":{m},"cache_creation_input_tokens":{m}}}}}}}"#
+        );
+        let (tp, tp_s) = transcript("huge", &(line + "\n"));
+        d.handle_hook(
+            format!("UserPromptSubmit\n{{\"session_id\":\"h\",\"cwd\":\"/p/h\",\"transcript_path\":\"{tp_s}\"}}")
+                .as_bytes(),
+        );
+        let a = activity(&mut d);
+        assert!(a["state"].as_str().unwrap().contains("tokens"));
+        let _ = d.render(timeutil::now_ms());
         d.presenter.shutdown();
         let _ = std::fs::remove_file(&tp);
     }

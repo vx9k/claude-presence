@@ -173,17 +173,7 @@ impl Conn {
 
     /// Read one frame into `self.buf`, returning its opcode.
     fn read_frame(&mut self) -> io::Result<u32> {
-        let mut hdr = [0u8; 8];
-        self.s.read_exact(&mut hdr)?;
-        let op = u32::from_le_bytes(hdr[..4].try_into().unwrap());
-        let len = u32::from_le_bytes(hdr[4..].try_into().unwrap()) as usize;
-        if len > MAX_FRAME {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "oversized frame"));
-        }
-        self.buf.clear();
-        self.buf.resize(len, 0);
-        self.s.read_exact(&mut self.buf)?;
-        Ok(op)
+        read_frame_from(&mut self.s, &mut self.buf)
     }
 
     fn pong(&mut self) -> io::Result<()> {
@@ -231,6 +221,22 @@ impl Conn {
     }
 }
 
+/// Read one frame from `r` into `buf`, returning its opcode.
+fn read_frame_from(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<u32> {
+    let mut hdr = [0u8; 8];
+    r.read_exact(&mut hdr)?;
+    let op = u32::from_le_bytes(hdr[..4].try_into().unwrap());
+    let len = u32::from_le_bytes(hdr[4..].try_into().unwrap()) as usize;
+    if len > MAX_FRAME {
+        // Not InvalidData: that means "activity rejected, connection fine".
+        return Err(io::Error::other("oversized frame"));
+    }
+    buf.clear();
+    buf.resize(len, 0);
+    r.read_exact(buf)?;
+    Ok(op)
+}
+
 /// The fields of a Discord IPC reply we look at.
 #[derive(Deserialize)]
 struct Reply<'a> {
@@ -273,6 +279,18 @@ impl Presenter {
             .spawn(move || worker(&s2, &client_id))
             .expect("spawn discord thread");
         Presenter { shared, thread: Some(thread) }
+    }
+
+    /// A presenter without a worker thread, so tests never reach Discord.
+    #[cfg(test)]
+    pub fn inert() -> Presenter {
+        Presenter { shared: Arc::new(Shared::default()), thread: None }
+    }
+
+    /// The activity last handed to `set`.
+    #[cfg(test)]
+    pub fn wanted(&self) -> Option<String> {
+        self.shared.want.lock().unwrap_or_else(|e| e.into_inner()).activity.clone()
     }
 
     /// Replace the desired activity (JSON object), or clear it with `None`.
@@ -513,6 +531,33 @@ mod tests {
         let lost = Err(io::Error::new(io::ErrorKind::BrokenPipe, "gone"));
         assert!(!w.record(&lost, Some("d".into()), 4));
         assert_eq!((w.on_wire.as_deref(), w.sent_gen, w.resend), (None, 3, true));
+    }
+
+    #[test]
+    fn oversized_frame_drops_the_connection() {
+        let mut hdr = OP_FRAME.to_le_bytes().to_vec();
+        hdr.extend_from_slice(&(MAX_FRAME as u32 + 1).to_le_bytes());
+        let mut buf = Vec::new();
+        let e = read_frame_from(&mut hdr.as_slice(), &mut buf).unwrap_err();
+        assert_ne!(e.kind(), io::ErrorKind::InvalidData, "InvalidData means \"rejected, keep the connection\"");
+        assert!(!Wire::default().record(&Err(e), Some("a".into()), 1));
+
+        let mut ok = OP_PING.to_le_bytes().to_vec();
+        ok.extend_from_slice(&2u32.to_le_bytes());
+        ok.extend_from_slice(b"{}");
+        assert_eq!(read_frame_from(&mut ok.as_slice(), &mut buf).unwrap(), OP_PING);
+        assert_eq!(buf, b"{}");
+        // Truncated body.
+        assert!(read_frame_from(&mut &ok[..9], &mut buf).is_err());
+    }
+
+    #[test]
+    fn inert_presenter_spawns_nothing() {
+        let p = Presenter::inert();
+        assert!(p.thread.is_none());
+        p.set(Some("x".into()));
+        assert_eq!(p.wanted().as_deref(), Some("x"));
+        p.shutdown();
     }
 
     #[test]

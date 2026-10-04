@@ -53,6 +53,7 @@ numbers are approximate.
    Fix: a shutdown request over the hook IPC (e.g. event name `__shutdown`
    → `Msg::Shutdown`), sent by `uninstall_service`, then wait ≤ 2 s for
    `daemon_running` to turn false. Touches the wire format → advisor first.
+
 ## Nice to have
 
 - Optionally add the Windows install dir to the user `PATH` on install.

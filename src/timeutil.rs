@@ -121,8 +121,8 @@ pub fn parse_rfc3339_ms(s: &str) -> Option<i64> {
             millis *= 10;
         }
     }
-    let offset = match b.get(i)? {
-        b'Z' | b'z' => 0,
+    let (offset, end) = match b.get(i)? {
+        b'Z' | b'z' => (0, i + 1),
         sign @ (b'+' | b'-') => {
             let oh = digits(b, i + 1, 2)? as i64;
             let om = digits(b, i + 4, 2)? as i64;
@@ -130,10 +130,13 @@ pub fn parse_rfc3339_ms(s: &str) -> Option<i64> {
                 return None;
             }
             let o = oh * 3600 + om * 60;
-            if *sign == b'-' { -o } else { o }
+            (if *sign == b'-' { -o } else { o }, i + 6)
         }
         _ => return None,
     };
+    if end != b.len() {
+        return None;
+    }
     let days = days_from_civil(year, month, day);
     let secs = days * DAY_SECS + hour * 3600 + min * 60 + sec - offset;
     Some(secs * 1000 + millis)
@@ -232,6 +235,10 @@ mod tests {
             "-026-10-04T05:25:00Z",
             "２０２６-10-04T05:25:00Z",
             "2026-10-04T05:25:00.１Z",
+            "2026-10-04T05:25:00Zjunk",
+            "2026-10-04T05:25:00Z ",
+            "2026-10-04T05:25:00+02:00x",
+            "2026-10-04T05:25:00.5+02:00:00",
         ] {
             assert_eq!(parse_rfc3339_ms(s), None, "{s:?}");
         }

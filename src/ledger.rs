@@ -796,8 +796,9 @@ impl Ledger {
 
     /// Persist if anything changed. New seen ids are appended to `seen.bin`
     /// and synced *before* `ledger.json` is atomically replaced: a crash in
-    /// between leaves ids marked seen whose counts were never saved, so that
-    /// save window is undercounted — never double counted.
+    /// between (or a ledger write that keeps failing) leaves ids marked seen
+    /// whose counts were never saved: everything since the last successful
+    /// ledger write is undercounted, never double counted.
     pub fn save(&mut self) -> io::Result<()> {
         if !self.dirty {
             return Ok(());
@@ -1032,13 +1033,12 @@ mod tests {
     fn trailing_partial_line_waits() {
         let full = asst("m1", "2026-10-04T10:00:00Z", 1, 1) + "\n";
         let partial = asst("m2", "2026-10-04T10:00:01Z", 1, 1);
-        let (dir, f, key, mut l) = one_file("partial", (full.clone() + &partial).as_bytes());
+        let (dir, _, key, mut l) = one_file("partial", (full.clone() + &partial).as_bytes());
         l.ingest(&key);
         l.ingest(&key);
         assert_eq!(l.totals.turns, 1);
         assert_eq!(l.file(&key).unwrap().offset, full.len() as u64);
         // A file with no newline at all is never consumed.
-        fs::write(&f, &partial).unwrap();
         let (dir2, _, key2, mut l2) = one_file("partial-only", partial.as_bytes());
         l2.ingest(&key2);
         assert_eq!((l2.totals.turns, l2.file(&key2).unwrap().offset), (0, 0));

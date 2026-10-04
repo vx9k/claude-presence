@@ -161,6 +161,16 @@ impl Default for Config {
     }
 }
 
+/// `v` clamped to `min..=max`, warning when it had to be changed.
+fn clamped(key: &str, v: u64, min: u64, max: u64) -> u64 {
+    let c = v.clamp(min, max);
+    if c != v {
+        let bound = if v < min { "below the minimum" } else { "above the maximum" };
+        crate::warn!("{key} = {v} is {bound}; using {c}");
+    }
+    c
+}
+
 impl Config {
     /// Load from `path`; a missing file means defaults, a broken one is
     /// reported and also falls back to defaults so presence keeps working.
@@ -185,9 +195,10 @@ impl Config {
     /// arithmetic (`secs as i64 * 1000`) can't overflow.
     pub fn sanitized(mut self) -> Config {
         if self.idle_timeout != 0 {
-            self.idle_timeout = self.idle_timeout.clamp(IDLE_TIMEOUT_MIN, IDLE_TIMEOUT_MAX);
+            self.idle_timeout = clamped("idle_timeout", self.idle_timeout, IDLE_TIMEOUT_MIN, IDLE_TIMEOUT_MAX);
         }
-        self.rotation_interval = self.rotation_interval.clamp(ROTATION_INTERVAL_MIN, ROTATION_INTERVAL_MAX);
+        self.rotation_interval =
+            clamped("rotation_interval", self.rotation_interval, ROTATION_INTERVAL_MIN, ROTATION_INTERVAL_MAX);
         self
     }
 

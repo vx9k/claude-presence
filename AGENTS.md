@@ -49,8 +49,8 @@ fix or discover something.
 - **Ledger** (`ledger.json` + append-only `seen.bin`): totals only grow;
   tokens counted once per `message.id`, prompts once per `uuid`, globally.
   `seen.bin` is appended and synced before `ledger.json` is atomically
-  replaced; a crash between them undercounts at most one save window, never
-  double counts. `seen.bin` is truncated to a multiple of 8 bytes on load and
+  replaced; a crash between them (or a failing ledger write) undercounts
+  everything since the last successful ledger write, never double counts. `seen.bin` is truncated to a multiple of 8 bytes on load and
   before appending. Bump `VERSION` in `src/ledger.rs` on incompatible changes.
 - **Discord rate limit:** ≤ 4 `SET_ACTIVITY` per 20 s, ≥ 4 s apart; bursts
   coalesce to the latest state. All Discord I/O stays on its worker thread.
