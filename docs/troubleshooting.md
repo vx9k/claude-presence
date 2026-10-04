@@ -8,7 +8,7 @@ See also: [services.md](services.md) (commands per platform), [configuration.md]
 1. `claude-presence status`: first line should be `daemon:   running` (exit code 3 means not running). It also prints the socket, config and stats paths.
 2. Is the Discord desktop app open (Stable, PTB, Canary, Flatpak, Snap, or an arRPC bridge such as Vesktop), with Settings, Activity Privacy, "Share your detected activities" on? A browser tab cannot be reached.
 3. Is the Claude Code session local? See below.
-4. Look at the logs ([services.md](services.md#start-stop-logs)). The default level `info` already shows the key lines; set `CLAUDE_PRESENCE_LOG=debug` for more (only when running the daemon in the foreground, or in the service environment).
+4. Look at the logs ([services.md](services.md#start-stop-logs)). The default level `info` already shows the key lines; set `CLAUDE_PRESENCE_LOG=debug` for more (levels `error`, `warn`, `info`, `debug`; `trace` is accepted and means `debug`; only when running the daemon in the foreground, or in the service environment).
 
 ## Feed a hook by hand
 
@@ -46,7 +46,7 @@ The hook command prints nothing and always exits 0, even when the daemon is down
 | `install` fails with `failed to update Claude Code settings: settings.json: ...` | `settings.json` is not valid JSON or not an object, or `hooks`/`hooks.<Event>` has an unexpected type | Fix the file by hand (the first install keeps `settings.json.bak`), then re-run |
 | `install` ends with `daemon not reachable yet` | Service manager is slow or the service failed | Wait a few seconds and run `status`; if still down, see the service logs. Note the printed commands for OpenRC, dinit, systemd or launchd when it says `wrote <file> - enable it with ...` |
 | `install` prints `note: installing from a debug build directory` | Running `target/debug/claude-presence` | `cargo install --path .` first, so hooks do not point into `target/` |
-| Card disappears after a while | Expected: `idle_timeout` (default 900 s) with no activity and no transcript writes. Active (mid-task) sessions are kept at least one hour. A closed Claude Code clears it immediately via `SessionEnd`. | `idle_timeout = 0` to keep it until Claude Code exits |
+| Card disappears after a while | Expected: `idle_timeout` (default 900 s) with no activity and no transcript writes. Sessions that are Thinking, Working or Compacting (mid-task) are kept at least one hour; a session waiting on you (Notification) uses the plain `idle_timeout`. A closed Claude Code clears it immediately via `SessionEnd`. | `idle_timeout = 0` to keep it until Claude Code exits |
 | Card shows the wrong session with several open | The card sticks to the shown session while it is as active as any other; it switches when it goes idle and another is working | Expected ([architecture.md](architecture.md#which-session-is-shown-sticky-choice)) |
 | Config edit has no effect | Not reloaded, or file failed to parse (`error: <path>: ...; using defaults`) | Send SIGHUP or restart ([configuration.md](configuration.md#applying-changes)); fix the syntax error; a wrong-typed value discards the whole file |
 | Warning `idle_timeout = N is below the minimum; using 60` | Value clamped | Use `0` or `60..=604800` |

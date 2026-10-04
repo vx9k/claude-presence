@@ -60,7 +60,7 @@ Nothing polls. `Daemon::tick` returns how long the loop may sleep: the minimum o
 
 The Discord worker has its own deadlines: the next allowed send (rate limit), the reconnect retry, and a keepalive resend while a card is shown (60 s; 20 s against an arRPC bridge).
 
-With no sessions, a clean ledger and `rescan_interval = 0`, the process sleeps until a hook or signal arrives. With defaults it wakes once per `rescan_interval` (30 min) for the background rescan.
+There is no polling loop: the daemon wakes only for these timers (and for hooks and signals), so CPU use is near zero. With no sessions, a clean ledger and `rescan_interval = 0`, it sleeps until a hook or signal arrives. With defaults it wakes once per `rescan_interval` (30 min) for the background rescan, every 60 s while the ledger has a pending save, and (in the Discord worker) for the keepalive resend while a card is shown.
 
 Discord limits (`src/discord.rs`): at most 4 `SET_ACTIVITY` per 20 s window (`MAX_PER_WINDOW`, `WINDOW`) and at least 4 s apart (`MIN_GAP`); bursts coalesce to the latest wanted activity. Reconnect backoff starts at 2 s and doubles to 60 s; a refused handshake (bad `client_id`) waits 300 s.
 

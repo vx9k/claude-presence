@@ -17,6 +17,10 @@ Rules:
 - A value with the wrong type (for example `idle_timeout = "900"`, `idle_timeout = -1`, `activity_type = 300`, a button without `url`) or a TOML syntax error makes the whole file fall back to defaults, with `error: <path>: <message>; using defaults` in the log. An unreadable file does the same.
 - Numeric ranges are clamped, with `warn: <key> = <v> is below the minimum; using <n>` (or `above the maximum`).
 
+> **Defaults borrowed from claude-rpc:** the default `client_id` is claude-rpc's public Discord application and the default images are its hosted gifs (`https://cdn.qualit.ly/...`). Create your own application at <https://discord.com/developers/applications> and point `client_id` and `[assets]` at it if you prefer not to depend on them.
+
+Highlights: `client_id` (your own application), `idle_timeout`, `github_button`, `hidden_projects`, and the `[status.*]` templates. Everything else is below.
+
 ## Top-level keys
 
 | Key | Type | Default | Notes |
@@ -79,7 +83,7 @@ Only `[status.idle]` has default `rotation` frames:
 | `{total_time} on Claude` | `{total_sessions} sessions · {total_prompts} prompts` |
 | `Lifetime · {total_tokens} tokens` | `{streak} day streak` |
 
-A `[status.x]` table you write replaces that status as a whole: a key you leave out is empty, not the default above (an empty `details` or `state` line is omitted from the card; an omitted `rotation` means no rotation). So write both `details` and `state`, and for `[status.idle]` also `rotation` if you want to keep the carousel. Statuses you do not mention keep their defaults. (`[assets]` is different: its missing keys keep their defaults.)
+Missing keys fall back per key to that status's built-in default from the tables above. An explicit value always wins, including an empty string (`state = ""` omits that line from the card) and `rotation = []` (no rotation). So `[status.idle]` with only `details = "zzz"` keeps the default `state` and the default idle carousel. Statuses you do not mention keep all their defaults. `[assets]` works the same way per key.
 
 ## Template syntax
 
@@ -141,11 +145,8 @@ Turn off the idle carousel and the elapsed timer:
 show_elapsed = false
 
 [status.idle]
-details = "Idle in {project}"
-state = "{model} · {today_time} today"
+rotation = []
 ```
-
-(Leaving out `rotation` there removes the carousel.)
 
 Never expire sessions and never rescan:
 
@@ -161,5 +162,7 @@ rescan_interval = 0
 | Linux, macOS | Send `SIGHUP`: `systemctl --user kill -s HUP claude-presence` (systemd), `pkill -HUP -x claude-presenced`, `launchctl kill SIGHUP gui/$(id -u)/io.github.vx9k.claude-presence` (macOS). Log: `info: configuration reloaded`. |
 | Any | Restart the service ([services.md](services.md)). |
 | Windows | No reload signal: `schtasks /End /TN claude-presence` then `schtasks /Run /TN claude-presence`. |
+
+A config file with a syntax error is reported in the log and the defaults are used.
 
 Reload re-reads the file, applies it to existing sessions immediately, and restarts the Discord worker only when `client_id` changed. `scan_history` is only read at start.

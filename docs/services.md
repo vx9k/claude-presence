@@ -1,6 +1,6 @@
 # Services
 
-`claude-presence install` registers `claude-presenced` as a per-user background service. Nothing needs root. See also: [README](../README.md#background-service) (short per-platform command lists), [troubleshooting.md](troubleshooting.md), [ipc-and-security.md](ipc-and-security.md), [architecture.md](architecture.md).
+`claude-presence install` registers `claude-presenced` as a per-user background service. Nothing needs root. See also: [README](../README.md#background-service) (short per-platform summary), [troubleshooting.md](troubleshooting.md), [ipc-and-security.md](ipc-and-security.md), [architecture.md](architecture.md).
 
 The service name is `claude-presence` everywhere; the process is `claude-presenced`. On every platform, `claude-presence status` printing `daemon:   running` is the quickest check (exit code 3 when not running).
 
@@ -142,6 +142,32 @@ There is no stop-only command in `claude-presence`; use the table. A service tha
 
 Foreground debugging: stop the service, then `CLAUDE_PRESENCE_LOG=debug claude-presence daemon` (Windows PowerShell: `$env:CLAUDE_PRESENCE_LOG="debug"; claude-presence daemon`). Levels: `error`, `warn`, `info` (default), `debug` (also `trace`). Logs go to stderr.
 
+## Remove manually
+
+Stop the daemon first (the manual steps below do not ask it to stop; `claude-presence uninstall` does).
+
+| Platform | Commands |
+|---|---|
+| systemd | `systemctl --user disable --now claude-presence`; `rm ~/.config/systemd/user/claude-presence.service`; `systemctl --user daemon-reload` |
+| OpenRC | `rc-service --user claude-presence stop`; `rc-update --user del claude-presence default`; `rm ~/.config/rc/init.d/claude-presence` |
+| dinit | `dinitctl disable claude-presence`; `dinitctl stop claude-presence`; `rm ~/.config/dinit.d/claude-presence` |
+| XDG autostart | `rm ~/.config/autostart/claude-presence.desktop`; `pkill -x claude-presenced` |
+| launchd | `launchctl bootout gui/$(id -u)/io.github.vx9k.claude-presence`; `rm ~/Library/LaunchAgents/io.github.vx9k.claude-presence.plist` |
+| Task Scheduler | `schtasks /End /TN claude-presence`; `schtasks /Delete /TN claude-presence /F` |
+| Run key | `reg delete HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v claude-presence /f`; `taskkill /IM claude-presenced.exe /F` |
+
+## Extra platform notes
+
+| Platform | Note |
+|---|---|
+| systemd | Disable at login but keep the unit: `systemctl --user disable --now claude-presence`. Reload config: `systemctl --user kill -s HUP claude-presence`. |
+| OpenRC | Don't start at login: `rc-update --user del claude-presence default`. Your user runlevel must be started at login. |
+| dinit | Don't start with your user instance: `dinitctl disable claude-presence`. |
+| XDG autostart | Reload config: `pkill -HUP -x claude-presenced`. If it crashes it stays down until next login. |
+| launchd | Reload config: `launchctl kill SIGHUP gui/$(id -u)/io.github.vx9k.claude-presence`. Logs can also be opened in Console.app. |
+| Task Scheduler | Also visible in the Task Scheduler app (Task Scheduler Library, `claude-presence`). Task status is `Running` or `Ready`. Don't start at logon: `schtasks /Change /TN claude-presence /DISABLE` (`/ENABLE` to undo). PowerShell log follow: `Get-Content $env:LOCALAPPDATA\claude-presence\daemon.log -Wait`. |
+| Run key | Appears in Task Manager, Startup apps, where it can be disabled. Check registration: `reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v claude-presence`. |
+
 ## Reinstall and upgrade
 
 Re-running `claude-presence install` is safe. For the service step it:
@@ -177,4 +203,4 @@ Order: remove our hooks from `settings.json` (`removed hooks from <path>` or `no
 
 Each removed item prints `removed <path>` (or `removed scheduled task "claude-presence"` / `removed Run registry key`). Only hook entries whose command contains `claude-presence` and ` hook ` are removed from `settings.json`; everything else stays. `--purge` deletes the config dir and the data dir ([ledger.md](ledger.md) lists them). Binaries are never deleted: `cargo uninstall claude-presence`, and on Windows remove `%LOCALAPPDATA%\Programs\claude-presence`.
 
-To undo by hand, see the "Remove manually" snippets in the [README](../README.md#background-service). Doing so does not stop a running daemon; stop it first.
+To undo by hand, see [Remove manually](#remove-manually).
