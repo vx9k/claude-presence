@@ -7,11 +7,25 @@ Work items are ordered by priority. Delete an entry once its fix is merged.
 ## Status
 
 - CI (fmt, clippy, test, release build on Linux/macOS/Windows) is green.
-  Unit tests: 76 on Linux/macOS, about 65 on Windows (socket and POSIX
-  permission tests are Unix-only).
+  Unit tests: 81 on Linux, 77 on Windows (socket and POSIX permission tests
+  are Unix-only; named pipe tests Windows-only).
 - **Verified on Windows by hand:** `install` (Task Scheduler), `status`, the
   hook named pipe, connecting to Discord and setting an activity (via a
   hand-fed `UserPromptSubmit` hook).
+- **Verified on Windows by tests** (CI, `windows-latest`, elevated): the pipe
+  DACL read back, an elevated daemon accepting a non-elevated (restricted
+  token) hook and `OW` rejecting it (that negative control runs only when
+  the runner's default owner is Administrators; the test logs a skip),
+  the hook-side pipe-owner check,
+  `ERROR_NO_DATA`, bind retry vs `FILE_FLAG_FIRST_PIPE_INSTANCE`, the
+  `__shutdown` round trip, cancelling a Discord worker blocked in pipe I/O.
+  Still by hand only: the locked-`.exe` copy during a real reinstall
+  (`replace_binary`; its retry/rename logic is unit-tested).
+- Under Wine (see docs/development.md) all tests pass except two Wine
+  quirks: `counts_incrementally_and_dedups` (Wine reports ctime as the
+  creation time, so `file_ident` changes on append) and
+  `our_pipe_passes_the_owner_check` (Wine's default owner is its primary
+  group `S-1-5-21-0-0-0-513`).
 - **Not yet verified anywhere real:** a full local Claude Code session
   driving the card end-to-end on Windows/macOS; OpenRC and dinit services;
   launchd; the Run-key fallback.
@@ -24,32 +38,11 @@ Work items are ordered by priority. Delete an entry once its fix is merged.
 
 Line numbers are approximate.
 
-### Medium
-
-9. **Windows pipe name can be pre-created by another user** (`src/ipc.rs`).
-   Our pipe now has an owner-only DACL, but a squatter who creates
-   `\\.\pipe\claude-presence-<user>` first still receives hooks; the daemon
-   then logs "another claude-presence daemon is already running". Fix:
-   client-side `GetNamedPipeServerProcessId` + compare the server's token
-   user SID.
-
 ### Low / unverified
 
-10. **Windows changes are type-checked only**: the `ERROR_NO_DATA` handling
-    and error-path read in `Listener::serve`, the user-SID DACL
-    (`D:P(A;;GA;;;<user SID>)` from `TokenUser`; check an elevated daemon
-    accepts non-elevated hooks), the bind retry while the old daemon exits,
-    and the `__shutdown` reinstall path (copying over the `.exe` once the old
-    daemon exits). Verify by hand.
-11. **A wedged Discord worker is abandoned, not killed**
-    (`src/discord.rs` `Presenter::shutdown`). After 1 s it is left running;
-    fine at exit, but a `client_id` reload leaves the old thread (and its
-    pipe) behind until its I/O returns.
 12. **`PostToolUseFailure` is handled but never wired** (`src/daemon.rs`
     vs `install::HOOK_EVENTS`). Either add it to `HOOK_EVENTS` (check the
     event exists in current Claude Code first) or drop the handler.
-13. **`install --no-service` on Windows still copies the binaries**, which
-    fails if the old daemon holds the `.exe`, and skips the old-daemon stop.
 
 ## Nice to have
 

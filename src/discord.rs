@@ -265,8 +265,10 @@ struct Shared {
 }
 
 /// How long `Presenter::shutdown` waits for the worker to clear the
-/// activity. A worker stuck in blocking I/O (Windows pipes have no timeout)
-/// is left behind; process exit ends it.
+/// activity. Unix sockets time out after 5 s anyway; Windows pipes have no
+/// timeout, so a worker still stuck in blocking I/O then has it cancelled
+/// (`cancel_blocked_io`). One that still won't stop is left behind; process
+/// exit ends it.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
 
 /// Handle to the Discord worker thread.
@@ -330,14 +332,40 @@ impl Presenter {
         }
         if let Some((t, done)) = self.thread.take() {
             // Disconnected means the worker is gone too (it panicked).
-            match done.recv_timeout(wait) {
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
-                    let _ = t.join();
-                }
-                Err(RecvTimeoutError::Timeout) => crate::warn!("Discord worker did not stop in time; leaving it"),
+            let stopped = match done.recv_timeout(wait) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => true,
+                #[cfg(windows)]
+                Err(RecvTimeoutError::Timeout) => cancel_blocked_io(&t, &done),
+                #[cfg(not(windows))]
+                Err(RecvTimeoutError::Timeout) => false,
+            };
+            if stopped {
+                let _ = t.join();
+            } else {
+                crate::warn!("Discord worker did not stop in time; leaving it");
             }
         }
     }
+}
+
+/// Cancel the worker's blocking pipe I/O until it signals `done`, for up to
+/// about 500 ms. Repeated because a cancel only hits a call already in
+/// progress. The failed read or write makes the worker drop the connection,
+/// and it sees `stop` before it would reconnect. True if it finished.
+#[cfg(windows)]
+fn cancel_blocked_io(t: &JoinHandle<()>, done: &Receiver<()>) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::CancelSynchronousIo;
+    for _ in 0..10 {
+        // SAFETY: the thread handle stays open while `t` is alive. Failure
+        // (no I/O in progress right now) is harmless.
+        unsafe { CancelSynchronousIo(t.as_raw_handle()) };
+        match done.recv_timeout(Duration::from_millis(50)) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return true,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+    false
 }
 
 fn next_allowed(window: &VecDeque<Instant>, last: Option<Instant>) -> Option<Instant> {
@@ -565,6 +593,48 @@ mod tests {
         }
         let last = *w.back().unwrap();
         assert_eq!(next_allowed(&w, Some(last)), Some(t0 + WINDOW));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_cancels_a_worker_blocked_in_pipe_io() {
+        use std::os::windows::ffi::OsStrExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+        use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_WAIT};
+        // A frozen Discord: accepts the connection, never writes.
+        let name = format!(r"\\.\pipe\cp-test-discord-{}", std::process::id());
+        let wide: Vec<u16> = std::ffi::OsStr::new(&name).encode_wide().chain(Some(0)).collect();
+        // SAFETY: NUL-terminated name; default security; the handle is closed below.
+        let server = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                1,
+                0,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(server, INVALID_HANDLE_VALUE);
+        let mut client = open(std::path::Path::new(&name)).unwrap();
+        let returned = Arc::new(AtomicBool::new(false));
+        let r2 = returned.clone();
+        let p = Presenter::spawn_with(move |_| {
+            // The worker's own read path (read_exact retries Interrupted).
+            assert!(read_frame_from(&mut client, &mut Vec::new()).is_err());
+            r2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let t = Instant::now();
+        p.shutdown_within(Duration::from_millis(100));
+        assert!(returned.load(Ordering::SeqCst), "worker left blocked in ReadFile");
+        assert!(t.elapsed() < Duration::from_secs(2), "shutdown hung: {:?}", t.elapsed());
+        // SAFETY: the server handle we created, closed once.
+        unsafe { CloseHandle(server) };
     }
 
     /// Tests that need a real socket.

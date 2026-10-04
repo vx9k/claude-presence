@@ -599,15 +599,78 @@ fn stop_daemon(addr: &Path, wait: Duration) -> Option<bool> {
     }
 }
 
-/// Stop the running daemon and remove every service flavor we might have
-/// installed.
-pub fn uninstall_service() -> Vec<String> {
+/// True for the errors copying over a running program's `.exe` gives on
+/// Windows: access denied, sharing or lock violation.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_locked(e: &io::Error) -> bool {
+    // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+    e.kind() == io::ErrorKind::PermissionDenied || (cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)))
+}
+
+/// Run `op` up to `attempts` times, `delay` apart, while it fails because
+/// the target is locked (`is_locked`); any other outcome is returned at once.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn copy_with_retry<T>(mut op: impl FnMut() -> io::Result<T>, attempts: u32, delay: Duration) -> io::Result<T> {
+    let mut left = attempts.max(1);
+    loop {
+        match op() {
+            Err(e) if is_locked(&e) && left > 1 => {
+                left -= 1;
+                std::thread::sleep(delay);
+            }
+            r => return r,
+        }
+    }
+}
+
+/// `<dst>.old`: where a locked binary is moved aside.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn old_path(dst: &Path) -> PathBuf {
+    let mut name = dst.file_name().unwrap_or_default().to_os_string();
+    name.push(".old");
+    dst.with_file_name(name)
+}
+
+/// `replace_binary` with the copy as a closure.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn replace_with(
+    dst: &Path,
+    attempts: u32,
+    delay: Duration,
+    mut copy: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    match copy_with_retry(&mut copy, attempts, delay) {
+        Err(e) if is_locked(&e) && dst.exists() => {
+            let old = old_path(dst);
+            let _ = fs::remove_file(&old);
+            // A failed rename (say, an older `.old` still running) reports the original error.
+            fs::rename(dst, &old).map_err(|_| e)?;
+            copy()
+        }
+        r => r,
+    }
+}
+
+/// Remove `<name>.old` files a previous install left in `dir`. Silent: one
+/// may still be in use by an old daemon.
+pub fn remove_stale_old(dir: &Path, names: &[String]) {
+    for n in names {
+        let _ = fs::remove_file(old_path(&dir.join(n)));
+    }
+}
+
+/// Copy `src` over `dst`, which a daemon that is still exiting may hold
+/// open: retry for up to 5 s, then move `dst` aside to `<name>.old`
+/// (Windows lets a running `.exe` be renamed, not overwritten) and copy.
+#[cfg(windows)]
+pub fn replace_binary(src: &Path, dst: &Path) -> io::Result<()> {
+    replace_with(dst, 20, Duration::from_millis(250), || fs::copy(src, dst).map(|_| ()))
+}
+
+/// Ask a running daemon (at today's address and the legacy one) to shut
+/// down, so it saves its stats and releases its binary.
+pub fn stop_daemons() -> Vec<String> {
     let mut done = Vec::new();
-    // Asked first so it saves stats and clears the card itself, and so
-    // daemons no service manager tracks (XDG autostart, the Run key, a
-    // detached spawn) stop too. systemd, launchd and Task Scheduler don't
-    // restart a clean exit; OpenRC and dinit respawn after 5 s, but are
-    // stopped right below.
     let sock = paths::hook_socket();
     // TODO: drop the legacy path a couple of releases after the private
     // socket dir shipped.
@@ -621,6 +684,18 @@ pub fn uninstall_service() -> Vec<String> {
             None => {}
         }
     }
+    done
+}
+
+/// Stop the running daemon and remove every service flavor we might have
+/// installed.
+pub fn uninstall_service() -> Vec<String> {
+    // Asked first so it saves stats and clears the card itself, and so
+    // daemons no service manager tracks (XDG autostart, the Run key, a
+    // detached spawn) stop too. systemd, launchd and Task Scheduler don't
+    // restart a clean exit; OpenRC and dinit respawn after 5 s, but are
+    // stopped right below.
+    let mut done = stop_daemons();
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let ch = config_home();
@@ -726,10 +801,98 @@ mod tests {
         assert_eq!(un.trim(), "{}");
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn copy_retries_only_while_locked() {
+        let locked = || Err::<u32, _>(io::Error::from(io::ErrorKind::PermissionDenied));
+        // Succeeds on the third try.
+        let mut n = 0;
+        let r = copy_with_retry(
+            || {
+                n += 1;
+                if n < 3 { locked() } else { Ok(n) }
+            },
+            20,
+            Duration::ZERO,
+        );
+        assert_eq!(r.unwrap(), 3);
+        // Gives up after `attempts`.
+        let mut n = 0;
+        let r = copy_with_retry(
+            || {
+                n += 1;
+                locked()
+            },
+            4,
+            Duration::ZERO,
+        );
+        assert_eq!((r.unwrap_err().kind(), n), (io::ErrorKind::PermissionDenied, 4));
+        // Anything else is not retried.
+        let mut n = 0;
+        let r = copy_with_retry(
+            || {
+                n += 1;
+                Err::<(), _>(io::Error::from(io::ErrorKind::NotFound))
+            },
+            4,
+            Duration::ZERO,
+        );
+        assert_eq!((r.unwrap_err().kind(), n), (io::ErrorKind::NotFound, 1));
+        #[cfg(windows)]
+        for code in [32, 33] {
+            // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+            let mut n = 0;
+            let r = copy_with_retry(
+                || {
+                    n += 1;
+                    if n < 2 { Err(io::Error::from_raw_os_error(code)) } else { Ok(()) }
+                },
+                4,
+                Duration::ZERO,
+            );
+            assert!(r.is_ok() && n == 2, "{code}");
+        }
+    }
+
+    #[test]
+    fn locked_binary_is_moved_aside() {
+        let dir = std::env::temp_dir().join(format!("cp-replace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("bin.exe");
+        let old = dir.join("bin.exe.old");
+        assert_eq!(old_path(&dst), old);
+        fs::write(&dst, "v1").unwrap();
+        // Like a running .exe on Windows: can't be overwritten, can be renamed.
+        let mut tries = 0;
+        let copy = |tries: &mut u32| {
+            *tries += 1;
+            if dst.exists() { Err(io::Error::from(io::ErrorKind::PermissionDenied)) } else { fs::write(&dst, "v2") }
+        };
+        replace_with(&dst, 3, Duration::ZERO, || copy(&mut tries)).unwrap();
+        assert_eq!(tries, 4, "three locked tries, then one after moving it aside");
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "v2");
+        assert_eq!(fs::read_to_string(&old).unwrap(), "v1");
+        // The next install cleans up.
+        remove_stale_old(&dir, &["bin.exe".into(), "other.exe".into()]);
+        assert!(!old.exists() && dst.exists());
+        // Other failures don't move anything.
+        let e = replace_with(&dst, 3, Duration::ZERO, || Err(io::Error::from(io::ErrorKind::NotFound))).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert!(!old.exists() && dst.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A hook endpoint unique to this test and process.
+    fn test_addr(name: &str) -> PathBuf {
+        #[cfg(unix)]
+        return std::env::temp_dir().join(format!("cp-{name}-{}.sock", std::process::id()));
+        #[cfg(windows)]
+        return PathBuf::from(format!(r"\\.\pipe\cp-test-{name}-{}", std::process::id()));
+    }
+
     #[test]
     fn stops_a_running_daemon() {
-        let p = std::env::temp_dir().join(format!("cp-stop-{}.sock", std::process::id()));
+        let p = test_addr("install-stop");
         assert_eq!(stop_daemon(&p, Duration::from_millis(100)), None, "nothing running");
 
         // A daemon that honors the request: stops serving and unbinds.

@@ -69,7 +69,7 @@ fn hook(event: &str) -> ExitCode {
     msg.push(b'\n');
     let _ = std::io::stdin().lock().read_to_end(&mut msg);
     let (sock, in_private_dir) = paths::hook_endpoint();
-    let _ = ipc::send_to(&sock, in_private_dir, &msg);
+    let _ = ipc::send_hook(&sock, in_private_dir, paths::legacy_hook_socket, &msg);
     ExitCode::SUCCESS
 }
 
@@ -96,11 +96,18 @@ fn stable_location(exe: &Path) -> std::io::Result<PathBuf> {
         return Ok(exe.to_path_buf());
     }
     std::fs::create_dir_all(&dir)?;
+    // A running daemon holds its .exe open. Stop it even with --no-service
+    // (with a service, `install` already did).
+    for line in install::stop_daemons() {
+        println!("  {line} (to replace its binary)");
+    }
+    let names = [exe_name("claude-presence"), exe_name("claude-presenced")];
+    install::remove_stale_old(&dir, &names);
     let src_dir = exe.parent().unwrap_or(Path::new("."));
-    for name in [exe_name("claude-presence"), exe_name("claude-presenced")] {
-        let src = src_dir.join(&name);
+    for name in &names {
+        let src = src_dir.join(name);
         if src.exists() {
-            std::fs::copy(&src, dir.join(&name))?;
+            install::replace_binary(&src, &dir.join(name))?;
         }
     }
     println!("  copied binaries to {}", dir.display());

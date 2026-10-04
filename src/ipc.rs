@@ -66,22 +66,103 @@ pub fn send_to(addr: &Path, in_private_dir: bool, msg: &[u8]) -> io::Result<()> 
     send(addr, msg)
 }
 
-/// `send` for hook events; named pipes carry their own DACL on Windows.
+/// What the `hook` command sends through: `send_to`, but when nothing
+/// listens at `addr` (or its private dir doesn't exist yet), try the socket
+/// `legacy()` names, where a daemon from before the private socket dir may
+/// still be running until the next install or logon. The legacy path is in
+/// the shared temp dir, so only a socket we own (`lstat`) is used.
+// TODO: remove a couple of releases after the private socket dir shipped.
+#[cfg(unix)]
+pub fn send_hook(
+    addr: &Path,
+    in_private_dir: bool,
+    legacy: impl FnOnce() -> Option<std::path::PathBuf>,
+    msg: &[u8],
+) -> io::Result<()> {
+    match send_to(addr, in_private_dir, msg) {
+        // Not a refusal of an untrusted dir (PermissionDenied): nobody's home.
+        Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => match legacy() {
+            Some(old) if old != addr => send_legacy(&old, msg),
+            _ => Err(e),
+        },
+        r => r,
+    }
+}
+
+/// `send` to an older daemon's socket, if it is a socket owned by us.
+#[cfg(unix)]
+fn send_legacy(addr: &Path, msg: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let m = std::fs::symlink_metadata(addr)?;
+    // SAFETY: geteuid never fails.
+    check_legacy(m.file_type().is_socket(), m.uid(), unsafe { libc::geteuid() })?;
+    send(addr, msg)
+}
+
+/// The `lstat` facts `send_legacy` requires.
+#[cfg(unix)]
+fn check_legacy(is_socket: bool, uid: u32, euid: u32) -> io::Result<()> {
+    let why = if !is_socket {
+        "not a socket (or a symlink)"
+    } else if uid != euid {
+        "owned by another user"
+    } else {
+        return Ok(());
+    };
+    Err(io::Error::new(io::ErrorKind::PermissionDenied, why))
+}
+
+/// `send_to` for hook events; Windows has no legacy endpoint.
+#[cfg(windows)]
+pub fn send_hook(
+    addr: &Path,
+    in_private_dir: bool,
+    _legacy: impl FnOnce() -> Option<std::path::PathBuf>,
+    msg: &[u8],
+) -> io::Result<()> {
+    send_to(addr, in_private_dir, msg)
+}
+
+/// `send` for hook events. Our pipe's DACL keeps other users out, but not
+/// a squatter who created the pipe name first: only write once the pipe's
+/// owner checks out (`pipe_owner_trusted`).
 #[cfg(windows)]
 pub fn send_to(addr: &Path, _in_private_dir: bool, msg: &[u8]) -> io::Result<()> {
-    send(addr, msg)
+    use std::io::Write;
+    use std::os::windows::io::AsRawHandle;
+    let mut f = open_pipe(addr)?;
+    let owner = SecurityInfo::query(f.as_raw_handle(), windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION)?
+        .owner_string()?;
+    if !pipe_owner_trusted(&owner, &current_user_sid()?) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "hook pipe owned by someone else"));
+    }
+    f.write_all(msg)
 }
 
 #[cfg(windows)]
 pub fn send(addr: &Path, msg: &[u8]) -> io::Result<()> {
     use std::io::Write;
+    open_pipe(addr)?.write_all(msg)
+}
+
+/// Connect to the pipe at `addr` for writing, waiting while all instances
+/// are busy. `READ_CONTROL` lets `send_to` read the owner;
+/// `SECURITY_IDENTIFICATION` keeps the server from impersonating us.
+#[cfg(windows)]
+fn open_pipe(addr: &Path) -> io::Result<std::fs::File> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, SECURITY_IDENTIFICATION};
     use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
     let wide: Vec<u16> = addr.as_os_str().encode_wide().chain(Some(0)).collect();
     for _ in 0..10 {
-        match std::fs::OpenOptions::new().write(true).open(addr) {
-            Ok(mut f) => return f.write_all(msg),
+        match std::fs::OpenOptions::new()
+            .access_mode(GENERIC_WRITE | READ_CONTROL)
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(addr)
+        {
+            Ok(f) => return Ok(f),
             Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
                 // SAFETY: NUL-terminated wide string.
                 unsafe { WaitNamedPipeW(wide.as_ptr(), 250) };
@@ -90,6 +171,14 @@ pub fn send(addr: &Path, msg: &[u8]) -> io::Result<()> {
         }
     }
     Err(io::Error::new(io::ErrorKind::TimedOut, "daemon pipe busy"))
+}
+
+/// Whether a hook may write to a pipe owned by `owner` (a SID string) when
+/// running as `user`. Our daemon's pipe is owned by the user, or by
+/// `BUILTIN\Administrators` when the daemon runs elevated; LocalSystem is
+/// trusted anyway. Anyone else is a squatter.
+pub fn pipe_owner_trusted(owner: &str, user: &str) -> bool {
+    !owner.is_empty() && (owner == user || owner == "S-1-5-32-544" || owner == "S-1-5-18")
 }
 
 /// True if a daemon is accepting connections at `addr`.
@@ -265,17 +354,16 @@ impl Drop for Listener {
     }
 }
 
-/// A security descriptor granting only the current user access (see
-/// `pipe_sddl`). Other users can neither connect to our pipe nor add
-/// instances to it.
+/// The pipe's security descriptor: normally `pipe_sddl`, granting only the
+/// current user access, so other users can neither connect to our pipe nor
+/// add instances to it.
 #[cfg(windows)]
 struct OwnerOnly(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
 
 /// The current process token's user SID as a string (`S-1-5-21-…`).
 #[cfg(windows)]
 fn current_user_sid() -> io::Result<String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     let mut token: HANDLE = std::ptr::null_mut();
@@ -298,10 +386,21 @@ fn current_user_sid() -> io::Result<String> {
     if ok == 0 {
         return Err(err);
     }
-    // SAFETY: on success the buffer starts with an initialized, aligned TOKEN_USER.
-    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    // SAFETY: on success the buffer starts with an initialized, aligned
+    // TOKEN_USER whose SID points into `buf`, which is still alive.
+    unsafe { sid_string((*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid) }
+}
+
+/// `sid` as a string (`S-1-5-…`).
+///
+/// # Safety
+/// `sid` must point to a valid SID.
+#[cfg(windows)]
+unsafe fn sid_string(sid: windows_sys::Win32::Security::PSID) -> io::Result<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     let mut wide = std::ptr::null_mut();
-    // SAFETY: `sid` points into `buf`, which is still alive; `wide` is a valid out-pointer.
+    // SAFETY: `sid` is valid (caller); `wide` is a valid out-pointer.
     if unsafe { ConvertSidToStringSidW(sid, &mut wide) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -316,13 +415,69 @@ fn current_user_sid() -> io::Result<String> {
     Ok(s)
 }
 
+/// Parts of a kernel object's security descriptor, read from a handle
+/// opened with `READ_CONTROL`. `owner` and `dacl` point into `sd` and are
+/// null unless requested.
+#[cfg(windows)]
+struct SecurityInfo {
+    sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    owner: windows_sys::Win32::Security::PSID,
+    #[cfg_attr(not(test), allow(dead_code))]
+    dacl: *mut windows_sys::Win32::Security::ACL,
+}
+
+#[cfg(windows)]
+impl SecurityInfo {
+    fn query(
+        h: windows_sys::Win32::Foundation::HANDLE,
+        what: windows_sys::Win32::Security::OBJECT_SECURITY_INFORMATION,
+    ) -> io::Result<SecurityInfo> {
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+        let mut si = SecurityInfo { sd: std::ptr::null_mut(), owner: std::ptr::null_mut(), dacl: std::ptr::null_mut() };
+        // SAFETY: `h` is an open handle; every out-pointer is valid. On
+        // success `sd` is LocalAlloc'd and freed by Drop.
+        let r = unsafe {
+            GetSecurityInfo(
+                h,
+                SE_KERNEL_OBJECT,
+                what,
+                &mut si.owner,
+                std::ptr::null_mut(),
+                &mut si.dacl,
+                std::ptr::null_mut(),
+                &mut si.sd,
+            )
+        };
+        if r != 0 {
+            return Err(io::Error::from_raw_os_error(r as i32));
+        }
+        Ok(si)
+    }
+
+    fn owner_string(&self) -> io::Result<String> {
+        if self.owner.is_null() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "pipe has no owner"));
+        }
+        // SAFETY: a non-null owner points into `self.sd`, which is alive.
+        unsafe { sid_string(self.owner) }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SecurityInfo {
+    fn drop(&mut self) {
+        // SAFETY: allocated by GetSecurityInfo (or null) and freed exactly once, here.
+        unsafe { windows_sys::Win32::Foundation::LocalFree(self.sd) };
+    }
+}
+
 #[cfg(windows)]
 impl OwnerOnly {
-    fn new() -> io::Result<OwnerOnly> {
+    fn from_sddl(sddl: &str) -> io::Result<OwnerOnly> {
         use windows_sys::Win32::Security::Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
         };
-        let sddl: Vec<u16> = pipe_sddl(&current_user_sid()?).encode_utf16().chain(Some(0)).collect();
+        let sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
         let mut sd = std::ptr::null_mut();
         // SAFETY: NUL-terminated wide string and a valid out-pointer; the
         // size out-parameter is optional. On success `sd` is a LocalAlloc'd
@@ -374,7 +529,9 @@ unsafe impl Send for Listener {}
 #[cfg(windows)]
 impl Listener {
     fn create(name: &[u16], sd: &OwnerOnly, first: bool) -> io::Result<windows_sys::Win32::Foundation::HANDLE> {
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, INVALID_HANDLE_VALUE, SetLastError,
+        };
         use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND};
         use windows_sys::Win32::System::Pipes::{
             CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
@@ -382,6 +539,8 @@ impl Listener {
         };
         let flags = PIPE_ACCESS_INBOUND | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
         let sa = sd.attributes();
+        // SAFETY: only resets this thread's last-error value.
+        unsafe { SetLastError(0) };
         // SAFETY: valid NUL-terminated name; `sa` and the descriptor it points
         // to outlive the call.
         let h = unsafe {
@@ -403,13 +562,26 @@ impl Listener {
             }
             return Err(e);
         }
+        // Windows refuses a second first instance (above); Wine ignores the
+        // flag and only reports that the pipe already existed.
+        // SAFETY: GetLastError right after the call.
+        if first && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            // SAFETY: the handle we just created, closed once.
+            unsafe { CloseHandle(h) };
+            return Err(io::Error::new(io::ErrorKind::AddrInUse, "daemon already running"));
+        }
         Ok(h)
     }
 
     pub fn bind(addr: &Path) -> io::Result<Listener> {
+        Self::bind_sddl(addr, &pipe_sddl(&current_user_sid()?))
+    }
+
+    /// `bind` with the pipe's security descriptor given as SDDL.
+    fn bind_sddl(addr: &Path, sddl: &str) -> io::Result<Listener> {
         use std::os::windows::ffi::OsStrExt;
         let name: Vec<u16> = addr.as_os_str().encode_wide().chain(Some(0)).collect();
-        let sd = OwnerOnly::new()?;
+        let sd = OwnerOnly::from_sddl(sddl)?;
         let first = Self::create(&name, &sd, true)?;
         Ok(Listener { name, sd, first })
     }
@@ -435,8 +607,10 @@ impl Listener {
         }
     }
 
-    pub fn serve(self, mut on_msg: impl FnMut(Vec<u8>) -> bool) {
-        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, GetLastError, HANDLE};
+    pub fn serve(mut self, mut on_msg: impl FnMut(Vec<u8>) -> bool) {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+        };
         use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, DisconnectNamedPipe};
         let close = |h: HANDLE| {
             // SAFETY: closing a server pipe handle we own, exactly once.
@@ -445,7 +619,8 @@ impl Listener {
                 CloseHandle(h);
             }
         };
-        let mut next = self.first;
+        // Ours from here on; Drop must not close it again.
+        let mut next = std::mem::replace(&mut self.first, INVALID_HANDLE_VALUE);
         loop {
             // A client that connected before this call reports PIPE_CONNECTED;
             // one that already wrote everything and closed reports NO_DATA.
@@ -481,6 +656,19 @@ impl Listener {
     }
 }
 
+/// An unserved listener releases the pipe name, so a daemon that fails
+/// after binding (or a test) doesn't block the next bind.
+#[cfg(windows)]
+impl Drop for Listener {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        if self.first != INVALID_HANDLE_VALUE {
+            // SAFETY: a server pipe handle we still own (serve takes it out).
+            unsafe { CloseHandle(self.first) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,38 +692,311 @@ mod tests {
         assert_eq!(pipe_sddl("S-1-5-21-1-2-3-1001"), "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)");
     }
 
+    #[test]
+    fn pipe_owner_must_be_the_user_admins_or_system() {
+        let me = "S-1-5-21-1-2-3-1001";
+        assert!(pipe_owner_trusted(me, me));
+        assert!(pipe_owner_trusted("S-1-5-32-544", me), "elevated daemon");
+        assert!(pipe_owner_trusted("S-1-5-18", me), "LocalSystem");
+        assert!(!pipe_owner_trusted("S-1-5-21-1-2-3-1002", me), "another user");
+        assert!(!pipe_owner_trusted("S-1-5-21-1-2-3-10011", me));
+        assert!(!pipe_owner_trusted("S-1-5-21-1-2-3-100", me));
+        assert!(!pipe_owner_trusted("S-1-1-0", me), "Everyone");
+        assert!(!pipe_owner_trusted("S-1-5-32-545", me), "Users");
+        assert!(!pipe_owner_trusted("", me));
+        assert!(!pipe_owner_trusted("", ""));
+    }
+
+    /// A hook endpoint unique to this test and process.
+    fn test_addr(name: &str) -> std::path::PathBuf {
+        #[cfg(unix)]
+        return std::env::temp_dir().join(format!("cp-ipc-{name}-{}.sock", std::process::id()));
+        #[cfg(windows)]
+        return std::path::PathBuf::from(format!(r"\\.\pipe\cp-test-{name}-{}", std::process::id()));
+    }
+
+    /// Serve `l` on its own thread, forwarding every message.
+    fn serve(l: Listener) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || l.serve(move |m| tx.send(m).is_ok()));
+        rx
+    }
+
+    #[test]
+    fn roundtrip() {
+        let p = test_addr("rt");
+        let l = Listener::bind(&p).unwrap();
+        assert_eq!(Listener::bind(&p).err().map(|e| e.kind()), Some(io::ErrorKind::AddrInUse));
+        let rx = serve(l);
+        send(&p, b"Stop\n{}").unwrap();
+        assert!(daemon_running(&p));
+        send(&p, b"PreToolUse\n{\"a\":1}").unwrap();
+        assert_eq!(rx.recv().unwrap(), b"Stop\n{}");
+        assert_eq!(rx.recv().unwrap(), b"PreToolUse\n{\"a\":1}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn shutdown_request_roundtrip() {
+        let p = test_addr("stop");
+        let rx = serve(Listener::bind(&p).unwrap());
+        send(&p, &shutdown_request()).unwrap();
+        let m = rx.recv().unwrap();
+        assert_eq!(event_name(&m), SHUTDOWN.as_bytes());
+        assert!(is_control(event_name(&m)));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn bind_waits_for_a_stopping_daemon() {
+        use std::time::{Duration, Instant};
+        let p = test_addr("wait");
+        let l = Listener::bind(&p).unwrap();
+        // Still held after the wait: gives up with AddrInUse.
+        let t = Instant::now();
+        let e = bind_waiting(&p, Duration::from_millis(300)).err().unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::AddrInUse);
+        assert!(t.elapsed() >= Duration::from_millis(250));
+        // Released while waiting (old daemon finished shutting down).
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(l);
+        });
+        drop(bind_waiting(&p, Duration::from_secs(5)).unwrap());
+    }
+
+    /// Named pipe behavior that can only be checked on Windows.
+    #[cfg(windows)]
+    mod windows {
+        use super::*;
+        use std::os::windows::io::AsRawHandle;
+        use std::time::Duration;
+        use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE, LocalFree};
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation, CreateRestrictedToken, CreateWellKnownSid,
+            DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetSecurityDescriptorControl, GetTokenInformation,
+            ImpersonateLoggedOnUser, OWNER_SECURITY_INFORMATION, PSID, RevertToSelf, SE_DACL_PROTECTED,
+            SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY,
+            TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL, TOKEN_OWNER, TOKEN_QUERY,
+            TokenElevation, TokenIntegrityLevel, TokenOwner, WinBuiltinAdministratorsSid,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, READ_CONTROL};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        // From Win32_System_SystemServices, a feature we don't otherwise need.
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+        const SE_GROUP_INTEGRITY: u32 = 0x20;
+
+        /// A client handle that may read the pipe's security descriptor.
+        fn open_read_control(p: &Path) -> std::fs::File {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().access_mode(READ_CONTROL).open(p).unwrap()
+        }
+
+        fn process_token(access: u32) -> HANDLE {
+            let mut t: HANDLE = std::ptr::null_mut();
+            // SAFETY: pseudo-handle and a valid out-pointer.
+            assert_ne!(unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut t) }, 0);
+            t
+        }
+
+        /// Fixed-size token information `T` of class `class`.
+        fn token_info<T: Copy>(class: i32, buf: &mut [usize; 64]) -> T {
+            let t = process_token(TOKEN_QUERY);
+            let mut len = 0u32;
+            // SAFETY: `buf` is writable for the given length; `t` is open.
+            let ok = unsafe {
+                GetTokenInformation(t, class, buf.as_mut_ptr().cast(), std::mem::size_of_val(buf) as u32, &mut len)
+            };
+            // SAFETY: closing the token we opened.
+            unsafe { CloseHandle(t) };
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+            // SAFETY: on success `buf` starts with an initialized, aligned T.
+            unsafe { *buf.as_ptr().cast::<T>() }
+        }
+
+        fn is_elevated() -> bool {
+            token_info::<TOKEN_ELEVATION>(TokenElevation, &mut [0; 64]).TokenIsElevated != 0
+        }
+
+        /// The owner new objects get: Administrators for an elevated admin.
+        fn default_owner() -> String {
+            let mut buf = [0; 64];
+            let o = token_info::<TOKEN_OWNER>(TokenOwner, &mut buf);
+            // SAFETY: the owner SID points into `buf`, still alive.
+            unsafe { sid_string(o.Owner) }.unwrap()
+        }
+
+        /// Impersonates a token on this thread until dropped.
+        struct Impersonating;
+        impl Drop for Impersonating {
+            fn drop(&mut self) {
+                // SAFETY: ends this thread's impersonation.
+                unsafe { RevertToSelf() };
+            }
+        }
+
+        /// Impersonate what a non-elevated hook of the same user looks like
+        /// to an access check: our token with `BUILTIN\Administrators`
+        /// deny-only, at medium integrity.
+        fn impersonate_non_elevated() -> Impersonating {
+            // The restricted token gets the same access; SetTokenInformation
+            // needs TOKEN_ADJUST_DEFAULT.
+            let own = process_token(
+                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
+            );
+            let mut admins = [0u8; SECURITY_MAX_SID_SIZE as usize];
+            let mut n = admins.len() as u32;
+            // SAFETY: `admins` is writable for `n` bytes.
+            let ok = unsafe {
+                CreateWellKnownSid(
+                    WinBuiltinAdministratorsSid,
+                    std::ptr::null_mut(),
+                    admins.as_mut_ptr().cast(),
+                    &mut n,
+                )
+            };
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+            let deny = SID_AND_ATTRIBUTES { Sid: admins.as_mut_ptr().cast(), Attributes: 0 };
+            let mut t: HANDLE = std::ptr::null_mut();
+            // SAFETY: `own` is open with TOKEN_DUPLICATE; one SID to make
+            // deny-only, no privileges or restricting SIDs; valid out-pointer.
+            let ok =
+                unsafe { CreateRestrictedToken(own, 0, 1, &deny, 0, std::ptr::null(), 0, std::ptr::null(), &mut t) };
+            // SAFETY: closing the token we opened.
+            unsafe { CloseHandle(own) };
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+            let medium: Vec<u16> = "S-1-16-8192".encode_utf16().chain(Some(0)).collect();
+            let mut sid: PSID = std::ptr::null_mut();
+            // SAFETY: NUL-terminated string, valid out-pointer; freed below.
+            assert_ne!(unsafe { ConvertStringSidToSidW(medium.as_ptr(), &mut sid) }, 0);
+            let mut label = TOKEN_MANDATORY_LABEL::default();
+            label.Label.Sid = sid;
+            label.Label.Attributes = SE_GROUP_INTEGRITY;
+            // SAFETY: `t` is a token we own with TOKEN_ADJUST_DEFAULT; `label`
+            // and `sid` outlive the call.
+            let ok = unsafe {
+                SetTokenInformation(
+                    t,
+                    TokenIntegrityLevel,
+                    (&label as *const TOKEN_MANDATORY_LABEL).cast(),
+                    std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32,
+                )
+            };
+            // SAFETY: allocated by ConvertStringSidToSidW, freed once.
+            unsafe { LocalFree(sid) };
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+            // SAFETY: `t` is a valid token; the guard reverts.
+            let ok = unsafe { ImpersonateLoggedOnUser(t) };
+            // SAFETY: the impersonation token is a copy; ours can go.
+            unsafe { CloseHandle(t) };
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+            Impersonating
+        }
+
+        /// Run `f` on a fresh thread as a non-elevated client.
+        fn as_non_elevated<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+            std::thread::spawn(move || {
+                let _imp = impersonate_non_elevated();
+                f()
+            })
+            .join()
+            .unwrap()
+        }
+
+        #[test]
+        fn pipe_dacl_admits_only_the_user() {
+            let p = test_addr("dacl");
+            let _l = Listener::bind(&p).unwrap();
+            let f = open_read_control(&p);
+            let si = SecurityInfo::query(f.as_raw_handle(), DACL_SECURITY_INFORMATION).unwrap();
+            let (mut control, mut rev) = (0u16, 0u32);
+            // SAFETY: `si.sd` is a valid descriptor; valid out-pointers.
+            assert_ne!(unsafe { GetSecurityDescriptorControl(si.sd, &mut control, &mut rev) }, 0);
+            assert_ne!(control & SE_DACL_PROTECTED, 0, "DACL must not inherit");
+            assert!(!si.dacl.is_null(), "a null DACL grants everyone");
+            let mut size = ACL_SIZE_INFORMATION::default();
+            // SAFETY: valid ACL and a buffer of the stated size.
+            let ok = unsafe {
+                GetAclInformation(
+                    si.dacl,
+                    (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            };
+            assert_ne!(ok, 0);
+            assert_eq!(size.AceCount, 1);
+            let mut ace = std::ptr::null_mut();
+            // SAFETY: index 0 exists; valid out-pointer.
+            assert_ne!(unsafe { GetAce(si.dacl, 0, &mut ace) }, 0);
+            // SAFETY: GetAce points into the DACL, alive with `si`.
+            let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            assert_eq!(ace.Header.AceType, ACCESS_ALLOWED_ACE_TYPE);
+            // GA may be stored as given or mapped to the pipe's specific rights.
+            assert!(ace.Mask == GENERIC_ALL || ace.Mask == FILE_ALL_ACCESS, "mask {:#x}", ace.Mask);
+            // SAFETY: the ACE's SID starts at SidStart.
+            let sid = unsafe { sid_string((&ace.SidStart as *const u32).cast_mut().cast()) }.unwrap();
+            assert_eq!(sid, current_user_sid().unwrap());
+        }
+
+        #[test]
+        fn our_pipe_passes_the_owner_check() {
+            let p = test_addr("owner");
+            let rx = serve(Listener::bind(&p).unwrap());
+            let f = open_read_control(&p);
+            let si = SecurityInfo::query(f.as_raw_handle(), OWNER_SECURITY_INFORMATION).unwrap();
+            let owner = si.owner_string().unwrap();
+            assert!(pipe_owner_trusted(&owner, &current_user_sid().unwrap()), "owner {owner}");
+            drop(f);
+            send_to(&p, false, b"Stop\n{}").unwrap();
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"Stop\n{}");
+            // A non-elevated hook writing to an (elevated) daemon's pipe.
+            let q = p.clone();
+            as_non_elevated(move || send_to(&q, false, b"Stop\n{}")).unwrap();
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"Stop\n{}");
+        }
+
+        #[test]
+        fn elevated_daemon_accepts_a_non_elevated_hook() {
+            let p = test_addr("elev");
+            let rx = serve(Listener::bind(&p).unwrap());
+            let q = p.clone();
+            as_non_elevated(move || send(&q, b"Stop\n{}")).unwrap();
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"Stop\n{}");
+
+            // Negative control: with `OW` (owner rights) an elevated daemon's
+            // pipe, owned by Administrators, shuts that same client out. Only
+            // meaningful when new objects really are owned by Administrators
+            // (not the user, nor Wine's primary group).
+            let owner = default_owner();
+            if is_elevated() && owner == "S-1-5-32-544" {
+                let q = test_addr("elev-ow");
+                let _l = Listener::bind_sddl(&q, "D:P(A;;GA;;;OW)").unwrap();
+                let e = as_non_elevated(move || send(&q, b"Stop\n{}")).unwrap_err();
+                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+            } else {
+                eprintln!("default owner {owner}, not elevated Administrators: skipping the OW negative control");
+            }
+        }
+
+        #[test]
+        fn message_sent_before_serving_is_delivered() {
+            // The client connects, writes and closes before ConnectNamedPipe,
+            // which then reports ERROR_NO_DATA; the bytes are still buffered.
+            let p = test_addr("nodata");
+            let l = Listener::bind(&p).unwrap();
+            send(&p, b"Stop\n{}").unwrap();
+            let rx = serve(l);
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"Stop\n{}");
+        }
+    }
+
     /// Tests that need a Unix socket or POSIX permissions.
     #[cfg(unix)]
     mod unix {
         use super::*;
-
-        #[test]
-        fn roundtrip() {
-            let p = std::env::temp_dir().join(format!("cp-ipc-{}.sock", std::process::id()));
-            let l = Listener::bind(&p).unwrap();
-            assert_eq!(Listener::bind(&p).err().map(|e| e.kind()), Some(io::ErrorKind::AddrInUse));
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || l.serve(move |m| tx.send(m).is_ok()));
-            send(&p, b"Stop\n{}").unwrap();
-            assert!(daemon_running(&p));
-            send(&p, b"PreToolUse\n{\"a\":1}").unwrap();
-            assert_eq!(rx.recv().unwrap(), b"Stop\n{}");
-            assert_eq!(rx.recv().unwrap(), b"PreToolUse\n{\"a\":1}");
-            let _ = std::fs::remove_file(&p);
-        }
-
-        #[test]
-        fn shutdown_request_roundtrip() {
-            let p = std::env::temp_dir().join(format!("cp-ipc-stop-{}.sock", std::process::id()));
-            let l = Listener::bind(&p).unwrap();
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || l.serve(move |m| tx.send(m).is_ok()));
-            send(&p, &shutdown_request()).unwrap();
-            let m = rx.recv().unwrap();
-            assert_eq!(event_name(&m), SHUTDOWN.as_bytes());
-            assert!(is_control(event_name(&m)));
-            let _ = std::fs::remove_file(&p);
-        }
 
         #[test]
         fn private_dir_is_verified() {
@@ -629,21 +1090,57 @@ mod tests {
         }
 
         #[test]
-        fn bind_waits_for_a_stopping_daemon() {
-            use std::time::{Duration, Instant};
-            let p = std::env::temp_dir().join(format!("cp-ipc-wait-{}.sock", std::process::id()));
-            let l = Listener::bind(&p).unwrap();
-            // Still held after the wait: gives up with AddrInUse.
-            let t = Instant::now();
-            let e = bind_waiting(&p, Duration::from_millis(300)).err().unwrap();
-            assert_eq!(e.kind(), io::ErrorKind::AddrInUse);
-            assert!(t.elapsed() >= Duration::from_millis(250));
-            // Released while waiting (old daemon finished shutting down).
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(400));
-                drop(l);
-            });
-            drop(bind_waiting(&p, Duration::from_secs(5)).unwrap());
+        fn legacy_socket_rules() {
+            assert!(check_legacy(true, 5, 5).is_ok());
+            assert!(check_legacy(true, 6, 5).is_err(), "another user's socket");
+            assert!(check_legacy(true, 0, 5).is_err(), "root's socket");
+            assert!(check_legacy(false, 5, 5).is_err(), "not a socket");
+        }
+
+        #[test]
+        fn hook_falls_back_to_a_legacy_daemon() {
+            use std::os::unix::fs::PermissionsExt;
+            use std::time::Duration;
+            let base = std::env::temp_dir().join(format!("cp-legacy-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            // Another test's bind may have the process umask at 0o177 right now.
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let old = base.join("old.sock");
+            let rx = serve(Listener::bind_with(&old, false).unwrap());
+            let legacy = || Some(old.clone());
+
+            // Upgraded hook, old daemon: the private dir doesn't exist yet.
+            let current = base.join("priv").join("hook.sock");
+            send_hook(&current, true, legacy, b"Stop\n{}").unwrap();
+            assert_eq!(rx.recv().unwrap(), b"Stop\n{}");
+            // Nothing listens at today's path (stale socket file).
+            let stale = base.join("stale.sock");
+            drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+            send_hook(&stale, false, legacy, b"Stop\n{}").unwrap();
+            assert_eq!(rx.recv().unwrap(), b"Stop\n{}");
+
+            // Today's daemon wins; the legacy path isn't even computed.
+            let new = base.join("new.sock");
+            let rx_new = serve(Listener::bind_with(&new, false).unwrap());
+            send_hook(&new, false, || panic!("legacy looked up"), b"Stop\n{}").unwrap();
+            assert_eq!(rx_new.recv().unwrap(), b"Stop\n{}");
+
+            // A squatter's private dir is refused outright, not bypassed.
+            let open = base.join("open");
+            std::fs::create_dir(&open).unwrap();
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(send_hook(&open.join("hook.sock"), true, legacy, b"Stop\n{}").is_err());
+            // Only a real socket: not a symlink to one, not a plain file.
+            let link = base.join("link.sock");
+            std::os::unix::fs::symlink(&old, &link).unwrap();
+            assert!(send_hook(&current, true, || Some(link.clone()), b"Stop\n{}").is_err());
+            let file = base.join("file.sock");
+            std::fs::write(&file, "").unwrap();
+            assert!(send_hook(&current, true, || Some(file.clone()), b"Stop\n{}").is_err());
+            assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+
+            let _ = std::fs::remove_dir_all(&base);
         }
 
         #[test]
