@@ -24,17 +24,6 @@ numbers are approximate.
 
 ### Medium
 
-1. **Rotation spin, 20 Hz wakeups** (`src/daemon.rs` `next_rotation` /
-   `render` / `tick`). `render` only advances `rotation.since` when more than
-   one rotation frame is eligible; with ≤ 1 eligible frame (e.g. a new user
-   with no stats, idle card) `next_rotation` stays in the past and `tick`
-   returns the 50 ms floor forever. Reproduced. Fix: advance
-   `rotation.since = now` when `frames.len() <= 1`, or return `None`.
-   Add a unit test.
-2. **Expiry spin, 20 Hz wakeups** (`daemon.rs` `expire` / `next_expiry`).
-   A recent transcript mtime keeps a session alive but `last_activity` is
-   not updated, so `next_expiry` is in the past. Reproduced. Fix:
-   `s.last_activity = max(s.last_activity, mtime)`.
 3. **Windows hook pipe drops messages** (`src/ipc.rs` Windows `serve`).
    `ConnectNamedPipe` returning `ERROR_NO_DATA` (client wrote and closed
    already) is treated as failure and the buffered data is discarded; the
@@ -53,13 +42,6 @@ numbers are approximate.
 
 ### Low / low-medium
 
-5. **Ledger save order** (`src/ledger.rs` `save`). `ledger.json` is renamed
-   before `seen.bin` is appended, so a crash in between can double-count a
-   message copied into a resumed transcript. Fix: append + `sync_all`
-   `seen.bin` first, then the ledger, **and update the ledger invariant in
-   AGENTS.md accordingly**. Also: a torn `seen.bin` append leaves the length
-   not a multiple of 8 and misaligns every later id — truncate to a multiple
-   of 8 on load and before appending.
 6. **Windows Discord pipe has no timeout** (`src/discord.rs` Windows
    `open`). A frozen Discord blocks the worker forever, and
    `Presenter::shutdown`'s `join` hangs exit. Fix: overlapped I/O with a
@@ -71,18 +53,9 @@ numbers are approximate.
    Fix: a shutdown request over the hook IPC (e.g. event name `__shutdown`
    → `Msg::Shutdown`), sent by `uninstall_service`, then wait ≤ 2 s for
    `daemon_running` to turn false. Touches the wire format → advisor first.
-8. **Rejected activity resent forever** (`discord.rs` ~400): set
-   `on_wire = None` after Discord rejects an activity.
-9. **Unix accept error busy loop** (`ipc.rs` Unix `serve`): sleep ~100 ms on
-   `incoming()` errors (EMFILE/ENFILE).
-10. **Config overflow** (`daemon.rs` uses of `idle_timeout`,
-    `rotation_interval`): clamp at config load so `as i64 * 1000` can't
-    overflow. Document the ranges in README and `DEFAULT_TOML`.
 
 ## Nice to have
 
-- Log the first received hook at `info` so a silent daemon is easier to
-  diagnose (users saw only "listening…" and assumed it was broken).
 - Optionally add the Windows install dir to the user `PATH` on install.
 - PR #1 description footer: replace "Generated with Claude Code" with
   `🤖 Written by the <sub-agent> sub-agent` (see CLAUDE.md).

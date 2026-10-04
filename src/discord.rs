@@ -173,17 +173,7 @@ impl Conn {
 
     /// Read one frame into `self.buf`, returning its opcode.
     fn read_frame(&mut self) -> io::Result<u32> {
-        let mut hdr = [0u8; 8];
-        self.s.read_exact(&mut hdr)?;
-        let op = u32::from_le_bytes(hdr[..4].try_into().unwrap());
-        let len = u32::from_le_bytes(hdr[4..].try_into().unwrap()) as usize;
-        if len > MAX_FRAME {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "oversized frame"));
-        }
-        self.buf.clear();
-        self.buf.resize(len, 0);
-        self.s.read_exact(&mut self.buf)?;
-        Ok(op)
+        read_frame_from(&mut self.s, &mut self.buf)
     }
 
     fn pong(&mut self) -> io::Result<()> {
@@ -231,6 +221,22 @@ impl Conn {
     }
 }
 
+/// Read one frame from `r` into `buf`, returning its opcode.
+fn read_frame_from(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<u32> {
+    let mut hdr = [0u8; 8];
+    r.read_exact(&mut hdr)?;
+    let op = u32::from_le_bytes(hdr[..4].try_into().unwrap());
+    let len = u32::from_le_bytes(hdr[4..].try_into().unwrap()) as usize;
+    if len > MAX_FRAME {
+        // Not InvalidData: that means "activity rejected, connection fine".
+        return Err(io::Error::other("oversized frame"));
+    }
+    buf.clear();
+    buf.resize(len, 0);
+    r.read_exact(buf)?;
+    Ok(op)
+}
+
 /// The fields of a Discord IPC reply we look at.
 #[derive(Deserialize)]
 struct Reply<'a> {
@@ -275,6 +281,18 @@ impl Presenter {
         Presenter { shared, thread: Some(thread) }
     }
 
+    /// A presenter without a worker thread, so tests never reach Discord.
+    #[cfg(test)]
+    pub fn inert() -> Presenter {
+        Presenter { shared: Arc::new(Shared::default()), thread: None }
+    }
+
+    /// The activity last handed to `set`.
+    #[cfg(test)]
+    pub fn wanted(&self) -> Option<String> {
+        self.shared.want.lock().unwrap_or_else(|e| e.into_inner()).activity.clone()
+    }
+
     /// Replace the desired activity (JSON object), or clear it with `None`.
     pub fn set(&self, activity: Option<String>) {
         let mut w = self.shared.want.lock().unwrap_or_else(|e| e.into_inner());
@@ -305,11 +323,51 @@ fn next_allowed(window: &VecDeque<Instant>, last: Option<Instant>) -> Option<Ins
     t
 }
 
+/// What the worker last got onto the wire.
+#[derive(Default)]
+struct Wire {
+    /// What Discord currently shows (and keepalives re-assert).
+    on_wire: Option<String>,
+    /// Generation of the last activity Discord answered for.
+    sent_gen: u64,
+    /// Resend the wanted activity even if its generation was already sent.
+    resend: bool,
+}
+
+impl Wire {
+    /// Record the outcome of sending `want` (generation `generation`).
+    /// Returns `false` when the connection is lost and must be dropped.
+    fn record(&mut self, res: &io::Result<()>, want: Option<String>, generation: u64) -> bool {
+        match res {
+            Ok(()) => {
+                crate::debug!("activity {}", if want.is_some() { "set" } else { "cleared" });
+                self.on_wire = want;
+                self.sent_gen = generation;
+                self.resend = false;
+                true
+            }
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                crate::warn!("Discord rejected the activity: {e}");
+                // Not shown, so nothing to keep alive: re-sending a payload
+                // Discord refused would only fail again every keepalive.
+                self.on_wire = None;
+                self.sent_gen = generation;
+                self.resend = false;
+                true
+            }
+            Err(e) => {
+                crate::info!("Discord connection lost: {e}");
+                self.on_wire = None;
+                self.resend = true;
+                false
+            }
+        }
+    }
+}
+
 fn worker(shared: &Shared, client_id: &str) {
     let mut conn: Option<Conn> = None;
-    let mut on_wire: Option<String> = None; // what Discord currently shows
-    let mut sent_gen = 0u64;
-    let mut resend = false;
+    let mut wire = Wire::default();
     let mut window: VecDeque<Instant> = VecDeque::with_capacity(MAX_PER_WINDOW + 1);
     let mut last_send: Option<Instant> = None;
     let mut retry_at = Instant::now();
@@ -321,24 +379,24 @@ fn worker(shared: &Shared, client_id: &str) {
             loop {
                 if g.stop {
                     drop(g);
-                    if let (Some(c), Some(_)) = (conn.as_mut(), on_wire.as_ref()) {
+                    if let (Some(c), Some(_)) = (conn.as_mut(), wire.on_wire.as_ref()) {
                         let _ = c.set_activity(None);
                     }
                     return;
                 }
                 let now = Instant::now();
                 let keepalive = conn.as_ref().map(|c| if c.bridge { KEEPALIVE_BRIDGE } else { KEEPALIVE });
-                let keepalive_at = match (keepalive, &on_wire, last_send) {
+                let keepalive_at = match (keepalive, &wire.on_wire, last_send) {
                     (Some(k), Some(_), Some(l)) => Some(l + k),
                     _ => None,
                 };
-                let dirty = g.generation != sent_gen || resend;
+                let dirty = g.generation != wire.sent_gen || wire.resend;
                 let mut wake = None;
                 if dirty || keepalive_at.is_some_and(|t| t <= now) {
                     if conn.is_none() && g.activity.is_none() {
                         // Nothing to clear on a connection we don't have.
-                        sent_gen = g.generation;
-                        resend = false;
+                        wire.sent_gen = g.generation;
+                        wire.resend = false;
                         continue;
                     }
                     let mut at = next_allowed(&window, last_send).unwrap_or(now);
@@ -390,26 +448,9 @@ fn worker(shared: &Shared, client_id: &str) {
         while window.len() > MAX_PER_WINDOW || window.front().is_some_and(|&t| now - t >= WINDOW) {
             window.pop_front();
         }
-        match res {
-            Ok(()) => {
-                crate::debug!("activity {}", if want.is_some() { "set" } else { "cleared" });
-                on_wire = want;
-                sent_gen = generation;
-                resend = false;
-            }
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                crate::warn!("Discord rejected the activity: {e}");
-                on_wire = want;
-                sent_gen = generation;
-                resend = false;
-            }
-            Err(e) => {
-                crate::info!("Discord connection lost: {e}");
-                conn = None;
-                on_wire = None;
-                resend = true;
-                retry_at = now;
-            }
+        if !wire.record(&res, want, generation) {
+            conn = None;
+            retry_at = now;
         }
     }
 }
@@ -472,6 +513,51 @@ mod tests {
         assert_eq!(c.set_activity(None).unwrap_err().kind(), io::ErrorKind::InvalidData);
         server.join().unwrap();
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn rejected_activity_is_not_kept_alive() {
+        let mut w = Wire::default();
+        assert!(w.record(&Ok(()), Some("a".into()), 1));
+        assert_eq!((w.on_wire.as_deref(), w.sent_gen, w.resend), (Some("a"), 1, false));
+
+        // Discord refused it: don't resend (keepalive only runs while on_wire is set).
+        let rejected = Err(io::Error::new(io::ErrorKind::InvalidData, "bad"));
+        assert!(w.record(&rejected, Some("b".into()), 2));
+        assert_eq!((w.on_wire.as_deref(), w.sent_gen, w.resend), (None, 2, false));
+
+        // A broken connection: forget what's shown and resend after reconnecting.
+        w.record(&Ok(()), Some("c".into()), 3);
+        let lost = Err(io::Error::new(io::ErrorKind::BrokenPipe, "gone"));
+        assert!(!w.record(&lost, Some("d".into()), 4));
+        assert_eq!((w.on_wire.as_deref(), w.sent_gen, w.resend), (None, 3, true));
+    }
+
+    #[test]
+    fn oversized_frame_drops_the_connection() {
+        let mut hdr = OP_FRAME.to_le_bytes().to_vec();
+        hdr.extend_from_slice(&(MAX_FRAME as u32 + 1).to_le_bytes());
+        let mut buf = Vec::new();
+        let e = read_frame_from(&mut hdr.as_slice(), &mut buf).unwrap_err();
+        assert_ne!(e.kind(), io::ErrorKind::InvalidData, "InvalidData means \"rejected, keep the connection\"");
+        assert!(!Wire::default().record(&Err(e), Some("a".into()), 1));
+
+        let mut ok = OP_PING.to_le_bytes().to_vec();
+        ok.extend_from_slice(&2u32.to_le_bytes());
+        ok.extend_from_slice(b"{}");
+        assert_eq!(read_frame_from(&mut ok.as_slice(), &mut buf).unwrap(), OP_PING);
+        assert_eq!(buf, b"{}");
+        // Truncated body.
+        assert!(read_frame_from(&mut &ok[..9], &mut buf).is_err());
+    }
+
+    #[test]
+    fn inert_presenter_spawns_nothing() {
+        let p = Presenter::inert();
+        assert!(p.thread.is_none());
+        p.set(Some("x".into()));
+        assert_eq!(p.wanted().as_deref(), Some("x"));
+        p.shutdown();
     }
 
     #[test]

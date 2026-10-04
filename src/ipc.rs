@@ -85,7 +85,12 @@ impl Listener {
         use std::io::Read;
         use std::time::Duration;
         for conn in self.0.incoming() {
-            let Ok(mut s) = conn else { continue };
+            let Ok(mut s) = conn else {
+                // EMFILE/ENFILE persist until a descriptor frees up; back off
+                // instead of spinning on accept().
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            };
             let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
             let mut buf = Vec::with_capacity(4096);
             if (&mut s).take(MAX_MSG as u64).read_to_end(&mut buf).is_ok() && !buf.is_empty() && !on_msg(buf) {
