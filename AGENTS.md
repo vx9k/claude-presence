@@ -63,10 +63,18 @@ checks and the ledger's crash rules is in
   group/other bits and owner rwx (never chmod/remove it), and whose parent
   is ours or root's and sticky or not writable by others. Hook clients run
   the same checks before connecting (only on this fallback path) and
-  silently skip sending if they fail. Windows: named pipe whose DACL grants
-  only the current user's SID (not `OW`, which breaks under elevation) and
-  `FILE_FLAG_FIRST_PIPE_INSTANCE`. A starting daemon retries a busy endpoint
-  for 5 s so a reinstall can replace a daemon that is still shutting down.
+  silently skip sending if they fail. Until a couple of releases after the
+  private dir shipped, a hook that finds nothing at today's path (`NotFound`
+  / `ConnectionRefused`, never after a failed check) falls back to
+  `paths::legacy_hook_socket()`, only if `lstat` shows a socket owned by
+  the euid in a parent that passes the same parent check. Windows: named pipe whose DACL grants only the current user's
+  SID (not `OW`, which breaks under elevation) and
+  `FILE_FLAG_FIRST_PIPE_INSTANCE`; hook clients connect with
+  `SECURITY_IDENTIFICATION` and write only if the pipe's owner is the
+  user, `BUILTIN\Administrators` (elevated daemon) or LocalSystem
+  (`pipe_owner_trusted`), else silently skip. A starting daemon retries a
+  busy endpoint for 5 s so a reinstall can replace a daemon that is still
+  shutting down.
 - **Ledger** (`ledger.json` + append-only `seen.bin`): totals only grow;
   tokens counted once per `message.id`, prompts once per `uuid`, globally.
   `seen.bin` is appended and synced before `ledger.json` is atomically
@@ -76,6 +84,9 @@ checks and the ledger's crash rules is in
   appending. Token arithmetic saturates. Bump `VERSION` in `src/ledger.rs` on incompatible changes.
 - **Discord rate limit:** ≤ 4 `SET_ACTIVITY` per 20 s, ≥ 4 s apart; bursts
   coalesce to the latest state. All Discord I/O stays on its worker thread.
+  On Windows it connects with `SECURITY_IDENTIFICATION` (no impersonation
+  by a fake Discord pipe), and a worker still blocked at shutdown has its
+  I/O cancelled (`CancelSynchronousIo`).
 - **`settings.json`:** only touch hook entries whose command contains
   `claude-presence` and ` hook `; preserve everything else and key order.
 - **Config:** every key optional (a partial `[status.*]` table falls back per

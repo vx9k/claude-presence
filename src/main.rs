@@ -69,7 +69,7 @@ fn hook(event: &str) -> ExitCode {
     msg.push(b'\n');
     let _ = std::io::stdin().lock().read_to_end(&mut msg);
     let (sock, in_private_dir) = paths::hook_endpoint();
-    let _ = ipc::send_to(&sock, in_private_dir, &msg);
+    let _ = ipc::send_hook(&sock, in_private_dir, paths::legacy_hook_socket, &msg);
     ExitCode::SUCCESS
 }
 
@@ -85,8 +85,12 @@ fn exe_name(base: &str) -> String {
 
 /// On Windows, binaries are often run from Downloads; copy them to the
 /// standard per-user programs folder so hooks keep working.
+///
+/// A running daemon holds its .exe open. With a service, `install` already
+/// stopped it (and starts the new one); with `service == false` stop it here
+/// and start the new binary detached, so it isn't left stopped.
 #[cfg(windows)]
-fn stable_location(exe: &Path) -> std::io::Result<PathBuf> {
+fn stable_location(exe: &Path, service: bool) -> std::io::Result<PathBuf> {
     let dir = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| paths::home().join("AppData").join("Local"))
@@ -96,19 +100,38 @@ fn stable_location(exe: &Path) -> std::io::Result<PathBuf> {
         return Ok(exe.to_path_buf());
     }
     std::fs::create_dir_all(&dir)?;
-    let src_dir = exe.parent().unwrap_or(Path::new("."));
-    for name in [exe_name("claude-presence"), exe_name("claude-presenced")] {
-        let src = src_dir.join(&name);
-        if src.exists() {
-            std::fs::copy(&src, dir.join(&name))?;
+    // With a service the service manager starts the new daemon; without one,
+    // restart whatever was running (a duplicate just exits "already running").
+    let restart = !service && ipc::daemon_running(&paths::hook_socket());
+    if !service {
+        for line in install::stop_daemons() {
+            println!("  {line} (to replace its binary)");
         }
     }
-    println!("  copied binaries to {}", dir.display());
+    let names = [exe_name("claude-presence"), exe_name("claude-presenced")];
+    install::remove_stale_old(&dir, &names);
+    let src_dir = exe.parent().unwrap_or(Path::new("."));
+    // A failed copy is rolled back, so the binary on disk is usable either
+    // way: restart before reporting the error.
+    let copied = names.iter().try_for_each(|name| {
+        let src = src_dir.join(name);
+        if src.exists() { install::replace_binary(&src, &dir.join(name)) } else { Ok(()) }
+    });
+    if copied.is_ok() {
+        println!("  copied binaries to {}", dir.display());
+    }
+    if restart {
+        match install::spawn_detached(&dir.join(exe_name("claude-presenced"))) {
+            Ok(()) => println!("  restarted the daemon"),
+            Err(e) => eprintln!("  could not restart the daemon: {e}"),
+        }
+    }
+    copied?;
     Ok(dir.join(exe_name("claude-presence")))
 }
 
 #[cfg(not(windows))]
-fn stable_location(exe: &Path) -> std::io::Result<PathBuf> {
+fn stable_location(exe: &Path, _service: bool) -> std::io::Result<PathBuf> {
     Ok(exe.to_path_buf())
 }
 
@@ -153,7 +176,7 @@ fn install_cmd(args: &[String]) -> ExitCode {
             println!("  {line} (reinstalling)");
         }
     }
-    let exe = match stable_location(&exe) {
+    let exe = match stable_location(&exe, service) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("cannot copy binaries: {e}");

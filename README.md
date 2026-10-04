@@ -34,8 +34,11 @@ This installs two programs: `claude-presence` (the command you type, also called
 hooks) and `claude-presenced` (the background daemon). `install` then:
 
 1. writes a default config (if none exists),
-2. adds hooks for 9 events to `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`).
-   A one-time `settings.json.bak` backup is kept; your other settings and hooks are untouched,
+2. adds hooks for 10 events to `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`).
+   A one-time `settings.json.bak` backup is kept; your other settings and hooks are untouched.
+   Events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+   `PostToolUseFailure`, `Notification`, `PreCompact`, `Stop`, `SubagentStop`, `SessionEnd`
+   (a Claude Code version that doesn't know an event ignores it),
 3. registers and starts `claude-presenced` as a per-user background service
    (see [Background service](#background-service)).
 
@@ -46,6 +49,10 @@ note: run `cargo install --path .` first so hooks don't point into `target/`.)
 Re-running `install` is safe (e.g. after upgrading): it asks a running daemon to stop
 cleanly (it saves your stats; waits up to 2 s; prints `stopped the running daemon`),
 stops the old service, rewrites the hooks and service file, and starts the new binary.
+Re-running it also adds hook events a newer version wires (no duplicates). On Windows it
+replaces the copied binaries even while the old daemon is shutting down. If you upgrade
+the binary but don't re-run `install`, hooks on Linux and macOS still reach a daemon from
+before the private socket directory that keeps running.
 Details: [docs/services.md](docs/services.md#reinstall-and-upgrade).
 
 ### Commands

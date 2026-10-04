@@ -56,7 +56,7 @@ Conventions the existing tests follow:
 | Output generic over `Write` so failures can be injected | `write_status` with a `ClosedPipe` writer in `src/main.rs` |
 | Regression tests named for the property | `crash_between_seen_and_ledger_never_double_counts`, `live_transcript_does_not_spin_expiry` |
 | Shift time instead of sleeping where possible | `d.rotation.since -= ...`, `sessions.get_mut(..).last_activity = ...`, then `tick()` |
-| Unix-only tests are gated `#[cfg(all(test, unix))]` | `src/ipc.rs`, `src/discord.rs` |
+| Unix-only tests are gated `#[cfg(all(test, unix))]` or sit in an inner `#[cfg(unix)] mod unix`; Windows runtime tests in `#[cfg(windows)] mod windows` | `src/ipc.rs`, `src/discord.rs` |
 
 Rules that tests must respect: never talk to a real Discord client, never run or modify real services, never touch the user's `settings.json` or config; do not rely on environment variables other tests may change.
 
@@ -66,12 +66,32 @@ Code conventions: match surrounding style, every `unsafe` block gets a `// SAFET
 
 ## Platform code you cannot run
 
-Windows named-pipe and Task Scheduler code, and macOS-only code, cannot be run on a Linux dev box.
+macOS-only code and Windows service code (Task Scheduler, Run key) cannot be run on a Linux dev box; Windows named-pipe code can run under Wine (below).
 
 - Make them compile cleanly with the two cross clippy commands above.
 - Factor decisions out of the FFI calls into pure functions and test those on Linux (see the table).
-- Reason carefully about the rest, and say in the PR which behavior is only type-checked and unverified (current examples are in [TODO.md](../TODO.md) item 10).
-- Add the item to TODO.md "Low / unverified" and remove it once verified by hand.
+- Put Windows runtime tests in a `#[cfg(windows)]` module of the module's tests; Windows CI runs them.
+- Reason carefully about the rest, and say in the PR which behavior is only type-checked and unverified.
+- Add the item to TODO.md "Low / unverified" and remove it once verified.
+
+### Windows tests under Wine
+
+With `wine` and the `x86_64-pc-windows-gnu` target installed, the Windows test build runs locally:
+
+```sh
+export WINEDEBUG=-all WINEPREFIX=/tmp/claude-0/wineprefix   # any private prefix
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine cargo test --target x86_64-pc-windows-gnu
+```
+
+Wine is a fast signal only; Windows CI is authoritative. Known Wine-only failures (Wine 9.0):
+
+| Test | Why it fails only under Wine |
+|---|---|
+| `ledger::tests::counts_incrementally_and_dedups` | Wine reports the Unix ctime as the creation time, so the Windows `file_ident` (creation time) changes on every append and the file is re-read from the start. NTFS creation times don't change on append. |
+| `ipc::tests::windows::our_pipe_passes_the_owner_check` | Wine's token default owner is its primary group `S-1-5-21-0-0-0-513`, so pipes are owned by that group rather than the user or Administrators. |
+| `discord::tests::a_fake_discord_cannot_impersonate_us` | Wine hands a pipe server an impersonation-level token whatever impersonation level the client asked for (`SECURITY_IDENTIFICATION`). |
+
+Wine also ignores `FILE_FLAG_FIRST_PIPE_INSTANCE` (it only sets `ERROR_ALREADY_EXISTS`); `Listener::create` treats that as `AddrInUse`, so the single-instance tests are meaningful under Wine too. The `OW` negative control in `elevated_daemon_accepts_a_non_elevated_hook` is skipped unless the process is elevated and new objects are owned by `BUILTIN\Administrators`, so it is skipped under Wine; when `CI` or `GITHUB_ACTIONS` is set, the test fails instead of skipping, so CI can't silently skip it.
 
 Invariants to keep (details in AGENTS.md): hooks never parse JSON, never print, always exit 0 and stay fast; ledger write order (`seen.bin` synced before `ledger.json` is replaced); Discord limit of 4 `SET_ACTIVITY` per 20 s with at least 4 s between, all Discord I/O on its worker thread; only touch `settings.json` hook entries whose command contains `claude-presence` and ` hook `; every config key optional.
 
@@ -107,7 +127,7 @@ Keep any other trailers your harness requires.
 
 ## CI
 
-`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests, on `ubuntu-latest`, `macos-latest` and `windows-latest` (not fail-fast): `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo build --release`. It uses the stable toolchain with clippy and rustfmt, and `Swatinem/rust-cache` (cache saved only on `main`). The cross clippy targets are not in CI; run them locally. Each test module compiles on every platform; only tests that need a real Unix socket or POSIX permissions sit in an inner `#[cfg(unix)] mod unix` (or are gated per test, like `stops_a_running_daemon` in `src/install.rs`). Pure tests such as `pipe_sddl_grants_only_the_user`, `rejected_activity_is_not_kept_alive` and the presenter shutdown tests therefore also run on Windows CI, but the Windows pipe I/O itself has no automated runtime coverage. Put new pure tests in the outer module.
+`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests, on `ubuntu-latest`, `macos-latest` and `windows-latest` (not fail-fast): `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo build --release`. It uses the stable toolchain with clippy and rustfmt, and `Swatinem/rust-cache` (cache saved only on `main`). The cross clippy targets are not in CI; run them locally. Each test module compiles on every platform; only tests that need a real Unix socket or POSIX permissions sit in an inner `#[cfg(unix)] mod unix` (or are gated per test). Pure tests such as `pipe_sddl_grants_only_the_user`, `pipe_owner_must_be_the_user_admins_or_system`, `copy_retries_only_while_locked` and the presenter shutdown tests therefore also run on Windows CI. Put new pure tests in the outer module. The hook round trip, `__shutdown` round trip, bind retry and `stops_a_running_daemon` tests run against a Unix socket or a named pipe (`test_addr`). Windows CI (`windows-latest`, which runs elevated) additionally verifies in `#[cfg(windows)]` tests: the pipe's DACL read back (protected, one `ACCESS_ALLOWED` ACE for the user's SID); an elevated daemon accepting a non-elevated hook (a restricted token with Administrators deny-only at medium integrity, impersonated on a client thread), with an `OW` pipe rejecting the same client as a negative control; the hook-side pipe-owner check; that a pipe server only gets an identification-level token from the Discord client; a message written and closed before `serve` (`ERROR_NO_DATA`); and `Presenter::shutdown` cancelling a worker blocked in `ReadFile` (`CancelSynchronousIo`). Copying over a locked `.exe` during a real reinstall is not covered (only `copy_with_retry` and the rename fallback, with closures).
 
 ## Release build
 

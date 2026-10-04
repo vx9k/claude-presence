@@ -877,6 +877,35 @@ mod tests {
     }
 
     #[test]
+    fn failed_tool_keeps_the_session_working() {
+        let mut d = daemon();
+        let cwd = std::env::temp_dir().join("cp-proj-fail");
+        let cwd_s = cwd.to_string_lossy().replace('\\', "\\\\");
+        let ev = |name: &str, extra: &str| {
+            format!(
+                r#"{name}
+{{"session_id":"f1","cwd":"{cwd_s}","hook_event_name":"{name}"{extra}}}"#
+            )
+        };
+        d.handle_hook(ev("UserPromptSubmit", "").as_bytes());
+        d.handle_hook(ev("PreToolUse", r#","tool_name":"Bash","tool_input":{"command":"false"}"#).as_bytes());
+        d.handle_hook(ev("Notification", r#","message":"needs permission""#).as_bytes());
+        assert_eq!(d.sessions["f1"].status, Status::Notification);
+        // The documented payload: the tool's input plus the error.
+        let failure = r#","tool_name":"Bash","tool_input":{"command":"false"},"tool_use_id":"toolu_1","tool_error":{"error_type":"exit_code","error_message":"exit 1"}"#;
+        d.sessions.get_mut("f1").unwrap().last_activity -= 60_000;
+        d.handle_hook(ev("PostToolUseFailure", failure).as_bytes());
+        let s = &d.sessions["f1"];
+        // Like PostToolUse: Claude carries on with the result.
+        assert_eq!(s.status, Status::Working);
+        assert_eq!((s.prompts, s.tools, s.tool.as_deref()), (1, 1, Some("Bash")));
+        assert!(timeutil::now_ms() - s.last_activity < 60_000, "counts as activity");
+        let a = activity(&mut d);
+        assert_eq!(a["details"].as_str(), Some("Working in cp-proj-fail"));
+        d.presenter.shutdown();
+    }
+
+    #[test]
     fn sticky_session_choice() {
         let mut d = daemon();
         assert!(!d.got_hook);

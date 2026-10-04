@@ -33,11 +33,11 @@ On Linux and Windows, an `--init` kind for another OS (for example `launchd` on 
 
 ### Verification status
 
-From [TODO.md](../TODO.md); update both when this changes.
+From [TODO.md](../TODO.md); update both when this changes. You do not need to verify anything yourself: `claude-presence install` ends with `daemon is running` when it worked.
 
 | Service | Status |
 |---|---|
-| Windows Task Scheduler | `install`, `status`, hook pipe and Discord activity verified by hand on Windows. A full local Claude Code session on Windows is not yet verified. Bind retry and `__shutdown` reinstall on Windows are type-checked only. |
+| Windows Task Scheduler | `install`, `status`, hook pipe and Discord activity verified by hand on Windows. Windows CI verifies the pipe DACL, an elevated daemon accepting a non-elevated hook, the hook-side pipe owner check, `ERROR_NO_DATA` handling, the bind retry, the `__shutdown` round trip and cancelling a stuck Discord worker (see [development.md](development.md#ci)). A full local Claude Code session on Windows is not yet verified. |
 | Run key | not verified on a real system |
 | launchd | not verified on a real system (CI compiles and tests it; macOS clippy target type-checks) |
 | OpenRC | not verified on a real system |
@@ -119,7 +119,12 @@ Plist keys: `Label` = `io.github.vx9k.claude-presence`, `ProgramArguments` = the
 
 ### Windows
 
-1. Install copies `claude-presence.exe` and `claude-presenced.exe` from where you ran them to `%LOCALAPPDATA%\Programs\claude-presence` (unless already there) and points hooks and the task at that copy, so you can delete the download. Only add that folder to `PATH` yourself if you want to type `claude-presence` anywhere (a PATH step is listed as nice-to-have in TODO.md).
+1. Install copies `claude-presence.exe` and `claude-presenced.exe` from where you ran them to `%LOCALAPPDATA%\Programs\claude-presence` (unless already there) and points hooks and the task at that copy, so you can delete the download. Only add that folder to `PATH` yourself if you want to type `claude-presence` anywhere (a PATH step is listed as nice-to-have in TODO.md). Windows will not overwrite a running `.exe`, so before copying:
+   - A running daemon is stopped first. With the service step this is the `stopped the running daemon (reinstalling)` line. With `--no-service` the copy step stops it itself (`stopped the running daemon (to replace its binary)`), and after copying starts the new one detached (`restarted the daemon`; on failure `could not restart the daemon: <error>`), so `--no-service` never leaves you without a daemon.
+   - Leftover `claude-presence.exe.old` and `claude-presenced.exe.old` from an earlier install are deleted (silently; one that is still in use stays until the next install).
+   - If the copy fails because the file is still locked (access denied, sharing or lock violation), it is retried for up to 5 s (20 tries, 250 ms apart). If it is still locked, the old exe is renamed to `<name>.exe.old` (Windows allows renaming a running exe) and the new one copied in its place.
+   - If that copy also fails, the old exe is moved back, so hooks and the task never lose their binary. Install then prints `cannot copy binaries: <error>` and exits 1; fix the cause (for example stop the daemon with `taskkill /IM claude-presenced.exe /F`) and re-run.
+   - On success it prints `copied binaries to <folder>`.
 2. Task XML (UTF-16, written to `%TEMP%\claude-presence-task.xml`, deleted after): logon trigger for your account, `InteractiveToken`, `LeastPrivilege`, `MultipleInstancesPolicy` `IgnoreNew`, runs on battery, no execution time limit (`PT0S`), hidden, `RestartOnFailure` `PT1M` x 999, action = the daemon exe.
 3. `schtasks /End /TN claude-presence` (quiet), `schtasks /Create /TN claude-presence /XML <file> /F`. If Create fails, it prints `Task Scheduler registration failed; using the Run registry key instead` and uses the Run key. On success it removes any old Run value, then `schtasks /Run /TN claude-presence` (or starts the daemon detached if that fails).
 4. Run key: `reg add HKCU\...\Run /v claude-presence /t REG_SZ /d "<exe>" /f`, then the daemon is started detached.
@@ -174,17 +179,21 @@ Re-running `claude-presence install` is safe. For the service step it:
 
 1. Prints `Installing claude-presence <version>`.
 2. Calls the same cleanup as `uninstall` (`uninstall_service`): sends `__shutdown` to the running daemon at the current socket or pipe, and also at the legacy socket path if different and present. It then polls for up to 2 s (every 50 ms). Output: `stopped the running daemon (reinstalling)`. If it has not stopped: `warn: the running daemon has not stopped after 2 s (still busy, or a version without __shutdown)`. Then it stops and removes every service flavor it finds (see Uninstall).
-3. On Windows, copies the binaries (now replaceable because the old daemon exited).
+3. On Windows, copies the binaries (now replaceable because the old daemon exited; see [Windows](#windows) for retry, `.old` and rollback).
 4. Keeps an existing `config.toml` (`keeping existing config <path>`); otherwise writes the default.
-5. Rewrites the hooks (idempotent; first run saves `settings.json.bak` next to `settings.json` if it did not exist).
+5. Rewrites the hooks (idempotent: our old entries are removed and all 10 current events are written, so events added by a newer version appear without duplicates; first run saves `settings.json.bak` next to `settings.json` if it did not exist). Output: `wired 10 hook events into <path>`.
 6. Writes the service file and starts the new binary.
 7. Waits up to 5 s (20 x 250 ms) for the daemon: `daemon is running`, or ``daemon not reachable yet — check `"<exe>" status` in a moment`` (em dash and backticks as printed).
 
 A daemon that starts while the old one is still shutting down retries binding for up to 5 s (`bind_waiting`) before logging `another claude-presence daemon is already running` and exiting 0.
 
-`--no-service` skips steps 2, 6 and 7 (on Windows the binaries are still copied, which fails if the old daemon is still running).
+`--no-service` skips steps 2, 6 and 7. On Windows the binaries are still copied: the running daemon is stopped, the binaries replaced, and the daemon restarted detached (see [Windows](#windows)).
 
 Legacy socket path: older versions listened at `<tmp>/claude-presence-<uid>.sock` (or `<tmp>/claude-presence.sock` when `<tmp>` is not `/tmp`) when no per-user runtime directory exists. Only in that case is the legacy path also asked to stop.
+
+### Upgrading the binary without `install` (Linux, macOS)
+
+If you replace the binaries (`cargo install ...`) but do not re-run `install`, a daemon from before the private socket directory may still be running at the legacy path. A hook first tries today's endpoint; if nothing listens there (not found or connection refused), it falls back to the legacy socket, but only if that path is a socket owned by you and its parent directory is safe (the same parent check as the fallback directory). Hooks therefore keep working until the next `install` or logon replaces the old daemon. Windows has no legacy endpoint. Re-run `claude-presence install` after an upgrade anyway to get new hook events and the new daemon.
 
 ## Uninstall
 

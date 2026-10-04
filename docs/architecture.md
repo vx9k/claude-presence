@@ -107,4 +107,4 @@ The base frame comes first, then `rotation` frames whose variables are all non-e
 
 ## Shutdown
 
-`SIGINT`, `SIGTERM`, `__shutdown` (sent by `install`/`uninstall`) or Windows console close: log `shutting down`, save the ledger, clear the card (the worker is given 1 s), exit 0.
+`SIGINT`, `SIGTERM`, `__shutdown` (sent by `install`/`uninstall`) or Windows console close: log `shutting down`, save the ledger, clear the card (the worker is given 1 s; on Windows a worker still stuck in Discord pipe I/O then has it cancelled with `CancelSynchronousIo`, for up to about 500 ms more), exit 0.
