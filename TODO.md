@@ -53,11 +53,6 @@ numbers are approximate.
    Fix: a shutdown request over the hook IPC (e.g. event name `__shutdown`
    → `Msg::Shutdown`), sent by `uninstall_service`, then wait ≤ 2 s for
    `daemon_running` to turn false. Touches the wire format → advisor first.
-10. **Config clamp ranges in README** (`README.md`). `idle_timeout`
-    (0, or 60..604800) and `rotation_interval` (5..86400) are now clamped at
-    load (`Config::sanitized`) and documented in `DEFAULT_TOML`; the README
-    still needs the ranges (docs-writer).
-
 ## Nice to have
 
 - Optionally add the Windows install dir to the user `PATH` on install.

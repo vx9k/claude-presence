@@ -270,7 +270,7 @@ Every key is optional; the generated file documents them all. Highlights:
 
 ```toml
 client_id = "..."            # your own Discord application (its name = "Playing <name>")
-idle_timeout = 900           # clear an idle card after 15 min without activity (0 = never)
+idle_timeout = 900           # clear an idle card after 15 min without activity (0 = never, else 60..604800 s)
 github_button = false        # "View on GitHub" button (off: would leak private repos)
 hidden_projects = ["secret-client", "~/work/nda"]
 
@@ -279,7 +279,8 @@ details = "Working in {project}"
 state = "{tool} · {file} · {tokens} tokens"
 ```
 
-Other keys: `activity_type`, `status_display`, `show_elapsed`, `rotation_interval`,
+Other keys: `activity_type`, `status_display`, `show_elapsed`, `rotation_interval`
+(seconds between rotation frames, default 15),
 `hidden_project_name`, `scan_history`, `rescan_interval`, `buttons`, `[assets]`, and
 `[status.thinking|compacting|notification|idle]` (each with `details`, `state`,
 optional `rotation`).
@@ -293,7 +294,8 @@ Variables: `{project} {branch} {model} {tool} {file} {tokens} {tokens_in} {token
 **Applying changes:** on Linux/macOS send `SIGHUP` to the daemon (commands per service
 manager above) or restart the service. On Windows, restart it (`schtasks /End` then
 `/Run`). A config file with a syntax error is reported in the log and the defaults are
-used.
+used. Out-of-range values are clamped on load: `idle_timeout` to 60..604800 seconds
+(0 still means never) and `rotation_interval` to 5..86400 seconds.
 
 > **Defaults borrowed from claude-rpc:** the default `client_id` is claude-rpc's public
 > Discord application and the default images are its hosted gifs. Create your own
@@ -325,6 +327,9 @@ used.
    On Windows (PowerShell): `$env:CLAUDE_PRESENCE_LOG="debug"; claude-presence daemon`.
    You should see `connected to Discord` once a Claude Code session is active
    (`Discord refused the handshake … (check client_id)` means a bad `client_id`).
+   The first hook the daemon receives is logged once per run as
+   `first hook received (<event>)` (visible at the default `info` level). If you never see
+   it after using Claude Code, the hooks are not reaching the daemon: recheck steps 3 and 4.
    Press Ctrl+C to quit, then start the service again.
 6. **Log files.** Windows: `%LOCALAPPDATA%\claude-presence\daemon.log`.
    macOS: `~/Library/Logs/claude-presence.log`. systemd: `journalctl --user -u claude-presence`.
