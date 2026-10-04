@@ -1,0 +1,32 @@
+[package]
+name = "claude-presence"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Discord Rich Presence for Claude Code, driven by Claude Code hooks. Lean, native, no Node.js."
+repository = "https://github.com/vx9k/claude-presence"
+readme = "README.md"
+keywords = ["discord", "rich-presence", "claude", "claude-code", "rpc"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+sonic-rs = "0.5"
+memchr = "2"
+# Only used by `install` to edit settings.json without reordering the user's keys.
+serde_json = { version = "1", features = ["preserve_order"] }
+serde = { version = "1", features = ["derive"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_IO", "Win32_System_Console", "Win32_System_Time", "Win32_Security"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
