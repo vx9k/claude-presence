@@ -208,6 +208,12 @@ fn run(cmd: &str, args: &[&str]) -> bool {
     }
 }
 
+/// Like [`run`], but silent: for probes and cleanups where "not found" is expected.
+#[cfg(windows)]
+fn run_quiet(cmd: &str, args: &[&str]) -> bool {
+    Command::new(cmd).args(args).output().is_ok_and(|o| o.status.success())
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 fn in_path(bin: &str) -> bool {
     std::env::var_os("PATH").map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file())).unwrap_or(false)
@@ -544,14 +550,14 @@ pub fn install_service(init: Init, daemon: &Path) -> io::Result<String> {
             }
             let tmp = std::env::temp_dir().join("claude-presence-task.xml");
             fs::write(&tmp, bytes)?;
-            run("schtasks", &["/End", "/TN", SERVICE]);
+            run_quiet("schtasks", &["/End", "/TN", SERVICE]);
             let ok = run("schtasks", &["/Create", "/TN", SERVICE, "/XML", &tmp.to_string_lossy(), "/F"]);
             let _ = fs::remove_file(&tmp);
             if !ok {
                 eprintln!("  Task Scheduler registration failed; using the Run registry key instead");
                 return install_service(Init::RunKey, daemon);
             }
-            run("reg", &["delete", RUN_KEY, "/v", SERVICE, "/f"]);
+            run_quiet("reg", &["delete", RUN_KEY, "/v", SERVICE, "/f"]);
             if !run("schtasks", &["/Run", "/TN", SERVICE]) {
                 spawn_detached(daemon)?;
             }
@@ -622,12 +628,12 @@ pub fn uninstall_service() -> Vec<String> {
     }
     #[cfg(windows)]
     {
-        if run("schtasks", &["/Query", "/TN", SERVICE]) {
-            run("schtasks", &["/End", "/TN", SERVICE]);
+        if run_quiet("schtasks", &["/Query", "/TN", SERVICE]) {
+            run_quiet("schtasks", &["/End", "/TN", SERVICE]);
             run("schtasks", &["/Delete", "/TN", SERVICE, "/F"]);
             done.push(format!("removed scheduled task \"{SERVICE}\""));
         }
-        if run("reg", &["delete", RUN_KEY, "/v", SERVICE, "/f"]) {
+        if run_quiet("reg", &["delete", RUN_KEY, "/v", SERVICE, "/f"]) {
             done.push("removed Run registry key".into());
         }
     }

@@ -188,14 +188,21 @@ fn install_cmd(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(600));
-        if ipc::daemon_running(&paths::hook_socket()) {
+        // Service managers (Task Scheduler especially) can take a few seconds.
+        let sock = paths::hook_socket();
+        let up = (0..20).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            ipc::daemon_running(&sock)
+        });
+        if up {
             println!("  daemon is running");
         } else {
-            println!("  daemon not reachable yet — check `claude-presence status` in a moment");
+            println!("  daemon not reachable yet — check `\"{}\" status` in a moment", exe.display());
         }
     }
     println!("Done. Open Claude Code with the Discord desktop app running.");
+    #[cfg(windows)]
+    println!("Tip: run `\"{}\" status` to check on it.", exe.display());
     ExitCode::SUCCESS
 }
 
