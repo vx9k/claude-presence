@@ -323,21 +323,47 @@ impl Delta {
     }
 }
 
-/// Stable identity of a file, to notice a transcript replaced in place.
-fn file_ident(meta: &fs::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        meta.ino() ^ meta.dev().rotate_left(32)
+/// Stable identity of an open file, to notice a transcript replaced in place.
+/// `meta` is the file's metadata, already fetched by the caller.
+#[cfg(unix)]
+fn file_ident(_file: &File, meta: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ino() ^ meta.dev().rotate_left(32)
+}
+
+/// Stable identity of an open file: volume serial + 128-bit file id (not the
+/// creation time, which NTFS tunneling carries over to a file recreated under
+/// the same name). 0 if the file system can't tell.
+#[cfg(windows)]
+fn file_ident(file: &File, _meta: &fs::Metadata) -> u64 {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx};
+    // SAFETY: FILE_ID_INFO is plain data; all-zero is a valid value.
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open for the lifetime of `file`, and the buffer is
+    // a FILE_ID_INFO of exactly the size passed, as FileIdInfo requires.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return 0;
     }
-    #[cfg(not(unix))]
-    {
-        meta.created()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
-    }
+    fold_ident(info.VolumeSerialNumber, info.FileId.Identifier)
+}
+
+/// Fold a volume serial and a 128-bit file id into a never-zero u64 (0 is
+/// what a failed lookup stores).
+#[cfg(any(windows, test))]
+fn fold_ident(vol: u64, id: [u8; 16]) -> u64 {
+    let mut b = [0u8; 24];
+    b[..8].copy_from_slice(&vol.to_le_bytes());
+    b[8..].copy_from_slice(&id);
+    id_hash(&b).max(1)
 }
 
 struct Ctx<'a> {
@@ -487,7 +513,7 @@ fn ingest_file(
 ) -> io::Result<bool> {
     let mut file = File::open(path)?;
     let meta = file.metadata()?;
-    let ident = file_ident(&meta);
+    let ident = file_ident(&file, &meta);
     if st.ident != ident || meta.len() < st.offset {
         *st = FileState { ident, ..FileState::default() };
     }
@@ -1085,15 +1111,12 @@ mod tests {
         fs::write(&f, format!("{}\n", asst("m", "2026-10-04T10:00:00Z", 1, 1))).unwrap();
         l.ingest(&key);
         assert_eq!(l.totals.turns, 2);
-        // Replaced by a different file (new inode) of the same length.
-        #[cfg(unix)]
-        {
-            let tmp = dir.join("t.tmp");
-            fs::write(&tmp, format!("{}\n", asst("n", "2026-10-04T10:00:00Z", 1, 1))).unwrap();
-            fs::rename(&tmp, &f).unwrap();
-            l.ingest(&key);
-            assert_eq!(l.totals.turns, 3);
-        }
+        // Replaced by a different file (new inode / file id) of the same length.
+        let tmp = dir.join("t.tmp");
+        fs::write(&tmp, format!("{}\n", asst("n", "2026-10-04T10:00:00Z", 1, 1))).unwrap();
+        fs::rename(&tmp, &f).unwrap();
+        l.ingest(&key);
+        assert_eq!(l.totals.turns, 3);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1227,5 +1250,72 @@ mod tests {
         assert_eq!(l.snapshot(now, 0).streak, 2);
         l.days.entry(today).or_default().prompts = 1;
         assert_eq!(l.snapshot(now, 0).streak, 3);
+    }
+
+    #[test]
+    fn fold_ident_is_deterministic_and_never_zero() {
+        let id = |b: u8| {
+            let mut a = [0u8; 16];
+            a[0] = b;
+            a
+        };
+        assert_eq!(fold_ident(7, id(1)), fold_ident(7, id(1)));
+        assert_ne!(fold_ident(7, id(1)), fold_ident(7, id(2)), "file id matters");
+        assert_ne!(fold_ident(7, id(1)), fold_ident(8, id(1)), "volume matters");
+        let mut hi = [0u8; 16];
+        hi[15] = 1;
+        assert_ne!(fold_ident(7, id(0)), fold_ident(7, hi), "every id byte matters");
+        assert_ne!(fold_ident(0, [0; 16]), 0);
+        // 0 is what a failed lookup stores; no real identity maps to it.
+        for v in 0..10_000u64 {
+            assert_ne!(fold_ident(v, id((v % 251) as u8)), 0);
+        }
+    }
+
+    #[test]
+    fn ident_change_rereads_without_double_counting() {
+        // An upgrade that changes how identities are computed makes every
+        // stored ident mismatch once: the file is re-read from offset 0 and
+        // the global id dedup keeps the totals unchanged.
+        let lines = [
+            user("p1", "2026-10-04T10:00:00Z", "hello"),
+            asst("m1", "2026-10-04T10:00:05Z", 100, 1),
+            asst("m1", "2026-10-04T10:00:06Z", 100, 50),
+            asst("m2", "2026-10-04T10:02:00Z", 200, 20),
+        ];
+        let content = lines.join("\n") + "\n";
+        let (dir, _, key, mut l) = one_file("ident-change", content.as_bytes());
+        l.ingest(&key);
+        let before = l.totals.clone();
+        let days_before = l.days.clone();
+        assert_eq!((before.prompts, before.turns, before.usage.total()), (1, 2, 400));
+        l.files.get_mut(&key).unwrap().ident ^= 0x5a5a;
+        assert!(l.ingest(&key), "a mismatched ident re-reads the file");
+        assert_eq!(l.file(&key).unwrap().offset, content.len() as u64);
+        assert_eq!(l.totals, before);
+        assert_eq!(l.days, days_before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_ident_survives_append_not_recreate() {
+        let dir = tmpdir("ident-win");
+        let f = dir.join("t.jsonl");
+        let ident = |p: &Path| {
+            let f = File::open(p).unwrap();
+            file_ident(&f, &f.metadata().unwrap())
+        };
+        fs::write(&f, b"a\n").unwrap();
+        let first = ident(&f);
+        assert_ne!(first, 0);
+        append_bytes(&f, b"b\n");
+        assert_eq!(ident(&f), first, "an append keeps the identity");
+        // Recreated under the same name right away: NTFS tunneling carries the
+        // creation time over, the file id does not.
+        fs::remove_file(&f).unwrap();
+        fs::write(&f, b"a\n").unwrap();
+        assert_ne!(ident(&f), first, "a recreated file is a new identity");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

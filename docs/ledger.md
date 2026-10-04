@@ -48,7 +48,7 @@ In the data dir (`claude-presence status` prints `stats:` path):
 | Field | Meaning |
 |---|---|
 | `offset` | Bytes already consumed; always the end of a complete line |
-| `ident` | File identity: inode xor rotated device on Unix, creation time in ns elsewhere |
+| `ident` | File identity: inode xor rotated device on Unix; on Windows a never-zero hash of the volume serial number and the 128-bit file id (`FileIdInfo`), not the creation time, which NTFS tunneling carries over to a file recreated under the same name. 0 if it can't be read |
 | `last_ts` | Latest valid timestamp seen (ms), for active-time gaps |
 | `usage`, `prompts`, `turns` | Totals attributed to this file |
 | `model` | Latest assistant model id (ignores ids starting with `<`) |
@@ -61,7 +61,7 @@ Derived values (`Ledger::snapshot`): `total_time` is active minutes summed over 
 Source: `<claude home>/projects/**/*.jsonl` (`$CLAUDE_CONFIG_DIR` or `~/.claude`).
 
 - Incremental: each file is opened, seeked to `offset`, and read in 1 MiB chunks. Only complete lines (up to the last `\n`) are consumed; a partial trailing line waits for the writer. A file with no newline is never consumed.
-- Replaced files: if `ident` changed or the file is shorter than `offset`, that file's state resets and it is read again from 0 (global dedup keeps totals correct).
+- Replaced files: if `ident` changed or the file is shorter than `offset`, that file's state resets and it is read again from 0 (global dedup keeps totals correct). The same happens once per file when an upgrade changes how `ident` is computed (Windows moved from creation time to file id without a `VERSION` bump): totals are unchanged, but that file's own `usage`/`prompts`/`turns` restart from what is still new to the global set.
 - Malformed lines (invalid JSON, wrong types, negative numbers) are skipped.
 - Live sessions: `ingest(key)` on each hook and every 5 s while the displayed session is active. Background `scan` of everything at startup (if `scan_history`) and every `rescan_interval` seconds; scan uses up to 8 threads when there are 32 or more files.
 - `scan` forgets files that no longer exist (`pruned`); their totals stay.
