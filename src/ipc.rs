@@ -218,7 +218,11 @@ impl Listener {
             if UnixStream::connect(addr).is_ok() {
                 return Err(io::Error::new(io::ErrorKind::AddrInUse, "daemon already running"));
             }
-            std::fs::remove_file(addr)?;
+            // Another starting daemon may have removed it first.
+            match std::fs::remove_file(addr) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
         }
         if let Some(dir) = addr.parent() {
             std::fs::create_dir_all(dir)?;
@@ -528,6 +532,8 @@ mod tests {
         let base = std::env::temp_dir().join(format!("cp-priv-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
+        // Another test's bind may have the process umask at 0o177 right now.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         // Fresh: created owner-only; an existing good dir is accepted again.
         let fresh = base.join("fresh");
@@ -587,6 +593,8 @@ mod tests {
         let base = std::env::temp_dir().join(format!("cp-ww-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
+        // Another test's bind may have the process umask at 0o177 right now.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
         let ww = base.join("ww");
         std::fs::create_dir(&ww).unwrap();
         let good = ww.join("good");
@@ -635,6 +643,8 @@ mod tests {
         let base = std::env::temp_dir().join(format!("cp-cli-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
+        // Another test's bind may have the process umask at 0o177 right now.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
         let serve = |sock: &Path| {
             let l = Listener::bind_with(sock, false).unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
