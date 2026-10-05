@@ -22,6 +22,8 @@ COMMANDS:
                      Remove hooks, service and (Windows) the PATH entry
                      (--purge also deletes config and lifetime stats)
     status           Show daemon state and lifetime stats
+    tui              Live dashboard: daemon, Discord card, sessions,
+                     stats and config (q quits)
     daemon           Run the daemon in the foreground
     hook <Event>     Forward a Claude Code hook event (used by Claude Code)
     config           Print the config file path
@@ -39,6 +41,7 @@ fn main() -> ExitCode {
         "install" => install_cmd(rest),
         "uninstall" => uninstall_cmd(rest),
         "status" => status(),
+        "tui" => tui(),
         "config" => {
             println!("{}", paths::config_file().display());
             ExitCode::SUCCESS
@@ -336,6 +339,28 @@ fn status() -> ExitCode {
     // A reader that quit early (`status | head -1`) is not an error.
     let _ = write_status(&mut std::io::stdout().lock(), running, &sock, &db, &stats);
     if running { ExitCode::SUCCESS } else { ExitCode::from(3) }
+}
+
+#[cfg(feature = "tui")]
+fn tui() -> ExitCode {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        eprintln!("tui needs a terminal; use `claude-presence status` for plain output");
+        return ExitCode::from(2);
+    }
+    match claude_presence::tui::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("tui: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(feature = "tui"))]
+fn tui() -> ExitCode {
+    eprintln!("this build has no tui (built without the `tui` feature)");
+    ExitCode::from(2)
 }
 
 /// The `status` report. `writeln!` instead of `println!`, which panics when

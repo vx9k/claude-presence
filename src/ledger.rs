@@ -451,10 +451,11 @@ fn process_line(line: &[u8], st: &mut FileState, cx: &mut Ctx<'_>) {
     };
     match rec.kind.as_deref() {
         Some("assistant") => {
-            if let Some(m) = msg.model.as_deref() {
-                if !m.starts_with('<') && st.model.as_deref() != Some(m) {
-                    st.model = Some(m.to_owned());
-                }
+            if let Some(m) = msg.model.as_deref()
+                && !m.starts_with('<')
+                && st.model.as_deref() != Some(m)
+            {
+                st.model = Some(m.to_owned());
             }
             let Some(raw) = msg.usage.as_ref() else {
                 return;
@@ -569,12 +570,12 @@ fn settle(st: &mut FileState, cx: &mut Ctx<'_>, resolve: &mut dyn FnMut(&mut [Pe
                 total_turn(cx.delta, &p.usage, p.day);
             }
         }
-        if !p.prompt {
-            if let Some(e) = st.ring.iter_mut().find(|e| e.id == p.id) {
-                // A healed id (fresh in an already counted region) may be a
-                // copy counted elsewhere: its later growth stays out of the totals.
-                e.seen = if p.fresh && !p.counted { Seen::Counted } else { Seen::Dup };
-            }
+        if !p.prompt
+            && let Some(e) = st.ring.iter_mut().find(|e| e.id == p.id)
+        {
+            // A healed id (fresh in an already counted region) may be a
+            // copy counted elsewhere: its later growth stays out of the totals.
+            e.seen = if p.fresh && !p.counted { Seen::Counted } else { Seen::Dup };
         }
     }
     cx.pending.clear();
@@ -674,10 +675,11 @@ fn walk(root: &Path, out: &mut Vec<String>) {
         let p = e.path();
         if ft.is_dir() {
             walk(&p, out);
-        } else if ft.is_file() && p.extension().is_some_and(|x| x == "jsonl") {
-            if let Some(s) = p.to_str() {
-                out.push(s.to_owned());
-            }
+        } else if ft.is_file()
+            && p.extension().is_some_and(|x| x == "jsonl")
+            && let Some(s) = p.to_str()
+        {
+            out.push(s.to_owned());
         }
     }
 }
@@ -743,6 +745,38 @@ pub struct Snapshot {
     pub streak: u32,
 }
 
+/// How many days, today included, [`Stats::days`] covers.
+pub const STATS_DAYS: i32 = 60;
+
+/// Lifetime totals and recent days, as the daemon's `__state` reply and
+/// [`read_only_stats`] give them to `claude-presence tui`. Every field
+/// defaults, so readers of other versions still parse it.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct Stats {
+    /// Local day number (days since the Unix epoch) the stats were taken on.
+    pub today: i32,
+    pub usage: Usage,
+    pub prompts: u64,
+    pub turns: u64,
+    pub sessions: u64,
+    /// Lifetime active time.
+    pub active_ms: i64,
+    pub streak: u32,
+    /// Days with activity in the last [`STATS_DAYS`], oldest first.
+    pub days: Vec<DayStats>,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct DayStats {
+    pub day: i32,
+    pub active_minutes: u32,
+    pub tokens: u64,
+    pub prompts: u32,
+    pub turns: u32,
+}
+
 #[derive(Default, Debug)]
 pub struct ScanReport {
     pub files: usize,
@@ -765,13 +799,13 @@ impl Ledger {
     fn load_with(db_path: PathBuf, repeat: bool) -> Ledger {
         let mut l = Ledger { db_path, ..Ledger::default() };
         let mut res = l.read_db();
-        if let Err(DbError::Sql(e)) = &res {
-            if is_corrupt(e) {
-                crate::warn!("{}: {e}; moved aside, rebuilding stats", l.db_path.display());
-                l.reset();
-                move_aside(&l.db_path);
-                res = l.read_db();
-            }
+        if let Err(DbError::Sql(e)) = &res
+            && is_corrupt(e)
+        {
+            crate::warn!("{}: {e}; moved aside, rebuilding stats", l.db_path.display());
+            l.reset();
+            move_aside(&l.db_path);
+            res = l.read_db();
         }
         match res {
             Ok(()) => {}
@@ -901,7 +935,7 @@ impl Ledger {
         if let Some(b) = ids {
             // A torn append's partial id is dropped.
             self.seen.reserve(b.len() / 8);
-            self.seen.extend(b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())));
+            self.seen.extend(b.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)));
         }
         crate::info!("imported {}", path.display());
         Ok(true)
@@ -1176,8 +1210,8 @@ impl Ledger {
             tx.prepare("INSERT OR REPLACE INTO day(day, minutes, tokens, prompts, turns) VALUES (?1, ?2, ?3, ?4, ?5)")?;
         let mut day = |k: i32, d: &Day| {
             let mut minutes = [0u8; DAY_WORDS * 8];
-            for (c, w) in minutes.chunks_exact_mut(8).zip(d.minutes.iter()) {
-                c.copy_from_slice(&w.to_le_bytes());
+            for (c, w) in minutes.as_chunks_mut::<8>().0.iter_mut().zip(d.minutes.iter()) {
+                *c = w.to_le_bytes();
             }
             q.execute(params![k, &minutes[..], d.tokens as i64, d.prompts, d.turns])
         };
@@ -1281,39 +1315,82 @@ impl Ledger {
         }
         s
     }
+
+    /// Totals plus the last [`STATS_DAYS`] days, for `claude-presence tui`.
+    pub fn stats(&self, now_ms: i64, off: i64) -> Stats {
+        let snap = self.snapshot(now_ms, off);
+        let today = timeutil::day_number(now_ms, off);
+        let days = self
+            .days
+            .range(today - (STATS_DAYS - 1)..)
+            .map(|(&day, d)| DayStats {
+                day,
+                active_minutes: d.active_minutes(),
+                tokens: d.tokens,
+                prompts: d.prompts,
+                turns: d.turns,
+            })
+            .collect();
+        Stats {
+            today,
+            usage: self.totals.usage,
+            prompts: self.totals.prompts,
+            turns: self.totals.turns,
+            sessions: self.totals.sessions,
+            active_ms: snap.total_ms,
+            streak: snap.streak,
+            days,
+        }
+    }
 }
 
 /// Totals and days only (for `status`), read without creating, migrating or
 /// locking out anything. A database not created yet shows the legacy
 /// ledger's stats, if any. Errors if the database is busy or unreadable.
 pub fn load_stats(db_path: &Path) -> io::Result<Ledger> {
-    let mut l = Ledger::default();
-    let mut read = || -> Result<(), DbError> {
+    Ok(read_stored(db_path, BUSY_TIMEOUT)?.unwrap_or_default())
+}
+
+/// [`Ledger::stats`] of the stored ledger, for `claude-presence tui` while
+/// the daemon is down: like [`load_stats`] (read-only, one read transaction,
+/// never the seen ids, never a write, rename or migration), but waits at most
+/// [`READ_ONLY_BUSY_TIMEOUT`] for a busy database. `None` if nothing is
+/// stored yet.
+pub fn read_only_stats(db_path: &Path, now_ms: i64, off: i64) -> io::Result<Option<Stats>> {
+    Ok(read_stored(db_path, READ_ONLY_BUSY_TIMEOUT)?.map(|l| l.stats(now_ms, off)))
+}
+
+/// The stored totals and days, `None` if neither the database nor a legacy
+/// ledger holds any.
+fn read_stored(db_path: &Path, busy: Duration) -> io::Result<Option<Ledger>> {
+    let read = || -> Result<Option<Ledger>, DbError> {
         // Not migrated yet (no database, or an empty one left by an import
         // that was rolled back): the legacy ledger's stats, if any.
-        let legacy = |l: &mut Ledger| {
-            if let Ok(Some(s)) = read_legacy(&db_path.with_file_name(LEGACY_LEDGER)) {
-                l.totals = s.totals;
-                l.days = s.days.into_iter().collect();
-            }
+        let legacy = || {
+            read_legacy(&db_path.with_file_name(LEGACY_LEDGER)).ok().flatten().map(|s| Ledger {
+                totals: s.totals,
+                days: s.days.into_iter().collect(),
+                ..Ledger::default()
+            })
         };
         if !exists(db_path)? {
-            legacy(&mut l);
-            return Ok(());
+            return Ok(legacy());
         }
         let mut conn = open(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(busy)?;
         let tx = conn.transaction()?;
         match user_version(&tx)? {
-            0 => {
-                legacy(&mut l);
-                Ok(())
+            0 => Ok(legacy()),
+            DB_VERSION => {
+                let mut l = Ledger::default();
+                read_stats(&tx, &mut l)?;
+                Ok(Some(l))
             }
-            DB_VERSION => Ok(read_stats(&tx, &mut l)?),
             v => Err(DbError::Newer(v)),
         }
     };
     match read() {
-        Ok(()) => Ok(l),
+        Ok(l) => Ok(l),
         Err(DbError::Sql(e)) => Err(io::Error::other(e)),
         Err(DbError::Io(_, e)) => Err(e),
         Err(e) => Err(io::Error::other(e.describe(db_path))),
@@ -1329,6 +1406,8 @@ const LEGACY_VERSION: u32 = 1;
 const LEGACY_LEDGER: &str = "ledger.json";
 const LEGACY_SEEN: &str = "seen.bin";
 const BUSY_TIMEOUT: Duration = Duration::from_millis(if cfg!(test) { 100 } else { 2000 });
+/// A reader that refreshes on its own schedule waits less for a save.
+pub const READ_ONLY_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// u64 counters and ids are stored bit-cast to SQLite's i64.
 const SCHEMA_SQL: &str = "
@@ -1451,8 +1530,8 @@ fn read_stats(c: &Connection, l: &mut Ledger) -> rusqlite::Result<()> {
     while let Some(r) = rows.next()? {
         let mut d = Day { tokens: r.get::<_, i64>(2)? as u64, prompts: r.get(3)?, turns: r.get(4)?, ..Day::default() };
         let blob = r.get_ref(1)?.as_blob()?;
-        for (w, c) in d.minutes.iter_mut().zip(blob.chunks_exact(8)) {
-            *w = u64::from_le_bytes(c.try_into().unwrap());
+        for (w, c) in d.minutes.iter_mut().zip(blob.as_chunks::<8>().0) {
+            *w = u64::from_le_bytes(*c);
         }
         l.days.insert(r.get(0)?, d);
     }
@@ -1547,6 +1626,88 @@ mod tests {
         format!(
             r#"{{"type":"user","timestamp":"{ts}","uuid":"{uuid}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"x","content":"ok"}}]}}}}"#
         )
+    }
+
+    #[test]
+    fn stats_cover_totals_and_recent_days() {
+        let totals = Totals {
+            usage: Usage { input: 1, output: 2, cache_read: 3, cache_write: 4 },
+            prompts: 5,
+            turns: 6,
+            sessions: 7,
+        };
+        let mut l = Ledger { totals, ..Ledger::default() };
+        let now = 20_000 * 86_400_000 + 12 * 3_600_000;
+        let today = timeutil::day_number(now, 0);
+        let day = |minutes: u16, tokens: u64| {
+            let mut d = Day { tokens, prompts: 1, turns: 2, ..Day::default() };
+            d.mark(0, minutes - 1);
+            d
+        };
+        // Today, yesterday, the oldest day still in the window and one past it.
+        for (n, d) in [(today, day(3, 30)), (today - 1, day(2, 20)), (today - 59, day(1, 10)), (today - 60, day(1, 1))]
+        {
+            l.days.insert(n, d);
+        }
+        let s = l.stats(now, 0);
+        assert_eq!(s.today, today);
+        assert_eq!(s.usage, l.totals.usage);
+        assert_eq!((s.prompts, s.turns, s.sessions), (5, 6, 7));
+        assert_eq!(s.active_ms, 7 * MINUTE_MS, "every day counts toward the lifetime");
+        assert_eq!(s.streak, 2);
+        let days: Vec<_> = s.days.iter().map(|d| (d.day, d.active_minutes, d.tokens, d.prompts, d.turns)).collect();
+        assert_eq!(days, [(today - 59, 1, 10, 1, 2), (today - 1, 2, 20, 1, 2), (today, 3, 30, 1, 2)]);
+        // A JSON round trip keeps it whole (the TUI reads it from `__state`).
+        let back: Stats = sonic_rs::from_str(&sonic_rs::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn read_only_stats_never_create_or_write() {
+        let dir = tmpdir("ro-stats");
+        let off = 0;
+        let now = timeutil::now_ms();
+        // Nothing stored: nothing is created either.
+        assert_eq!(read_only_stats(&db(&dir), now, off).unwrap(), None);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "no database or journal appeared");
+
+        let f = dir.join("t.jsonl");
+        fs::write(
+            &f,
+            format!("{}\n{}\n", user("p1", "2026-10-04T10:00:00Z", "hi"), asst("m1", "2026-10-04T10:00:05Z", 7, 3)),
+        )
+        .unwrap();
+        let mut l = Ledger::load(db(&dir));
+        l.ingest(&key_for(&f).unwrap());
+        l.save().unwrap();
+        // The seen-ids table is never read: the stats load without it.
+        raw(&dir).execute_batch("DROP TABLE seen").unwrap();
+        let before = fs::read(db(&dir)).unwrap();
+        let entries = fs::read_dir(&dir).unwrap().count();
+
+        let s = read_only_stats(&db(&dir), now, off).unwrap().expect("stored stats");
+        assert_eq!(s, l.stats(now, off));
+        assert_eq!((s.prompts, s.turns, s.usage.input), (1, 1, 7));
+        assert_eq!(fs::read(db(&dir)).unwrap(), before, "not written");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), entries, "no journal or other file left behind");
+
+        // Busy: an error, soon, rather than zeros or a wait.
+        let lock = raw(&dir);
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let t = std::time::Instant::now();
+        assert!(read_only_stats(&db(&dir), now, off).is_err());
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+
+        // A newer release's database is not read as ours, and not renamed.
+        raw(&dir).pragma_update(None, "user_version", DB_VERSION + 1).unwrap();
+        assert!(read_only_stats(&db(&dir), now, off).is_err());
+        // Neither is a corrupt one moved aside.
+        fs::write(db(&dir), b"not a database at all, just text").unwrap();
+        assert!(read_only_stats(&db(&dir), now, off).is_err());
+        assert!(db(&dir).exists() && !with_suffix(&db(&dir), ".corrupt").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -13,3 +13,9 @@ LIBSQLITE3_FLAGS = """\
 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_SHARED_CACHE \
 -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_DQS=0\
 """
+
+# Link the C runtime statically on MSVC so release binaries don't need the
+# Visual C++ Redistributable (VCRUNTIME140.dll). The `cc` crate sees the
+# feature and builds bundled SQLite with /MT to match.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -57,14 +57,6 @@ Line numbers are approximate.
     (`src/ledger.rs`): when `FileIdInfo` fails, the identity comes from
     `GetFileInformationByHandle` (`fold_index`, unit-tested). Not run on a
     file system without `FileIdInfo` (FAT, some network shares).
-17. **`{prompts}` in-flight +1 is approximate** (`src/daemon.rs` `render`).
-    The +1 applies while Thinking/Working whenever the hook count is ahead
-    of the transcript: after a custom slash command in a fresh session it
-    stays +1 for every later turn; in a resumed session (hook count below
-    the transcript's) it never applies; it drops during Notification and
-    Compacting. Fix: record the transcript's count at `UserPromptSubmit`
-    (`prompts_at_submit`) and add 1 only while the transcript hasn't passed
-    it, until `Stop`. Then tighten the wording in docs/configuration.md.
 21. **Drop the legacy ledger import** (`src/ledger.rs` `import_legacy`,
     `read_legacy`, `Stored`, `LEGACY_*`, and `load_stats`' legacy
     fallback): a couple of releases after `ledger.db` shipped, stop reading

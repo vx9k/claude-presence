@@ -209,14 +209,14 @@ impl Default for Config {
     }
 }
 
-/// `v` clamped to `min..=max`, warning when it had to be changed.
-fn clamped(key: &str, v: u64, min: u64, max: u64) -> u64 {
-    let c = v.clamp(min, max);
-    if c != v {
-        let bound = if v < min { "below the minimum" } else { "above the maximum" };
-        crate::warn!("{key} = {v} is {bound}; using {c}");
+/// `*v` clamped to `min..=max`, noting in `notes` when it had to be changed.
+fn clamp(notes: &mut Vec<String>, key: &str, v: &mut u64, min: u64, max: u64) {
+    let c = (*v).clamp(min, max);
+    if c != *v {
+        let bound = if *v < min { "below the minimum" } else { "above the maximum" };
+        notes.push(format!("{key} = {v} is {bound}; using {c}"));
+        *v = c;
     }
-    c
 }
 
 impl Config {
@@ -242,12 +242,30 @@ impl Config {
     /// Clamp numeric settings into ranges the daemon's millisecond
     /// arithmetic (`secs as i64 * 1000`) can't overflow.
     pub fn sanitized(mut self) -> Config {
-        if self.idle_timeout != 0 {
-            self.idle_timeout = clamped("idle_timeout", self.idle_timeout, IDLE_TIMEOUT_MIN, IDLE_TIMEOUT_MAX);
+        for note in self.clamp() {
+            crate::warn!("{note}");
         }
-        self.rotation_interval =
-            clamped("rotation_interval", self.rotation_interval, ROTATION_INTERVAL_MIN, ROTATION_INTERVAL_MAX);
         self
+    }
+
+    /// `config.toml` text as `load` reads it (sanitized), without logging:
+    /// the clamp warnings come back instead, for `claude-presence tui`,
+    /// whose screen stderr output would garble.
+    pub fn parse(s: &str) -> Result<(Config, Vec<String>), toml::de::Error> {
+        let mut c: Config = toml::from_str(s)?;
+        let notes = c.clamp();
+        Ok((c, notes))
+    }
+
+    /// The `sanitized` clamps; what had to change, as warnings.
+    fn clamp(&mut self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.idle_timeout != 0 {
+            clamp(&mut notes, "idle_timeout", &mut self.idle_timeout, IDLE_TIMEOUT_MIN, IDLE_TIMEOUT_MAX);
+        }
+        let r = &mut self.rotation_interval;
+        clamp(&mut notes, "rotation_interval", r, ROTATION_INTERVAL_MIN, ROTATION_INTERVAL_MAX);
+        notes
     }
 
     pub fn status_display_type(&self) -> Option<u8> {
@@ -437,6 +455,18 @@ mod tests {
 
         let c = load_str("ok", "idle_timeout = 1200\nrotation_interval = 30\n");
         assert_eq!((c.idle_timeout, c.rotation_interval), (1200, 30));
+    }
+
+    #[test]
+    fn parse_reports_clamps_instead_of_logging() {
+        let (c, notes) = Config::parse("idle_timeout = 1\nrotation_interval = 30\n").unwrap();
+        assert_eq!((c.idle_timeout, c.rotation_interval), (IDLE_TIMEOUT_MIN, 30));
+        assert_eq!(notes, ["idle_timeout = 1 is below the minimum; using 60"]);
+        let (c, notes) = Config::parse("").unwrap();
+        assert_eq!(c, Config::default());
+        assert!(notes.is_empty());
+        assert!(Config::parse("this is not toml").is_err());
+        assert!(Config::parse("idle_timeout = \"900\"\n").is_err());
     }
 
     #[test]

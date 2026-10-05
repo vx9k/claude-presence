@@ -19,10 +19,10 @@ pub fn inspect(cwd: &Path) -> GitInfo {
         return info;
     };
     info.root = Some(root);
-    if let Ok(head) = fs::read_to_string(git_dir.join("HEAD")) {
-        if let Some(r) = head.trim().strip_prefix("ref: refs/heads/") {
-            info.branch = r.to_owned();
-        }
+    if let Ok(head) = fs::read_to_string(git_dir.join("HEAD"))
+        && let Some(r) = head.trim().strip_prefix("ref: refs/heads/")
+    {
+        info.branch = r.to_owned();
     }
     // Linked worktrees keep `config` in the common dir.
     let common =
@@ -47,10 +47,10 @@ fn find_git_dir(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
                 return Some((d.to_path_buf(), dot));
             }
             // Worktrees and submodules: `.git` is a file `gitdir: <path>`.
-            if let Ok(s) = fs::read_to_string(&dot) {
-                if let Some(g) = s.lines().find_map(|l| l.strip_prefix("gitdir:")) {
-                    return Some((d.to_path_buf(), absolutize(d, g.trim())));
-                }
+            if let Ok(s) = fs::read_to_string(&dot)
+                && let Some(g) = s.lines().find_map(|l| l.strip_prefix("gitdir:"))
+            {
+                return Some((d.to_path_buf(), absolutize(d, g.trim())));
             }
         }
         dir = d.parent();
@@ -65,12 +65,11 @@ fn origin_url(cfg: &str) -> Option<&str> {
         let l = line.trim();
         if l.starts_with('[') {
             in_origin = l.replace(' ', "").eq_ignore_ascii_case("[remote\"origin\"]");
-        } else if in_origin {
-            if let Some((k, v)) = l.split_once('=') {
-                if k.trim().eq_ignore_ascii_case("url") {
-                    return Some(v.trim());
-                }
-            }
+        } else if in_origin
+            && let Some((k, v)) = l.split_once('=')
+            && k.trim().eq_ignore_ascii_case("url")
+        {
+            return Some(v.trim());
         }
     }
     None

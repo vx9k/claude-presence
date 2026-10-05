@@ -70,6 +70,21 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Howard Hinnant's civil_from_days: `(year, month, day)` of a day number
+/// (days since the Unix epoch, as `day_number` gives).
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 #[inline]
 fn digits(b: &[u8], at: usize, n: usize) -> Option<u32> {
     let s = b.get(at..at + n)?;
@@ -266,6 +281,23 @@ mod tests {
         assert_eq!(day_number(-1, 0), -1);
         assert_eq!(day_number(23 * 3_600_000, 3600), 1);
         assert_eq!(minute_of_day(90 * 60_000, 0), 90);
+    }
+
+    #[test]
+    fn civil_dates_from_day_numbers() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+        assert_eq!(civil_from_days(20_730), (2026, 10, 4));
+        assert_eq!(civil_from_days(-719_468), (0, 3, 1));
+        // The inverse of days_from_civil over a few centuries, leap days included.
+        for z in (-200_000..200_000).step_by(37) {
+            let (y, m, d) = civil_from_days(z);
+            assert_eq!(days_from_civil(y, m, d), z, "{z}");
+            assert!((1..=12).contains(&m) && (1..=31).contains(&d));
+        }
+        let _ = civil_from_days(i32::MIN as i64);
+        let _ = civil_from_days(i32::MAX as i64);
     }
 
     #[test]

@@ -10,15 +10,13 @@ as Discord Rich Presence on Linux, macOS and Windows.
 
 Rules:
 - Match the surrounding code: comment density, naming, error handling style.
-- Keep dependencies minimal; prefer std. Performance and low resource usage
-  are design goals — don't add threads, polling or allocations on hot paths.
+- Simplest thing that works (AGENTS.md "Conventions"): reuse existing
+  helpers, then std, then minimal code. No threads, polling or allocations
+  on hot paths.
 - Every fix gets a unit test when it is testable on Linux.
-- Before finishing, all of these must pass:
-  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
-  Also run `cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`
-  and `--target aarch64-apple-darwin` when a C cross toolchain for that
-  target is installed (bundled SQLite needs one); otherwise say they were
-  skipped and that CI's native clippy covers them.
+- Before finishing, the checks in AGENTS.md "Commands" must pass; say which
+  cross targets were skipped (no C cross toolchain) and left to CI.
+- Keep the report short: what changed, check results, proposed commits.
 - Do not commit or push; report what you changed and why, and end the report
   with the proposed commit message(s) in Conventional Commits form
   (`<type>(<scope>)!: <description>`; types, scopes and breaking rules in

@@ -20,7 +20,9 @@ A lean alternative to the Node.js [claude-rpc](https://github.com/rar-file/claud
    `serde`, `toml`, `serde_json` (install-time `settings.json` editing only,
    for key-order preservation), `rusqlite` (`bundled`, no default features;
    ledger persistence; extensions trimmed via `LIBSQLITE3_FLAGS` in
-   `.cargo/config.toml`), `libc` (unix), `windows-sys` (windows).
+   `.cargo/config.toml`), `libc` (unix), `windows-sys` (windows), `ratatui` (optional `tui` feature,
+   default on; only the `tui` command uses it — the daemon binary stays the
+   same size).
 
 ## Layout
 
@@ -39,6 +41,8 @@ A lean alternative to the Node.js [claude-rpc](https://github.com/rar-file/claud
 | `src/paths.rs` | Per-OS directories and socket/pipe names |
 | `src/timeutil.rs` | Time helpers (RFC 3339 parsing, local offset, formatting) |
 | `src/log.rs` | Minimal leveled logger (`CLAUDE_PRESENCE_LOG`) |
+| `src/state.rs` | `__state` snapshot (JSON, ≤ 64 KiB) the daemon builds for the TUI |
+| `src/tui/` | `claude-presence tui`: pure `app` (state/keys) and `ui` (drawing, `TestBackend` tests); `run` owns the terminal and the poll thread |
 | `docs/` | In-depth docs: architecture, IPC/security, ledger, config, services, troubleshooting, development |
 | `TODO.md` | Handoff: open audit findings and verification status |
 
@@ -133,6 +137,14 @@ short (AF_UNIX limit ~100 bytes) when overriding `XDG_RUNTIME_DIR`.
 
 ## Conventions
 
+- **Simplest thing that works** (the repo enables the `ponytail` plugin):
+  before writing code, check whether it needs to exist, then reuse what is
+  already here (`timeutil`, `presence::clamp`, `paths`, existing deps), then
+  `std`, then a few lines of your own. No abstractions with one user, no
+  config for values that never change, no scaffolding for later. Mark a
+  deliberate shortcut with a known ceiling with a `ponytail:` comment naming
+  the ceiling and the upgrade path. Never simplify away the invariants
+  below, endpoint checks, or error handling that prevents data loss.
 - Match surrounding style; `rustfmt.toml` sets width 120.
 - Every `unsafe` block gets a `// SAFETY:` comment.
 - **Test-driven:** write the failing unit test first, run it and confirm it
@@ -145,8 +157,8 @@ short (AF_UNIX limit ~100 bytes) when overriding `XDG_RUNTIME_DIR`.
   `cfg(target_os = "macos")`, `cfg(all(unix, not(target_os = "macos")))`.
 - Commits and PR titles: strictly [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
   (`<type>(<scope>)!: <description>`; types, scopes and breaking rules in
-  [`docs/development.md`](docs/development.md#commit-messages)); end with a
-  `Sub-agent: <name>` trailer naming the sub-agent credited for the change
+  [`docs/development.md`](docs/development.md#commit-messages)); add a
+  `Sub-agent: <name>` trailer only when a sub-agent did most of the work
   (see CLAUDE.md).
 
 ## Sub-agents

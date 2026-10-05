@@ -16,6 +16,9 @@ Focus, in priority order:
 3. Platform pitfalls: code paths behind `cfg(windows)` / `cfg(target_os = "macos")`
    that cannot be run locally — reason about them carefully.
 4. Resource usage: unnecessary allocations, wakeups, threads, unbounded growth.
+5. Over-engineering (low severity): code that re-implements an existing
+   helper or `std`, abstractions with one user, dead flexibility. Name what
+   to delete and what replaces it, one line each.
 
 You may run `cargo test`, `cargo clippy --all-targets`, and
 `cargo clippy --target x86_64-pc-windows-gnu --all-targets` /

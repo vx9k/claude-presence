@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -266,7 +267,14 @@ struct Want {
 struct Shared {
     want: Mutex<Want>,
     cv: Condvar,
+    /// Connection status for `Presenter::status`, written by the worker.
+    status: AtomicU8,
 }
+
+const DISCONNECTED: u8 = 0;
+const CONNECTED: u8 = 1;
+const BRIDGE: u8 = 2;
+const REFUSED: u8 = 3;
 
 /// How long `Presenter::shutdown` waits for the worker to clear the
 /// activity. Unix sockets time out after 5 s anyway; Windows pipes have no
@@ -312,6 +320,17 @@ impl Presenter {
     #[cfg(test)]
     pub fn wanted(&self) -> Option<String> {
         self.shared.want.lock().unwrap_or_else(|e| e.into_inner()).activity.clone()
+    }
+
+    /// Whether the worker is connected to Discord: `connected`, `bridge`
+    /// (an arRPC bridge), `refused` (bad `client_id`) or `disconnected`.
+    pub fn status(&self) -> &'static str {
+        match self.shared.status.load(Ordering::Relaxed) {
+            CONNECTED => "connected",
+            BRIDGE => "bridge",
+            REFUSED => "refused",
+            _ => "disconnected",
+        }
     }
 
     /// Replace the desired activity (JSON object), or clear it with `None`.
@@ -481,15 +500,18 @@ fn worker(shared: &Shared, client_id: &str) {
             match Conn::connect(client_id, &candidate_paths()) {
                 Ok(c) => {
                     crate::info!("connected to Discord{}", if c.bridge { " (arRPC bridge)" } else { "" });
+                    shared.status.store(if c.bridge { BRIDGE } else { CONNECTED }, Ordering::Relaxed);
                     conn = Some(c);
                     backoff = Duration::from_secs(2);
                 }
                 Err(e) => {
                     if e.kind() == io::ErrorKind::InvalidInput {
                         crate::error!("Discord refused the handshake: {e} (check client_id)");
+                        shared.status.store(REFUSED, Ordering::Relaxed);
                         retry_at = Instant::now() + Duration::from_secs(300);
                     } else {
                         crate::debug!("Discord not reachable: {e}");
+                        shared.status.store(DISCONNECTED, Ordering::Relaxed);
                         retry_at = Instant::now() + backoff;
                         backoff = (backoff * 2).min(Duration::from_secs(60));
                     }
@@ -508,6 +530,7 @@ fn worker(shared: &Shared, client_id: &str) {
         }
         if !wire.record(&res, want, generation) {
             conn = None;
+            shared.status.store(DISCONNECTED, Ordering::Relaxed);
             retry_at = now;
         }
     }
@@ -516,6 +539,18 @@ fn worker(shared: &Shared, client_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_status_names() {
+        assert_eq!(Presenter::inert().status(), "disconnected");
+        let p = Presenter::inert();
+        for (s, name) in
+            [(CONNECTED, "connected"), (BRIDGE, "bridge"), (REFUSED, "refused"), (DISCONNECTED, "disconnected")]
+        {
+            p.shared.status.store(s, Ordering::Relaxed);
+            assert_eq!(p.status(), name);
+        }
+    }
 
     #[test]
     fn rejected_activity_is_not_kept_alive() {
