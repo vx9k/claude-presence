@@ -4,27 +4,26 @@
 
 ## Claude Code workflow
 
-Orchestrate the sub-agents in `.claude/agents/` rather than doing everything
-in the main thread:
+Work in the main thread by default: each sub-agent starts cold and re-reads
+the repo, so spawn one only where it pays for itself.
 
-1. **advisor** (Sonnet): consult first when a change adds a dependency, a
-   thread or timer, touches the hook wire format, the ledger format, config
-   schema, or service installation.
-2. **developer**: implements the change test-first (failing test, confirm
-   it fails, then the fix) and runs every check listed in AGENTS.md
-   (including the Windows and macOS clippy targets).
-3. **auditor**: reviews the resulting diff. Hand its findings back to the
-   developer until it reports no high or medium findings.
-4. **docs-writer** (Sonnet): updates README.md and `docs/` when commands,
-   config keys, template variables, paths, log messages or service behavior
-   change. README stays a front page; details live in `docs/`.
+1. Implement test-first (failing test, confirm it fails, then the fix) and
+   run the checks in AGENTS.md once the change is done, not after every edit.
+2. **auditor**: one pass over the finished diff before committing; fix its
+   high/medium findings inline and re-audit only if a fix was non-trivial.
+3. **advisor** (Sonnet): only when a decision is genuinely open (a new
+   dependency, thread or timer; the hook wire format, ledger format, config
+   schema or service installation) — not to confirm a settled plan.
+4. **docs-writer** (Sonnet) / **developer**: for large, self-contained work
+   that would otherwise flood the main context. Small doc updates are done
+   inline: README stays a front page; details live in `docs/`.
 
-Independent steps (e.g. auditor + docs-writer) can run in parallel.
+Read targeted line ranges, not whole files or full diffs.
 
 ## Attribution
 
-Commits and PR descriptions are credited to one sub-agent picked at random
-from `advisor`, `auditor`, `developer`, `docs-writer`:
+When a sub-agent did most of the work, credit it; when the main thread did,
+add nothing:
 
 - commits: a `Sub-agent: <name>` trailer;
 - PR descriptions: end with `🤖 Written by the <name> sub-agent`.
@@ -45,10 +44,8 @@ conform too.
 ## Resuming work
 
 Start from `TODO.md` (and `docs/architecture.md` if the code is new to you).
-Stack related PRs when later work depends on earlier fixes. The usual loop for an item: advisor (if the item
-touches IPC, the ledger format, config schema or services) → developer →
-auditor until no high/medium findings → docs-writer if user-facing behavior
-changed → conventional commit with a `Sub-agent:` trailer → push → check CI.
+Stack related PRs when later work depends on earlier fixes. Loop: the
+workflow above → conventional commit → push → check CI.
 
 ## Gotchas
 

@@ -109,19 +109,18 @@ Definitions are in `.claude/agents/`.
 | `auditor` | inherit | Read-only review of the diff |
 | `docs-writer` | sonnet | README and docs, verified against the source |
 
-Loop for a change:
+Sub-agents start cold and re-read the repo, so the main thread does most work itself (see CLAUDE.md):
 
-1. `advisor`, if the change adds a dependency, a thread or timer, or touches the hook wire format, the ledger format, the config schema or service installation.
-2. `developer`: implement with tests; run all checks; the two cross clippy targets are optional (they need a C cross toolchain), so say in the PR which platforms were only checked by CI.
-3. `auditor`: review the diff; hand findings back to `developer` until it reports no high or medium findings.
-4. `docs-writer`: update README and `docs/` when commands, config keys, template variables, paths or service behavior changed. This and the audit can run in parallel.
-5. Commit with a [Conventional Commits](#commit-messages) message, push, check CI.
+1. Implement with tests; run all checks once the change is done. The two cross clippy targets are optional (they need a C cross toolchain), so say in the PR which platforms were only checked by CI.
+2. `auditor`: one review of the finished diff; fix high/medium findings.
+3. `advisor` only for genuinely open decisions (a dependency, thread or timer; the hook wire format, ledger format, config schema or service installation); `developer` / `docs-writer` only for large self-contained work.
+4. Commit with a [Conventional Commits](#commit-messages) message, push, check CI.
 
 Start new work from [TODO.md](../TODO.md); update it when you fix or discover something.
 
 ### Attribution
 
-Commits and PR descriptions are credited to one sub-agent picked at random from `advisor`, `auditor`, `developer`, `docs-writer`:
+When a sub-agent did most of the work, commits and PR descriptions credit it; when the main thread did, they carry no credit line:
 
 - commit: a `Sub-agent: <name>` trailer (see [Commit messages](#commit-messages));
 - PR description: end with `🤖 Written by the <name> sub-agent`.
