@@ -204,7 +204,7 @@ fn check_legacy(is_socket: bool, uid: u32, euid: u32) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::PermissionDenied, why))
 }
 
-/// `send_to` for hook events; Windows has no legacy endpoint.
+/// `send_to` for hook events; hooks never fall back on Windows (see `paths::legacy_hook_socket`).
 #[cfg(windows)]
 pub fn send_hook(
     addr: &Path,
@@ -549,7 +549,7 @@ struct OwnerOnly(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
 
 /// The current process token's user SID as a string (`S-1-5-21-…`).
 #[cfg(windows)]
-fn current_user_sid() -> io::Result<String> {
+pub(crate) fn current_user_sid() -> io::Result<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
