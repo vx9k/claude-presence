@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 172" width="420" height="172">
+<title>Discord card preview</title>
+<rect width="420" height="172" rx="12" fill="#111214"/>
+<text x="20" y="34" font-family="'gg sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#b5bac1" letter-spacing=".6">PLAYING A GAME</text>
+<rect x="20" y="52" width="96" height="96" rx="10" fill="#2b2d31"/>
+<g shape-rendering="crispEdges"><path fill="#D97757" d="M38 75h5v10h-5zM43 75h5v10h-5zM48 75h5v10h-5zM53 75h5v10h-5zM58 75h5v10h-5zM63 75h5v10h-5zM68 75h5v10h-5zM73 75h5v10h-5zM78 75h5v10h-5zM83 75h5v10h-5zM88 75h5v10h-5zM93 75h5v10h-5zM38 85h5v10h-5zM43 85h5v10h-5zM53 85h5v10h-5zM58 85h5v10h-5zM63 85h5v10h-5zM68 85h5v10h-5zM73 85h5v10h-5zM78 85h5v10h-5zM88 85h5v10h-5zM93 85h5v10h-5zM28 95h5v10h-5zM33 95h5v10h-5zM38 95h5v10h-5zM43 95h5v10h-5zM48 95h5v10h-5zM53 95h5v10h-5zM58 95h5v10h-5zM63 95h5v10h-5zM68 95h5v10h-5zM73 95h5v10h-5zM78 95h5v10h-5zM83 95h5v10h-5zM88 95h5v10h-5zM93 95h5v10h-5zM98 95h5v10h-5zM103 95h5v10h-5zM38 105h5v10h-5zM43 105h5v10h-5zM48 105h5v10h-5zM53 105h5v10h-5zM58 105h5v10h-5zM63 105h5v10h-5zM68 105h5v10h-5zM73 105h5v10h-5zM78 105h5v10h-5zM83 105h5v10h-5zM88 105h5v10h-5zM93 105h5v10h-5zM43 115h5v10h-5zM53 115h5v10h-5zM78 115h5v10h-5zM88 115h5v10h-5z"/></g>
+<text x="132" y="74" font-family="'gg sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="15" font-weight="700" fill="#f2f3f5">Claude Code</text>
+<text x="132" y="98" font-family="'gg sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="14" fill="#dbdee1">Working in claude-presence</text>
+<text x="132" y="120" font-family="'gg sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="14" fill="#dbdee1">PowerShell · 27.94M tokens</text>
+<text x="132" y="142" font-family="'gg sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="14" fill="#23a55a">29:31 elapsed</text>
+</svg>

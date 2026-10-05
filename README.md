@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/banner.svg" alt="Clawd, the Claude Code mascot, in pixel art next to the title claude-presence" width="100%"></p>
+
 # claude-presence
 
 Discord Rich Presence for [Claude Code](https://claude.com/claude-code), in pure Rust.
@@ -20,6 +22,16 @@ Linux, macOS and Windows. **Full documentation: [docs/](docs/README.md).**
 - **Respects Discord's rate limit** (≤ 4 updates / 20 s, bursts coalesce to the latest state).
 - **Per-user service** for every platform: systemd, OpenRC, dinit (or XDG autostart),
   launchd, Windows Task Scheduler.
+
+<p align="center">
+  <img src="docs/images/discord-card.svg" alt="Discord activity card: Claude Code, Working in claude-presence, PowerShell · 27.94M tokens, 29:31 elapsed" width="420"><br>
+  <sub>The Discord card (mock-up)</sub>
+</p>
+
+<p align="center">
+  <img src="docs/images/tui.png" alt="claude-presence tui: daemon status, the live Discord card and today's stats" width="760"><br>
+  <sub><code>claude-presence tui</code></sub>
+</p>
 
 ## Install
 
