@@ -852,6 +852,9 @@ impl Listener {
                         replying.store(false, Ordering::Release);
                     }
                 }
+                // ponytail: a second concurrent `__state` gets no reply, which
+                // the client reads as an older daemon (two TUIs at once).
+                // Answer `BUSY_REPLY` here if that turns out to matter.
                 Action::Reply(_) => close(cur),
             }
             match created {

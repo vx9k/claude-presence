@@ -22,8 +22,9 @@ pub enum Msg {
     Hook(Vec<u8>),
     Reload,
     Shutdown,
-    /// `__state`: send the snapshot reply line back.
-    State(SyncSender<String>),
+    /// `__state`: send the snapshot reply line back, unless the listener has
+    /// stopped waiting for it (the deadline passed).
+    State(SyncSender<String>, Instant),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -856,7 +857,7 @@ fn route(m: Vec<u8>) -> Option<Msg> {
 fn on_message(m: Vec<u8>, tx: &Sender<Msg>, wait: Duration) -> ipc::Action {
     if ipc::event_name(&m) == ipc::STATE.as_bytes() {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        if tx.send(Msg::State(reply_tx)).is_err() {
+        if tx.send(Msg::State(reply_tx, Instant::now() + wait)).is_err() {
             return ipc::Action::Stop;
         }
         let line = reply_rx.recv_timeout(wait).unwrap_or_else(|_| state::BUSY_REPLY.to_owned());
@@ -920,9 +921,12 @@ pub fn run(opts: Options) -> i32 {
                 Msg::Hook(b) => d.handle_hook(&b),
                 Msg::Reload => d.reload(),
                 Msg::Shutdown => stop = true,
-                // The listener may have given up waiting; then nobody reads it.
-                Msg::State(reply) => {
-                    let _ = reply.send(d.state_reply());
+                // Skip requests the listener gave up on (queued behind the
+                // startup scan): nobody would read the snapshot.
+                Msg::State(reply, deadline) => {
+                    if Instant::now() < deadline {
+                        let _ = reply.send(d.state_reply());
+                    }
                 }
             }
         }
@@ -1312,7 +1316,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Msg>();
         let t = std::thread::spawn(move || {
             for m in rx {
-                if let Msg::State(r) = m {
+                if let Msg::State(r, _) = m {
                     r.send("{\"v\":1,\"pid\":1}\n".into()).unwrap();
                 }
             }
@@ -1328,8 +1332,9 @@ mod tests {
         let ipc::Action::Reply(r) = on_message(ipc::state_request(), &tx, wait) else { panic!("no reply") };
         assert_eq!(r, crate::state::BUSY_REPLY.as_bytes());
         assert!(started.elapsed() >= wait && started.elapsed() < Duration::from_secs(2));
-        // The stale request is still queued; answering it later is harmless.
-        let Ok(Msg::State(late)) = rx.try_recv() else { panic!("not queued") };
+        // The stale request is still queued, past its deadline: the loop skips it.
+        let Ok(Msg::State(late, deadline)) = rx.try_recv() else { panic!("not queued") };
+        assert!(Instant::now() >= deadline);
         assert!(late.send(String::new()).is_err(), "nobody waits for it any more");
 
         // Everything else is queued as before.
@@ -1440,7 +1445,7 @@ mod tests {
             for m in rx {
                 match m {
                     Msg::Hook(b) => d.handle_hook(&b),
-                    Msg::State(r) => {
+                    Msg::State(r, _) => {
                         let _ = r.send(d.state_reply());
                     }
                     Msg::Reload => {}
