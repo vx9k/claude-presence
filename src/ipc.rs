@@ -489,10 +489,16 @@ impl Listener {
             std::fs::create_dir_all(dir)?;
         }
         // Create the socket with no group/other permissions from the start.
-        // SAFETY: umask is process-global; we restore it right after bind.
-        let old = unsafe { libc::umask(0o177) };
+        // umask is process-global: the daemon binds before starting any
+        // other thread, but tests bind while others create dirs, which would
+        // come out 0600 (unusable). Tests rely on the chmod below instead.
+        // SAFETY: we restore it right after bind.
+        let old = (!cfg!(test)).then(|| unsafe { libc::umask(0o177) });
         let l = UnixListener::bind(addr);
-        unsafe { libc::umask(old) };
+        if let Some(old) = old {
+            // SAFETY: restores the value saved above.
+            unsafe { libc::umask(old) };
+        }
         let l = l?;
         std::fs::set_permissions(addr, std::fs::Permissions::from_mode(0o600))?;
         Ok(Listener(l, addr.to_path_buf()))
