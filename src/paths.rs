@@ -162,8 +162,19 @@ pub fn hook_endpoint() -> (PathBuf, bool) {
     }
 }
 
+/// Named after the user SID: user names can collide once sanitized
+/// (`José`/`Josè`, a local and a domain `bob`), and pipe names are global.
 #[cfg(windows)]
 pub fn hook_socket() -> PathBuf {
+    match crate::ipc::current_user_sid() {
+        Ok(sid) => PathBuf::from(format!(r"\\.\pipe\{APP}-{sid}")),
+        Err(_) => user_name_pipe(),
+    }
+}
+
+/// The pipe name before it was named after the SID, from `%USERNAME%`.
+#[cfg(windows)]
+fn user_name_pipe() -> PathBuf {
     let user = env::var("USERNAME").unwrap_or_default();
     let user: String =
         user.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
@@ -191,9 +202,12 @@ fn legacy_socket_in(tmp: &std::path::Path, uid: u32) -> PathBuf {
     }
 }
 
+/// Only `install`/`uninstall` use it on Windows, to stop an older daemon;
+/// hooks and the daemon are upgraded together, so hooks don't fall back.
+// TODO: remove a couple of releases after the SID pipe name shipped.
 #[cfg(windows)]
 pub fn legacy_hook_socket() -> Option<PathBuf> {
-    None
+    Some(user_name_pipe())
 }
 
 #[cfg(windows)]
@@ -210,5 +224,17 @@ mod tests {
     fn legacy_socket_names() {
         assert_eq!(legacy_socket_in(Path::new("/tmp"), 1000), Path::new("/tmp/claude-presence-1000.sock"));
         assert_eq!(legacy_socket_in(Path::new("/var/tmp/me"), 1000), Path::new("/var/tmp/me/claude-presence.sock"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod win_tests {
+    #[test]
+    fn pipe_is_named_after_the_user_sid() {
+        // User names can collide once sanitized (`José`/`Josè`, local and domain `bob`); SIDs can't.
+        let pipe = super::hook_socket();
+        let sid = crate::ipc::current_user_sid().unwrap();
+        assert_eq!(pipe.to_str().unwrap(), format!(r"\\.\pipe\claude-presence-{sid}"));
+        assert_ne!(super::legacy_hook_socket(), Some(pipe));
     }
 }

@@ -7,7 +7,7 @@ Work items are ordered by priority. Delete an entry once its fix is merged.
 ## Status
 
 - CI (fmt, clippy, test, release build on Linux/macOS/Windows) is green.
-  Unit tests: 127 on Linux, 126 on Windows (socket and POSIX permission tests
+  Unit tests: 177 on Windows (socket and POSIX permission tests
   are Unix-only; named pipe tests Windows-only).
 - **Verified on Windows by hand:** `install` (Task Scheduler), `status`, the
   hook named pipe, connecting to Discord and setting an activity (via a
@@ -20,14 +20,20 @@ Work items are ordered by priority. Delete an entry once its fix is merged.
   the hook-side pipe-owner check,
   `ERROR_NO_DATA`, bind retry vs `FILE_FLAG_FIRST_PIPE_INSTANCE`, the
   `__shutdown` round trip, cancelling a Discord worker blocked in pipe I/O.
-  Still by hand only: the locked-`.exe` copy during a real reinstall
-  (`replace_binary`; its retry/rename logic is unit-tested).
+  **Verified on Windows by hand** (2026-10-05): a reinstall while
+  `claude-presence.exe` is in use (`replace_binary` renames it to `.old`,
+  removed by the next install), and the user `PATH` edit against the real
+  registry (added once; `%LOCALAPPDATA%` and quoted forms count as present;
+  `REG_EXPAND_SZ` and `%vars%` survive; `uninstall` removes only our entry
+  and deletes `Path` when it was the only one; `--no-path` leaves it alone;
+  the broadcast reaches Explorer, so new terminals see the change).
 - Under Wine (see docs/development.md) all tests pass except three Wine
   quirks: `counts_incrementally_and_dedups` (not rechecked since the Windows
   `file_ident` moved to the file id),
   `our_pipe_passes_the_owner_check` and `a_fake_discord_cannot_impersonate_us`.
-- **Not yet verified anywhere real:** a full local Claude Code session
-  driving the card end-to-end on Windows/macOS; OpenRC and dinit services;
+- **Verified end-to-end on Windows:** a local Claude Code session (desktop
+  app, Code tab) drives the card in Discord. **Not yet verified anywhere
+  real:** a full session showing the card on macOS; OpenRC and dinit services;
   launchd; the Run-key fallback.
 - Only **local** Claude Code sessions can be shown (CLI, or the desktop app's
   Code tab using the local machine). Cloud sessions run hooks in a remote
@@ -40,23 +46,6 @@ Line numbers are approximate.
 
 ### Low / unverified
 
-15. **Windows user `PATH` edit is only type-checked** (`src/install.rs`,
-    `edit_user_path`, `broadcast_environment_change`). The string logic
-    (`add_path_entry`, `remove_path_entry` with quote stripping and an
-    injected `%var%` expander, the growth-only 2047-character limit, the
-    empty-value check) and `expand_env` are unit-tested; the
-    `HKCU\Environment` read/write/delete and the `WM_SETTINGCHANGE`
-    broadcast have not run against a real registry. To verify by hand:
-    `install` adds the folder once (re-run says "already in your user
-    PATH", also when the entry is written as `%LOCALAPPDATA%\...` or
-    quoted), a new terminal finds `claude-presence`, the value type
-    (`REG_EXPAND_SZ`) and `%vars%` survive, `uninstall` removes only that
-    entry (and deletes `Path` if it was the only one), `--no-path` leaves
-    `Path` alone.
-16. **Windows `file_ident` fallback is only type-checked**
-    (`src/ledger.rs`): when `FileIdInfo` fails, the identity comes from
-    `GetFileInformationByHandle` (`fold_index`, unit-tested). Not run on a
-    file system without `FileIdInfo` (FAT, some network shares).
 21. **Drop the legacy ledger import** (`src/ledger.rs` `import_legacy`,
     `read_legacy`, `Stored`, `LEGACY_*`, and `load_stats`' legacy
     fallback): a couple of releases after `ledger.db` shipped, stop reading
@@ -70,9 +59,9 @@ Line numbers are approximate.
     smaller); gcc/clang process `-D`/`-U` in order too, but the Linux and
     macOS builds are only checked by CI. Also unverified: the ledger on a
     network/FUSE data dir (SQLite locking), and the daemon's busy-db retry
-    against a real second process (unit-tested with a second connection),
-    and the Unix (`ENOTDIR`) branch of `unreadable_db_path_is_retried`
-    (only the Windows `ERROR_INVALID_NAME` branch was run locally).
+    against a real second process (unit-tested with a second connection).
+    The Unix (`ENOTDIR`) branch of `unreadable_db_path_is_retried` and the
+    trimmed gcc/clang builds pass in CI; the size saving there is unmeasured.
     Known, accepted: a lasting load error (read-only data dir, invalid
     path) makes the daemon retry the load once a minute forever (logged at
     `debug` after the first warning). A backoff can be added later.

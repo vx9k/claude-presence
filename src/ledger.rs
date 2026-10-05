@@ -621,13 +621,9 @@ fn ingest_file(
     let mut cx = Ctx { off, now, pending: Vec::new(), delta, file_only: false };
     loop {
         let filled = buf.len();
-        buf.resize(filled + READ_CHUNK, 0);
-        let n = match file.read(&mut buf[filled..]) {
+        // `read_to_end` grows `buf` as needed without zero-filling it.
+        let n = match (&mut file).take(READ_CHUNK as u64).read_to_end(buf) {
             Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                buf.truncate(filled);
-                continue;
-            }
             Err(e) => {
                 buf.truncate(filled);
                 settle(st, &mut cx, resolve);
@@ -635,7 +631,6 @@ fn ingest_file(
                 return Err(e);
             }
         };
-        buf.truncate(filled + n);
         if n == 0 {
             break;
         }
@@ -984,8 +979,8 @@ impl Ledger {
         };
         let mut buf = std::mem::take(&mut self.buf);
         let res = ingest_file(Path::new(key), &mut st, &mut buf, &mut delta, off, now, &mut resolve);
-        // Don't let one huge line pin memory in a long-running daemon.
-        if buf.capacity() > 4 * READ_CHUNK {
+        // Keep a small buffer between ingests; a big first read must not pin MiBs.
+        if buf.capacity() > 64 << 10 {
             buf = Vec::new();
         }
         self.buf = buf;
