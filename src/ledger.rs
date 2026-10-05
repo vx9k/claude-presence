@@ -686,15 +686,6 @@ pub fn key_for(path: &Path) -> Option<String> {
 
 // ------------------------------------------------------------------ ledger --
 
-/// `ledger.json` as releases before `ledger.db` wrote it; imported once.
-#[derive(Deserialize, Default)]
-struct Stored {
-    version: u32,
-    totals: Totals,
-    days: Vec<(i32, Day)>,
-    files: HashMap<String, FileState>,
-}
-
 /// Whether the database may be written.
 #[derive(Default, Clone, Copy, PartialEq, Debug)]
 enum Store {
@@ -780,8 +771,7 @@ pub struct ScanReport {
 }
 
 impl Ledger {
-    /// Load from `db_path`, importing a legacy `ledger.json`/`seen.bin` next
-    /// to it on first use. Anything missing starts a fresh ledger (the next
+    /// Load from `db_path`. Anything missing starts a fresh ledger (the next
     /// scan rebuilds it from the transcripts still on disk); a corrupt
     /// database is moved aside first. A busy database leaves the ledger
     /// unloaded: it works in memory and refuses to save until
@@ -851,9 +841,8 @@ impl Ledger {
     }
 
     fn read_db(&mut self) -> Result<(), DbError> {
-        let legacy = self.db_path.with_file_name(LEGACY_LEDGER);
         // Only "not found" means there is nothing to load.
-        if !exists(&self.db_path)? && !exists(&legacy)? {
+        if !exists(&self.db_path)? {
             return Ok(());
         }
         let mut conn = open(&self.db_path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)?;
@@ -862,23 +851,11 @@ impl Ledger {
         self.from_db = true;
         match user_version(&tx)? {
             0 => {
-                // A legacy file that can't be read now aborts (rolls back)
-                // the import; the load is retried.
-                let migrated = self.import_legacy(&legacy)?;
                 tx.execute_batch(SCHEMA_SQL)?;
                 self.write_rows(&tx, true)?;
                 // Last: until this commits, the next load starts over.
                 tx.pragma_update(None, "user_version", DB_VERSION)?;
                 tx.commit()?;
-                if migrated {
-                    for p in [legacy, self.db_path.with_file_name(LEGACY_SEEN)] {
-                        match fs::rename(&p, with_suffix(&p, ".bak")) {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                            Err(e) => crate::warn!("{}: {e}", p.display()),
-                        }
-                    }
-                }
             }
             DB_VERSION => {
                 read_stats(&tx, self)?;
@@ -894,46 +871,6 @@ impl Ledger {
             v => return Err(DbError::Newer(v)),
         }
         Ok(())
-    }
-
-    /// Read a legacy ledger into `self`, for a first load to store. Returns
-    /// whether there was one (then it is renamed `*.bak` once stored); an
-    /// unparsable or unsupported one is not imported. Fails on I/O errors
-    /// other than a missing file: the import is retried rather than lost.
-    fn import_legacy(&mut self, path: &Path) -> Result<bool, DbError> {
-        let s = match read_legacy(path) {
-            Ok(Some(s)) => s,
-            Ok(None) => return Ok(false),
-            Err(Legacy::Io(e)) => return Err(DbError::Io(path.to_owned(), e)),
-            Err(Legacy::Bad(e)) => {
-                crate::warn!("{}: {e}; rebuilding stats", path.display());
-                return Ok(true);
-            }
-        };
-        let seen = self.db_path.with_file_name(LEGACY_SEEN);
-        let ids = match fs::read(&seen) {
-            Ok(b) => Some(b),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // The ids counted so far are unknown: a copy of them in a new
-                // transcript counts again (re-reads of known files don't, and
-                // record their ids again).
-                if missing_seen_matters(&s.totals) {
-                    crate::warn!("{}: {e}; previously counted ids are forgotten", seen.display())
-                }
-                None
-            }
-            Err(e) => return Err(DbError::Io(seen, e)),
-        };
-        self.totals = s.totals;
-        self.days = s.days.into_iter().collect();
-        self.files = s.files;
-        if let Some(b) = ids {
-            // A torn append's partial id is dropped.
-            self.seen.reserve(b.len() / 8);
-            self.seen.extend(b.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)));
-        }
-        crate::info!("imported {}", path.display());
-        Ok(true)
     }
 
     pub fn file(&self, key: &str) -> Option<&FileState> {
@@ -1340,8 +1277,7 @@ impl Ledger {
 }
 
 /// Totals and days only (for `status`), read without creating, migrating or
-/// locking out anything. A database not created yet shows the legacy
-/// ledger's stats, if any. Errors if the database is busy or unreadable.
+/// locking out anything. Errors if the database is busy or unreadable.
 pub fn load_stats(db_path: &Path) -> io::Result<Ledger> {
     Ok(read_stored(db_path, BUSY_TIMEOUT)?.unwrap_or_default())
 }
@@ -1355,27 +1291,18 @@ pub fn read_only_stats(db_path: &Path, now_ms: i64, off: i64) -> io::Result<Opti
     Ok(read_stored(db_path, READ_ONLY_BUSY_TIMEOUT)?.map(|l| l.stats(now_ms, off)))
 }
 
-/// The stored totals and days, `None` if neither the database nor a legacy
-/// ledger holds any.
+/// The stored totals and days, `None` if nothing is stored yet.
 fn read_stored(db_path: &Path, busy: Duration) -> io::Result<Option<Ledger>> {
     let read = || -> Result<Option<Ledger>, DbError> {
-        // Not migrated yet (no database, or an empty one left by an import
-        // that was rolled back): the legacy ledger's stats, if any.
-        let legacy = || {
-            read_legacy(&db_path.with_file_name(LEGACY_LEDGER)).ok().flatten().map(|s| Ledger {
-                totals: s.totals,
-                days: s.days.into_iter().collect(),
-                ..Ledger::default()
-            })
-        };
         if !exists(db_path)? {
-            return Ok(legacy());
+            return Ok(None);
         }
         let mut conn = open(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(busy)?;
         let tx = conn.transaction()?;
         match user_version(&tx)? {
-            0 => Ok(legacy()),
+            // Created but not set up yet (a first save that was rolled back).
+            0 => Ok(None),
             DB_VERSION => {
                 let mut l = Ledger::default();
                 read_stats(&tx, &mut l)?;
@@ -1396,10 +1323,6 @@ fn read_stored(db_path: &Path, busy: Duration) -> io::Result<Option<Ledger>> {
 
 /// `PRAGMA user_version` of the current `ledger.db` schema.
 const DB_VERSION: i64 = 1;
-/// The `ledger.json` version this release imports.
-const LEGACY_VERSION: u32 = 1;
-const LEGACY_LEDGER: &str = "ledger.json";
-const LEGACY_SEEN: &str = "seen.bin";
 const BUSY_TIMEOUT: Duration = Duration::from_millis(if cfg!(test) { 100 } else { 2000 });
 /// A reader that refreshes on its own schedule waits less for a save.
 pub const READ_ONLY_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
@@ -1564,33 +1487,6 @@ fn read_files(c: &Connection, files: &mut HashMap<String, FileState>) -> rusqlit
         files.insert(r.get(0)?, st);
     }
     Ok(())
-}
-
-enum Legacy {
-    /// Couldn't be read (perhaps only for now).
-    Io(io::Error),
-    /// Read, but unparsable or of an unsupported version.
-    Bad(String),
-}
-
-/// The legacy ledger, `Ok(None)` if there is none.
-fn read_legacy(path: &Path) -> Result<Option<Stored>, Legacy> {
-    let b = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Legacy::Io(e)),
-    };
-    match sonic_rs::from_slice::<Stored>(&b) {
-        Ok(s) if s.version == LEGACY_VERSION => Ok(Some(s)),
-        Ok(s) => Err(Legacy::Bad(format!("unsupported version {}", s.version))),
-        Err(e) => Err(Legacy::Bad(e.to_string())),
-    }
-}
-
-/// Whether losing the legacy `seen.bin` lost anything: it is only created
-/// once an id is counted.
-fn missing_seen_matters(t: &Totals) -> bool {
-    t.turns + t.prompts > 0
 }
 
 #[cfg(test)]
@@ -1916,32 +1812,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[derive(Serialize)]
-    struct StoredRef<'a> {
-        version: u32,
-        totals: &'a Totals,
-        days: Vec<(i32, &'a Day)>,
-        files: &'a HashMap<String, FileState>,
-    }
-
-    impl Ledger {
-        /// Write this ledger as an older release did: `ledger.json`, and
-        /// `seen.bin` if `seen`.
-        fn write_legacy(&self, dir: &Path, seen: bool) {
-            let stored = StoredRef {
-                version: LEGACY_VERSION,
-                totals: &self.totals,
-                days: self.days.iter().map(|(k, v)| (*k, v)).collect(),
-                files: &self.files,
-            };
-            fs::write(dir.join("ledger.json"), sonic_rs::to_vec(&stored).unwrap()).unwrap();
-            if seen {
-                let ids: Vec<u8> = self.seen.iter().flat_map(|id| id.to_le_bytes()).collect();
-                fs::write(dir.join("seen.bin"), ids).unwrap();
-            }
-        }
-    }
-
     fn append_bytes(p: &Path, b: &[u8]) {
         fs::OpenOptions::new().append(true).open(p).unwrap().write_all(b).unwrap();
     }
@@ -2241,129 +2111,21 @@ mod tests {
         let l = load_stats(&db(&dir)).unwrap();
         assert_eq!(l.totals, Totals::default());
         assert!(!db(&dir).exists());
-        // A daemon that hasn't migrated yet: the legacy ledger shows.
-        let mut legacy = Ledger::default();
-        legacy.totals.prompts = 9;
-        legacy.days.entry(20_000).or_default().turns = 3;
-        legacy.write_legacy(&dir, true);
-        let l = load_stats(&db(&dir)).unwrap();
-        assert_eq!((l.totals.prompts, l.days.clone()), (9, legacy.days.clone()));
-        assert!(!db(&dir).exists() && dir.join("ledger.json").exists(), "status migrates nothing");
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A ledger over a few transcripts, written in the legacy format.
-    fn legacy_fixture(name: &str) -> (PathBuf, Ledger) {
-        let content = [user("p1", "2026-10-04T10:00:00Z", "hello"), asst("m1", "2026-10-04T10:00:05Z", 100, 1)]
-            .join("\n")
-            + "\n"
-            + &no_id_lines("2026-10-04T10:00:06Z");
-        let (dir, _, _, mut l) = one_file(name, content.as_bytes());
-        fs::write(dir.join("b.jsonl"), format!("{}\n", asst("m2", "2026-10-05T10:00:00Z", 3, 3))).unwrap();
-        l.scan(std::slice::from_ref(&dir));
-        l.write_legacy(&dir, true);
-        (dir, l)
-    }
-
     #[test]
-    fn legacy_ledger_is_imported_once() {
-        let (dir, legacy) = legacy_fixture("legacy");
+    fn leftover_legacy_ledger_is_ignored() {
+        let dir = tmpdir("legacy-ignored");
+        let json = r#"{"version":1,"totals":{"prompts":9},"days":[],"files":{}}"#;
+        fs::write(dir.join("ledger.json"), json).unwrap();
+        assert_eq!(load_stats(&db(&dir)).unwrap().totals, Totals::default());
         let mut l = Ledger::load(db(&dir));
-        assert_same(&l, &legacy);
-        assert!(!l.is_dirty());
-        assert!(!dir.join("ledger.json").exists() && !dir.join("seen.bin").exists());
-        assert!(dir.join("ledger.json.bak").exists() && dir.join("seen.bin.bak").exists());
-        assert_eq!(l.scan(std::slice::from_ref(&dir)).changed, 0, "offsets carried over");
-        assert_eq!(l.totals, legacy.totals);
-        // A legacy ledger showing up again later is not imported again.
-        let mut other = Ledger::default();
-        other.totals.prompts = 1000;
-        other.write_legacy(&dir, false);
-        assert_same(&Ledger::load(db(&dir)), &legacy);
+        assert!(!l.needs_load());
+        assert_eq!(l.totals, Totals::default());
+        l.save().unwrap();
         assert!(dir.join("ledger.json").exists(), "left alone");
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn legacy_ledger_without_seen_bin() {
-        let (dir, legacy) = legacy_fixture("legacy-noseen");
-        fs::remove_file(dir.join("seen.bin")).unwrap();
-        let mut l = Ledger::load(db(&dir));
-        assert_eq!((l.totals.clone(), l.days.clone()), (legacy.totals.clone(), legacy.days.clone()));
-        assert!(l.seen.is_empty());
-        // Known files are not recounted.
-        l.scan(std::slice::from_ref(&dir));
-        assert_eq!(l.totals, legacy.totals);
-        assert!(missing_seen_matters(&legacy.totals));
-        assert!(!missing_seen_matters(&Totals { sessions: 3, ..Totals::default() }), "TODO #18");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn legacy_torn_seen_bin_keeps_whole_ids() {
-        let (dir, legacy) = legacy_fixture("legacy-torn");
-        append_bytes(&dir.join("seen.bin"), &[1, 2, 3]);
-        let l = Ledger::load(db(&dir));
-        assert_same(&l, &legacy);
-        assert_eq!(row_count(&dir, "seen"), legacy.seen.len() as i64);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn legacy_ledger_read_error_is_retried_not_discarded() {
-        // E.g. a sharing violation from an antivirus at first start; here a
-        // directory in its place.
-        let dir = tmpdir("legacy-io");
-        fs::create_dir_all(dir.join("ledger.json")).unwrap();
-        let mut l = Ledger::load(db(&dir));
-        assert!(l.needs_load());
-        assert!(!dir.join("ledger.json.bak").exists());
-        fs::remove_dir_all(dir.join("ledger.json")).unwrap();
-        let mut legacy = Ledger::default();
-        legacy.totals.prompts = 9;
-        legacy.seen.insert(7);
-        legacy.write_legacy(&dir, true);
-        assert!(l.retry_load());
-        assert_eq!((l.totals.prompts, l.seen.len()), (9, 1));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn legacy_seen_bin_read_error_is_retried_not_discarded() {
-        let (dir, legacy) = legacy_fixture("legacy-seen-io");
-        fs::remove_file(dir.join("seen.bin")).unwrap();
-        fs::create_dir_all(dir.join("seen.bin")).unwrap();
-        let mut l = Ledger::load(db(&dir));
-        assert!(l.needs_load(), "only a missing seen.bin means no ids");
-        assert!(dir.join("ledger.json").exists() && !dir.join("seen.bin.bak").exists());
-        // The aborted import left an empty database: status still shows the
-        // legacy stats, not zeros.
-        assert!(db(&dir).exists());
-        let s = load_stats(&db(&dir)).unwrap();
-        assert_eq!((s.totals, s.days), (legacy.totals.clone(), legacy.days.clone()));
-        fs::remove_dir_all(dir.join("seen.bin")).unwrap();
-        legacy.write_legacy(&dir, true);
-        assert!(l.retry_load());
-        assert_same(&l, &legacy);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn unreadable_legacy_ledger_starts_fresh() {
-        for (name, json) in [("legacy-v99", r#"{"version":99,"totals":{},"days":[],"files":{}}"#), ("legacy-bad", "{")]
-        {
-            let dir = tmpdir(name);
-            fs::write(dir.join("ledger.json"), json).unwrap();
-            fs::write(dir.join("seen.bin"), [0u8; 8]).unwrap();
-            let mut l = Ledger::load(db(&dir));
-            assert!(!l.needs_load());
-            assert_eq!(l.totals, Totals::default());
-            assert!(l.seen.is_empty(), "ids without their totals are not imported");
-            assert!(dir.join("ledger.json.bak").exists(), "kept, out of the way");
-            l.save().unwrap();
-            assert_eq!(Ledger::load(db(&dir)).totals, Totals::default());
-            let _ = fs::remove_dir_all(&dir);
-        }
     }
 
     #[test]

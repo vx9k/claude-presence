@@ -18,11 +18,11 @@ In the data dir (`claude-presence status` prints `stats:` path):
 | `ledger.db` | The ledger: one SQLite database. `claude-presence status` prints its path on the `stats:` line |
 | `ledger.db-journal` | SQLite's rollback journal; exists only while a save is in progress (or after a crash, until the next open) |
 | `ledger.db.corrupt` (and `ledger.db.corrupt-journal`) | A database SQLite reported as corrupt, moved aside so stats can be rebuilt. Kept for inspection; safe to delete |
-| `ledger.json.bak`, `seen.bin.bak` | The previous release's files, renamed after their one-time import (see [Migration](#migration-from-ledgerjson-and-seenbin)) |
+| `ledger.json(.bak)`, `seen.bin(.bak)` | Stats from releases before 0.2.0. Ignored (see [Older ledgers](#older-ledgers)); safe to delete |
 
 The database is opened only for one load or one save and closed again; the daemon holds no connection or lock between them. It is a plain SQLite 3 file (journal mode default, `synchronous = FULL`), so any SQLite tool can read it, for example `sqlite3 ledger.db 'select * from totals'` (read-only use only while the daemon is not saving).
 
-`claude-presence uninstall --purge` deletes the whole data dir, including all of the files above. To rebuild the stats by hand, stop the daemon, delete `ledger.db` (and any `ledger.db-journal`), and start it again: it rebuilds from the transcripts still on disk (older, deleted transcripts are lost). Do not delete `ledger.db` alone while `ledger.json`/`seen.bin` still exist: they would be imported again.
+`claude-presence uninstall --purge` deletes the whole data dir, including all of the files above. To rebuild the stats by hand, stop the daemon, delete `ledger.db` (and any `ledger.db-journal`), and start it again: it rebuilds from the transcripts still on disk (older, deleted transcripts are lost).
 
 ## Schema
 
@@ -113,26 +113,11 @@ Ids are stored as 64-bit hashes (FNV-1a with a splitmix finalizer) of the `messa
 | `ledger.db` deleted while the daemon runs | The next save recreates it in full from memory (every row). |
 | `ledger.db` appears after the daemon started without one (another writer, a restored backup) | The save refuses with `error: saving stats: <path> was created by someone else; loading it instead of saving`; the next 60 s attempt loads it as above. Test `db_created_meanwhile_is_loaded_not_overwritten`. |
 
-`claude-presence status` reads the database read-only (it never creates, migrates or locks it for writing). If the database is busy, unreadable or from a newer version it prints `stats unavailable: <error>` instead of the stats lines, rather than showing zeros. If `ledger.db` has not been migrated yet (it does not exist, or is still empty because an import was rolled back), it shows the stats from a legacy `ledger.json`, if there is one.
+`claude-presence status` reads the database read-only (it never creates, migrates or locks it for writing). If the database is busy, unreadable or from a newer version it prints `stats unavailable: <error>` instead of the stats lines, rather than showing zeros. If `ledger.db` does not exist yet, it shows zeros.
 
-## Migration from `ledger.json` and `seen.bin`
+## Older ledgers
 
-Releases before `ledger.db` kept stats in `ledger.json` (JSON, version `1`) and `seen.bin` (little-endian `u64` ids). On the first daemon start with the new release, and only if `ledger.db` is new (`user_version` 0):
-
-1. the legacy files next to it are read: `ledger.json` (log `info: imported <path>`), and `seen.bin` (a torn trailing partial id is dropped);
-2. everything is written to `ledger.db` in one transaction, and `user_version` is set last. If the daemon dies before the commit, the next start imports again;
-3. after the commit, `ledger.json` and `seen.bin` are renamed to `ledger.json.bak` and `seen.bin.bak`. A rename failure logs `warn: <path>: <error>` and is harmless.
-
-Edge cases:
-
-| Case | Outcome |
-|---|---|
-| `ledger.json` unparsable or not version `1` | `warn: <path>: <error>; rebuilding stats`: the stats are rebuilt from transcripts, and the files are still renamed `.bak` |
-| `ledger.json` or `seen.bin` exists but cannot be read (e.g. locked by an antivirus or sync client) | The import is rolled back and nothing is renamed: `warn: <path>: <error>; stats will load later`, retried every 60 s like a busy database |
-| `seen.bin` missing while `ledger.json` has tracked files | `warn: <seen.bin path>: <error>; previously counted ids are forgotten`. Known transcripts keep their offsets and a re-read of one re-records its ids without counting them again; a copy of forgotten history in a new transcript (`--resume`) counts again |
-| Neither legacy file nor database | Empty ledger; the first scan builds it and the first save creates `ledger.db` |
-
-**Going back to an older release:** it cannot read `ledger.db`. The `.bak` files are a snapshot from the moment of the migration. To downgrade, stop the daemon, rename `ledger.json.bak` to `ledger.json` and `seen.bin.bak` to `seen.bin`, delete or move aside `ledger.db`, and install the older release. Stats counted after the migration are not in the `.bak` files, so they are missing from the downgraded totals. If you do not downgrade, you can delete the `.bak` files at any time: nothing reads them.
+Releases before 0.2.0 kept stats in `ledger.json` and `seen.bin`, and 0.2.0 imported them once into `ledger.db` (renaming them `*.bak`). Later releases no longer read them: if `ledger.db` does not exist yet, it is rebuilt from the transcripts still on disk, so stats from deleted transcripts are lost when upgrading straight from a release before 0.2.0. Leftover files are left alone and are safe to delete.
 
 ## Arithmetic
 
