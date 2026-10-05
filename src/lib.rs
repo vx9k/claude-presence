@@ -13,3 +13,5 @@ pub mod paths;
 pub mod presence;
 pub mod state;
 pub mod timeutil;
+#[cfg(feature = "tui")]
+pub mod tui;
