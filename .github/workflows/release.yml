@@ -1,0 +1,209 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  # Dry run: builds, tests and packages every target without publishing.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Third-party actions are pinned by commit; the comment names the release.
+# No build cache: release artifacts are built from a clean state.
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The tag must match Cargo.toml, and CHANGELOG.md must have a section for
+      # it; that section becomes the release notes.
+      - id: check
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=$(awk -F'"' '/^\[/ { pkg = ($0 == "[package]") } pkg && /^version *=/ { print $2; exit }' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "::error::no version in Cargo.toml [package]"; exit 1
+          fi
+          if [ "$EVENT" = push ]; then
+            if [ "$REF_TYPE" != tag ] || [ "$REF_NAME" != "v$version" ]; then
+              echo "::error::tag '$REF_NAME' does not match Cargo.toml version 'v$version'"; exit 1
+            fi
+          fi
+          # Body of `## [X.Y.Z]...` up to the next `## ` heading.
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q "^## \[$(printf '%s' "$version" | sed 's/[.]/\\./g')\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$version]' section"; exit 1
+          fi
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::CHANGELOG.md section for $version is empty"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # Notes and installers go to the publish job, which never checks out code.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-meta
+          path: |
+            release-notes.md
+            scripts/install.sh
+            scripts/install.ps1
+          if-no-files-found: error
+
+  build:
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04, test: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, test: true }
+          - { target: aarch64-apple-darwin, os: macos-latest, test: true }
+          # Cross-compiled on the arm64 runner (clang handles both arches);
+          # not tested, since Rosetta isn't guaranteed on the runner.
+          - { target: x86_64-apple-darwin, os: macos-latest, test: false }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, test: true }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm, test: true }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.guard.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      # Static musl binaries; bundled SQLite is compiled with musl-gcc.
+      - if: contains(matrix.target, 'linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
+      - run: cargo build --release --locked --target "$TARGET"
+      - if: matrix.test
+        run: cargo test --locked --target "$TARGET"
+      # crt-static (.cargo/config.toml): no Visual C++ runtime DLL dependency.
+      - if: contains(matrix.target, 'windows')
+        name: Check for a static C runtime
+        run: |
+          vswhere="${PROGRAMFILES} (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+          dumpbin=$("$vswhere" -latest -products '*' -find 'VC/Tools/MSVC/**/dumpbin.exe' | head -n 1 | tr -d '\r')
+          [ -n "$dumpbin" ] || { echo "::error::dumpbin not found"; exit 1; }
+          for exe in claude-presence claude-presenced; do
+            deps=$("$dumpbin" -nologo -dependents "target/$TARGET/release/$exe.exe")
+            echo "$deps"
+            if echo "$deps" | grep -Eiq 'vcruntime|msvcp|api-ms-win-crt|ucrtbase'; then
+              echo "::error::$exe.exe links the C runtime dynamically"; exit 1
+            fi
+          done
+      - name: Package
+        run: |
+          name="claude-presence-$VERSION-$TARGET"
+          bin="target/$TARGET/release"
+          mkdir -p dist stage
+          case "$TARGET" in
+            *windows*)
+              cp "$bin/claude-presence.exe" "$bin/claude-presenced.exe" LICENSE README.md CHANGELOG.md stage/
+              pwsh -NoProfile -Command "Compress-Archive -Path stage/* -DestinationPath dist/$name.zip"
+              ;;
+            *)
+              cp "$bin/claude-presence" "$bin/claude-presenced" LICENSE README.md CHANGELOG.md stage/
+              # COPYFILE_DISABLE: no AppleDouble `._*` entries from macOS tar.
+              COPYFILE_DISABLE=1 tar -C stage -czf "dist/$name.tar.gz" .
+              ;;
+          esac
+          ls -l dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [guard, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.guard.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-meta
+          path: meta
+      - name: Checksums
+        run: |
+          cp meta/scripts/install.sh meta/scripts/install.ps1 dist/
+          cd dist
+          sha256sum -- *.tar.gz *.zip install.sh install.ps1 > SHA256SUMS
+          cat SHA256SUMS
+      # Keyless Sigstore signature over SHA256SUMS (identity: this workflow at
+      # the tag), checked by the installers when cosign is available. Each
+      # run signs afresh into a clean dist/, so a re-run just replaces it.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign checksums
+        run: cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/install.sh
+            dist/install.ps1
+            dist/SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # dist/* includes SHA256SUMS.sigstore.json. A re-run (e.g. after a
+          # failed upload) replaces the assets, signature included.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/*
+            exit 0
+          fi
+          flags=()
+          case "$VERSION" in *-*) flags+=(--prerelease) ;; esac
+          # Don't move "latest" (which the installers download) back to a
+          # patch release of an older line.
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          latest=${latest#v}
+          if [ -n "$latest" ] && [ "$latest" != "$VERSION" ] &&
+            [ "$(printf '%s\n%s\n' "$VERSION" "$latest" | sort -V | tail -n 1)" = "$latest" ]; then
+            flags+=(--latest=false)
+          fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag "${flags[@]}" \
+            --title "claude-presence $VERSION" --notes-file meta/release-notes.md dist/*
