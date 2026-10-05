@@ -72,7 +72,8 @@ fn quote(p: &Path) -> String {
     let s = p.to_string_lossy();
     #[cfg(windows)]
     let s = s.replace('\\', "/");
-    format!("\"{s}\"")
+    // Single quotes: bash expands `$` and backticks inside double quotes.
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 pub fn hook_command(exe: &Path, event: &str) -> String {
@@ -84,16 +85,20 @@ fn is_ours(h: &Value) -> bool {
 }
 
 /// Remove our hook entries from a settings value, dropping emptied groups.
-fn strip_hooks(settings: &mut Value) {
-    let Some(obj) = settings.as_object_mut() else { return };
+/// Removes our hook entries; true if there were any.
+fn strip_hooks(settings: &mut Value) -> bool {
+    let Some(obj) = settings.as_object_mut() else { return false };
     let Some(hooks) = obj.get_mut("hooks").and_then(Value::as_object_mut) else {
-        return;
+        return false;
     };
+    let mut removed = false;
     hooks.retain(|_, groups| {
         let Some(groups) = groups.as_array_mut() else { return true };
         for g in groups.iter_mut() {
             if let Some(list) = g.get_mut("hooks").and_then(Value::as_array_mut) {
+                let n = list.len();
                 list.retain(|h| !is_ours(h));
+                removed |= list.len() != n;
             }
         }
         groups.retain(|g| g.get("hooks").and_then(Value::as_array).is_none_or(|l| !l.is_empty()));
@@ -102,6 +107,7 @@ fn strip_hooks(settings: &mut Value) {
     if hooks.is_empty() {
         obj.remove("hooks");
     }
+    removed
 }
 
 fn parse(settings: &str) -> io::Result<Value> {
@@ -148,18 +154,27 @@ pub fn wire_hooks(settings: &str, exe: &Path) -> io::Result<String> {
     pretty(&v)
 }
 
-pub fn unwire_hooks(settings: &str) -> io::Result<String> {
+/// The settings without our hooks, or `None` if there were none (so a file
+/// we never touched isn't reformatted).
+pub fn unwire_hooks(settings: &str) -> io::Result<Option<String>> {
     let mut v = parse(settings)?;
-    strip_hooks(&mut v);
-    pretty(&v)
+    if !strip_hooks(&mut v) {
+        return Ok(None);
+    }
+    pretty(&v).map(Some)
 }
 
 fn write_atomic(path: &Path, data: &str) -> io::Result<()> {
+    // Write through a symlink (dotfile managers) and keep the file's mode.
+    let path = &fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     if let Some(d) = path.parent() {
         fs::create_dir_all(d)?;
     }
     let tmp = path.with_extension("tmp-claude-presence");
     fs::write(&tmp, data)?;
+    if let Ok(m) = fs::metadata(path) {
+        fs::set_permissions(&tmp, m.permissions())?;
+    }
     fs::rename(&tmp, path)
 }
 
@@ -187,12 +202,9 @@ pub fn uninstall_hooks() -> io::Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
-    let next = unwire_hooks(&current)?;
-    if next.trim() != current.trim() {
-        write_atomic(&path, &next)?;
-        return Ok(true);
-    }
-    Ok(false)
+    let Some(next) = unwire_hooks(&current)? else { return Ok(false) };
+    write_atomic(&path, &next)?;
+    Ok(true)
 }
 
 // ----------------------------------------------------------------- services --
@@ -686,7 +698,8 @@ pub fn stop_daemons() -> Vec<String> {
     let sock = paths::hook_socket();
     // TODO: drop the legacy path a couple of releases after the private
     // socket dir shipped.
-    let legacy = paths::legacy_hook_socket().filter(|old| *old != sock && old.exists());
+    // No `exists()` probe: on Windows it would open (connect to) the pipe.
+    let legacy = paths::legacy_hook_socket().filter(|old| *old != sock);
     for addr in std::iter::once(sock.clone()).chain(legacy) {
         match stop_daemon(&addr, Duration::from_secs(2)) {
             Some(true) => done.push("stopped the running daemon".into()),
@@ -998,6 +1011,37 @@ mod tests {
     const NO_EXPAND: Expand<'static> = &no_expand;
 
     #[test]
+    fn hook_command_is_single_quoted() {
+        // bash expands `$` and backticks inside double quotes.
+        assert_eq!(hook_command(Path::new("/home/jo$h/it's/cp"), "Stop"), r"'/home/jo$h/it'\''s/cp' hook Stop");
+    }
+
+    #[test]
+    fn unwire_leaves_foreign_settings_alone() {
+        let s =
+            "{\n    \"hooks\": {\"Stop\": [{\"hooks\": [{\"type\": \"command\", \"command\": \"notify-send\"}]}]}\n}";
+        assert_eq!(unwire_hooks(s).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_keeps_symlinks_and_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = std::env::temp_dir().join(format!("cp-install-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (real, link) = (dir.join("real.json"), dir.join("settings.json"));
+        fs::write(&real, "{}").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&real, &link).unwrap();
+        write_atomic(&link, "{\"a\":1}").unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(&real).unwrap(), "{\"a\":1}");
+        assert_eq!(fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn path_entries_compare_unquoted_and_expanded() {
         let dir = r"C:\Users\me\AppData\Local\Programs\claude-presence";
         fn expand(s: &str) -> Cow<'_, str> {
@@ -1140,10 +1184,7 @@ mod tests {
         }
         // The user's own Stop hook survives, ours is added beside it.
         assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            v["hooks"]["Stop"][1]["hooks"][0]["command"].as_str(),
-            Some("\"/opt/bin/claude-presence\" hook Stop")
-        );
+        assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["command"].as_str(), Some("'/opt/bin/claude-presence' hook Stop"));
         // Key order is preserved.
         let pos = |k: &str| wired.find(k).unwrap();
         assert!(pos("\"model\"") < pos("\"hooks\"") && pos("\"hooks\"") < pos("\"permissions\""));
@@ -1154,14 +1195,14 @@ mod tests {
         assert_eq!(again, wired);
 
         // Uninstall restores the user's hooks only.
-        let un = unwire_hooks(&wired).unwrap();
+        let un = unwire_hooks(&wired).unwrap().unwrap();
         let v: Value = serde_json::from_str(&un).unwrap();
         assert_eq!(v["hooks"].as_object().unwrap().len(), 1);
         assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str(), Some("notify-send done"));
 
         // Empty settings.
         let fresh = wire_hooks("", exe).unwrap();
-        let un = unwire_hooks(&fresh).unwrap();
+        let un = unwire_hooks(&fresh).unwrap().unwrap();
         assert_eq!(un.trim(), "{}");
     }
 
@@ -1180,7 +1221,7 @@ mod tests {
         }
         assert_eq!(
             v["hooks"]["PostToolUseFailure"][0]["hooks"][0]["command"].as_str(),
-            Some("\"/opt/bin/claude-presence\" hook PostToolUseFailure")
+            Some("'/opt/bin/claude-presence' hook PostToolUseFailure")
         );
     }
 
