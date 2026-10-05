@@ -24,6 +24,8 @@ Event names starting with `__` are reserved (`ipc::is_control`).
 | Event | Effect | Sent by |
 |---|---|---|
 | `__shutdown` | Daemon stops cleanly like SIGTERM (log `shutdown requested`) | `install`, `uninstall` (`install::stop_daemon`) |
+| `__reload` | Daemon reloads `config.toml` like SIGHUP | `tui` (`r` on the Config tab) |
+| `__state` | Daemon replies with one JSON line (`state::StateSnapshot`, ≤ 64 KiB: project names, never paths, prompts or tool input), then closes. The client applies the same endpoint/owner checks as hooks before trusting it | `tui`, about once a second while open |
 | any other `__...` | Ignored (debug log `ignoring control event`) | nobody; older daemons ignore newer controls |
 
 `claude-presence hook __shutdown` does not forward: the hook command drains stdin and exits 0, so a `settings.json` entry cannot stop the daemon. The control check looks at the first line only, so a payload containing `"hook_event_name":"__shutdown"` is a normal hook.

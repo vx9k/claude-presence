@@ -20,7 +20,9 @@ A lean alternative to the Node.js [claude-rpc](https://github.com/rar-file/claud
    `serde`, `toml`, `serde_json` (install-time `settings.json` editing only,
    for key-order preservation), `rusqlite` (`bundled`, no default features;
    ledger persistence; extensions trimmed via `LIBSQLITE3_FLAGS` in
-   `.cargo/config.toml`), `libc` (unix), `windows-sys` (windows).
+   `.cargo/config.toml`), `libc` (unix), `windows-sys` (windows), `ratatui` (optional `tui` feature,
+   default on; only the `tui` command uses it — the daemon binary stays the
+   same size).
 
 ## Layout
 
@@ -39,6 +41,8 @@ A lean alternative to the Node.js [claude-rpc](https://github.com/rar-file/claud
 | `src/paths.rs` | Per-OS directories and socket/pipe names |
 | `src/timeutil.rs` | Time helpers (RFC 3339 parsing, local offset, formatting) |
 | `src/log.rs` | Minimal leveled logger (`CLAUDE_PRESENCE_LOG`) |
+| `src/state.rs` | `__state` snapshot (JSON, ≤ 64 KiB) the daemon builds for the TUI |
+| `src/tui/` | `claude-presence tui`: pure `app` (state/keys) and `ui` (drawing, `TestBackend` tests); `run` owns the terminal and the poll thread |
 | `docs/` | In-depth docs: architecture, IPC/security, ledger, config, services, troubleshooting, development |
 | `TODO.md` | Handoff: open audit findings and verification status |
 

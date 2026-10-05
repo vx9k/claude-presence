@@ -159,7 +159,7 @@ Every commit, and every PR title, strictly follows
   A commit that fixes a bug and adds its test is `fix`, not `test`.
 - **scope** (optional): the module or area, lowercase: `daemon`, `discord`,
   `ipc`, `ledger`, `presence`, `config`, `install`, `git`, `paths`, `log`,
-  `timeutil`, `cli` (`src/main.rs`), `deps`, `agents`. Omit it when a change
+  `timeutil`, `state`, `tui`, `cli` (`src/main.rs`), `deps`, `agents`. Omit it when a change
   spans many areas.
 - **`!`** after the type/scope, plus a `BREAKING CHANGE: <what and how to
   migrate>` footer, when a change breaks users: the hook wire format, the

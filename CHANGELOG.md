@@ -14,8 +14,11 @@ tag without that section and publishes its body as the release notes.
 
 ### Added
 
-- `claude-presence tui`: a terminal dashboard showing the daemon's live
-  sessions and lifetime stats (in progress).
+- `claude-presence tui`: a terminal dashboard with the daemon and Discord
+  status, the current card, live sessions, lifetime stats with 60-day
+  charts, and the config file (with a reload key). Falls back to the stats
+  on disk when the daemon is down. Build without it with
+  `--no-default-features`.
 - `__state` and `__reload` control messages on the hook channel: `__state`
   returns a JSON snapshot of the daemon's sessions, `__reload` reloads the
   config like SIGHUP (which Windows lacks). Like `__shutdown`, they are sent

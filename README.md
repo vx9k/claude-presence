@@ -65,6 +65,7 @@ Details: [docs/services.md](docs/services.md#reinstall-and-upgrade).
 | `claude-presence install [--init <kind>] [--no-service] [--no-hooks] [--no-path]` | Set everything up (see above) |
 | `claude-presence uninstall [--purge]` | Remove hooks, service and (Windows) the `PATH` entry; `--purge` also deletes config and lifetime stats |
 | `claude-presence status` | Daemon state, file locations, today/lifetime stats. Exit code 3 if the daemon is not running |
+| `claude-presence tui` | Live dashboard: daemon and Discord status, the current card, sessions, 60-day charts, and the config (`r` reloads it). Works with the daemon down too (stats from disk). `?` lists the keys |
 | `claude-presence daemon` | Run the daemon in the foreground (for debugging) |
 | `claude-presence config` | Print the config file path |
 | `claude-presence hook <Event>` | Used by Claude Code; you never run this yourself |
