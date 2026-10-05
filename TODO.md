@@ -7,7 +7,7 @@ Work items are ordered by priority. Delete an entry once its fix is merged.
 ## Status
 
 - CI (fmt, clippy, test, release build on Linux/macOS/Windows) is green.
-  Unit tests: 174 on Windows (socket and POSIX permission tests
+  Unit tests: 177 on Windows (socket and POSIX permission tests
   are Unix-only; named pipe tests Windows-only).
 - **Verified on Windows by hand:** `install` (Task Scheduler), `status`, the
   hook named pipe, connecting to Discord and setting an activity (via a
@@ -31,8 +31,10 @@ Work items are ordered by priority. Delete an entry once its fix is merged.
   quirks: `counts_incrementally_and_dedups` (not rechecked since the Windows
   `file_ident` moved to the file id),
   `our_pipe_passes_the_owner_check` and `a_fake_discord_cannot_impersonate_us`.
-- **Not yet verified anywhere real:** a full local Claude Code session
-  driving the card end-to-end on Windows/macOS; OpenRC and dinit services;
+- A local Claude Code session (desktop app, Code tab) drives the daemon on
+  Windows: hooks arrive and the card is built (`__state`), Discord was not
+  running at the time. **Not yet verified anywhere real:** a full session
+  showing the card in Discord on Windows/macOS; OpenRC and dinit services;
   launchd; the Run-key fallback.
 - Only **local** Claude Code sessions can be shown (CLI, or the desktop app's
   Code tab using the local machine). Cloud sessions run hooks in a remote
