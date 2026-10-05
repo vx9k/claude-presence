@@ -46,13 +46,6 @@ Line numbers are approximate.
 
 ### Low / unverified
 
-21. **Drop the legacy ledger import** (`src/ledger.rs` `import_legacy`,
-    `read_legacy`, `Stored`, `LEGACY_*`, and `load_stats`' legacy
-    fallback): a couple of releases after `ledger.db` shipped, stop reading
-    `ledger.json`/`seen.bin` (users who skipped those releases rebuild from
-    the transcripts still on disk). The `*.bak` files can then be ignored
-    or removed by `uninstall --purge` (already covered: it deletes the
-    whole data dir).
 22. **SQLite trim flags verified on Windows MSVC only**
     (`.cargo/config.toml` `LIBSQLITE3_FLAGS`): `-U` after
     libsqlite3-sys's `-D`s works with cl.exe (tests pass, ~650 KB

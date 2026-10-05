@@ -33,7 +33,7 @@ A lean alternative to the Node.js [claude-rpc](https://github.com/rar-file/claud
 | `src/daemon.rs` | Event loop, session state machine, card rendering, signals |
 | `src/discord.rs` | Discord IPC client + worker thread with rate limiting/coalescing |
 | `src/ipc.rs` | Hook → daemon channel: Unix socket (0600) / local named pipe |
-| `src/ledger.rs` | Incremental transcript parsing, lifetime stats, delta saves to SQLite `ledger.db`, one-time legacy `ledger.json` import |
+| `src/ledger.rs` | Incremental transcript parsing, lifetime stats, delta saves to SQLite `ledger.db` |
 | `src/presence.rs` | Template rendering and the activity payload |
 | `src/config.rs` | `config.toml` schema, defaults and `DEFAULT_TOML` (keep in sync — a test enforces it) |
 | `src/install.rs` | `settings.json` hook wiring and per-user services |
@@ -93,9 +93,9 @@ checks and the ledger's crash rules is in
   only `NotFound` means "nothing there") is never written, nor is one that
   appeared after a start without one; the daemon retries the load every
   60 s. A corrupt db is moved to `ledger.db.corrupt`; a
-  `user_version` above ours is never written. A legacy `ledger.json` +
-  `seen.bin` is imported once (same transaction that sets `user_version`)
-  and renamed `*.bak`. u64s are stored bit-cast to i64. Token arithmetic
+  `user_version` above ours is never written. A pre-0.2 `ledger.json` /
+  `seen.bin` is no longer imported (it is ignored and left alone). u64s
+  are stored bit-cast to i64. Token arithmetic
   saturates. Bump `DB_VERSION` in `src/ledger.rs` on incompatible changes.
 - **Discord rate limit:** ≤ 4 `SET_ACTIVITY` per 20 s, ≥ 4 s apart; bursts
   coalesce to the latest state. All Discord I/O stays on its worker thread.
