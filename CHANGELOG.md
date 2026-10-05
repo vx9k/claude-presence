@@ -12,6 +12,12 @@ tag without that section and publishes its body as the release notes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `ledger.json` / `seen.bin` from releases before 0.2.0 are
+  no longer imported. Upgrading straight from such a release rebuilds the
+  stats from the transcripts still on disk.
+
 ## [0.2.0] - 2026-10-05
 
 ### Added

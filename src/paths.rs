@@ -48,8 +48,7 @@ pub fn config_file() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-/// The lifetime stats database (legacy `ledger.json`/`seen.bin` next to it
-/// are imported by `ledger`).
+/// The lifetime stats database.
 pub fn ledger_file() -> PathBuf {
     data_dir().join("ledger.db")
 }
