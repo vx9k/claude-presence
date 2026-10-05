@@ -12,6 +12,8 @@ tag without that section and publishes its body as the release notes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-05
+
 ### Added
 
 - `claude-presence tui`: a terminal dashboard with the daemon and Discord
@@ -50,3 +52,7 @@ tag without that section and publishes its body as the release notes.
 ### Fixed
 
 - No more spurious warning about a missing `seen.bin`.
+- `{prompts}` counts the prompt of the running turn exactly once until
+  `Stop`: it no longer sticks at +1 after a custom slash command, now
+  applies in resumed sessions, and stays during notifications and
+  compaction.
