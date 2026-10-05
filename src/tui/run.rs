@@ -104,17 +104,20 @@ fn decode(code: KeyCode, m: KeyModifiers) -> Option<Key> {
 }
 
 /// The poll thread: a snapshot every `POLL` (unless paused), or at once on
-/// `Refresh`; `Reload` re-reads the config and asks the daemon to reload.
-/// Ends when the UI is gone.
+/// `Refresh` (even while paused); `Reload` re-reads the config and asks the
+/// daemon to reload. Ends when the UI is gone.
 fn poller(cmds: &Receiver<Cmd>, out: &Sender<Update>, paused: &AtomicBool) {
     let _ = out.send(Update::Config(read_config()));
     let send = |u| out.send(u).is_ok();
+    let mut now = true;
     loop {
-        if !paused.load(Ordering::Relaxed) && !send(poll()) {
+        if (now || !paused.load(Ordering::Relaxed)) && !send(poll()) {
             return;
         }
+        now = false;
         match cmds.recv_timeout(POLL) {
-            Ok(Cmd::Refresh) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(Cmd::Refresh) => now = true,
+            Err(RecvTimeoutError::Timeout) => {}
             Ok(Cmd::Reload) => {
                 let (addr, private) = paths::hook_endpoint();
                 let note = match ipc::send_reload(&addr, private) {

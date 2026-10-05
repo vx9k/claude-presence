@@ -20,6 +20,8 @@ pub fn draw(f: &mut Frame, app: &App, pal: &Palette) {
     let [head, body, foot] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
     header(f, head, app, pal);
+    // Tabs that scroll set their own limit while drawing.
+    app.scroll_max.set(0);
     match app.tab {
         Tab::Overview => overview(f, body, app, pal),
         Tab::Sessions => sessions(f, body, app, pal),
@@ -175,7 +177,9 @@ fn sessions(f: &mut Frame, area: Rect, app: &App, pal: &Palette) {
         return f.render_widget(p.block(block("Sessions", pal)), area);
     };
     let visible = area.height.saturating_sub(3) as usize;
-    let skip = (app.scroll as usize).min(snap.sessions.len().saturating_sub(visible));
+    let last = snap.sessions.len().saturating_sub(visible);
+    app.scroll_max.set(u16::try_from(last).unwrap_or(u16::MAX));
+    let skip = (app.scroll as usize).min(last);
     let rows = snap.sessions.iter().skip(skip).map(|s| session_row(s, snap.now_ms, pal));
     let widths = [
         Constraint::Length(1),
@@ -260,6 +264,7 @@ fn config(f: &mut Frame, area: Rect, app: &App, pal: &Palette) {
     }
     let visible = area.height.saturating_sub(2);
     let max = u16::try_from(lines.len()).unwrap_or(u16::MAX).saturating_sub(visible);
+    app.scroll_max.set(max);
     let title = crate::paths::config_file();
     let title = title.display().to_string();
     f.render_widget(Paragraph::new(lines).scroll((app.scroll.min(max), 0)).block(block(&title, pal)), area);
@@ -401,6 +406,18 @@ mod tests {
         assert!(s.contains("below the minimum") && s.contains("[status.idle]"), "{s}");
         a.scroll = u16::MAX; // clamped: the last line stays visible
         assert!(render(&a, 80, 10).contains("details"));
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_end() {
+        use crate::tui::app::Key;
+        let mut a = App { tab: Tab::Config, ..App::default() };
+        a.apply(Update::Config(Some("a = 1\nb = 2\nc = 3\nd = 4\ne = 5\n".into())));
+        render(&a, 40, 7); // 3 visible of 5 lines: max 2
+        a.key(Key::Char('G'));
+        assert_eq!(a.scroll, 2);
+        a.key(Key::Char('k'));
+        assert_eq!(a.scroll, 1, "the way back is immediate");
     }
 
     #[test]

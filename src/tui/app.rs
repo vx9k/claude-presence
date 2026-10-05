@@ -97,6 +97,8 @@ pub struct App {
     pub config_notes: Vec<String>,
     /// Scroll offset of the Sessions and Config tabs.
     pub scroll: u16,
+    /// The furthest `scroll` can go, as the last draw found it.
+    pub scroll_max: std::cell::Cell<u16>,
     pub help: bool,
     pub paused: bool,
     pub note: Option<String>,
@@ -112,6 +114,7 @@ impl Default for App {
             config: None,
             config_notes: Vec::new(),
             scroll: 0,
+            scroll_max: std::cell::Cell::new(u16::MAX),
             help: false,
             paused: false,
             note: None,
@@ -184,6 +187,8 @@ impl App {
             Key::Char('r') => return Command::Refresh,
             Key::Char(_) => {}
         }
+        // `G` and long scrolls stop at the end, so the way back is immediate.
+        self.scroll = self.scroll.min(self.scroll_max.get());
         Command::None
     }
 
