@@ -46,10 +46,6 @@ Line numbers are approximate.
 
 ### Low / unverified
 
-16. **Windows `file_ident` fallback is only type-checked**
-    (`src/ledger.rs`): when `FileIdInfo` fails, the identity comes from
-    `GetFileInformationByHandle` (`fold_index`, unit-tested). Not run on a
-    file system without `FileIdInfo` (FAT, some network shares).
 21. **Drop the legacy ledger import** (`src/ledger.rs` `import_legacy`,
     `read_legacy`, `Stored`, `LEGACY_*`, and `load_stats`' legacy
     fallback): a couple of releases after `ledger.db` shipped, stop reading
