@@ -6,8 +6,11 @@
 //! user on Windows.
 //!
 //! Event names starting with `__` are reserved for control messages sent by
-//! claude-presence itself (`__shutdown`); the `hook` command never forwards
-//! them.
+//! claude-presence itself (`__shutdown`, `__reload`, `__state`); the `hook`
+//! command never forwards them. Control messages have no body. `__state` is
+//! the one request with a reply: the daemon writes one JSON line back
+//! (`state::StateSnapshot`, at most `MAX_STATE` bytes) and closes; an older
+//! daemon closes without a word.
 
 use std::io;
 use std::path::Path;
@@ -15,8 +18,34 @@ use std::path::Path;
 /// Largest message the daemon accepts (Write tool payloads carry file contents).
 pub const MAX_MSG: usize = 16 << 20;
 
+/// Largest `__state` reply, newline included; clients refuse anything longer.
+pub const MAX_STATE: usize = 64 << 10;
+
 /// Control event: stop the daemon cleanly, like SIGTERM.
 pub const SHUTDOWN: &str = "__shutdown";
+
+/// Control event: reload `config.toml`, like SIGHUP (which Windows lacks).
+pub const RELOAD: &str = "__reload";
+
+/// Control request: reply with the daemon's state snapshot.
+pub const STATE: &str = "__state";
+
+/// What a listener does after handing over a message.
+pub enum Action {
+    /// Close the connection and wait for the next one.
+    Continue,
+    /// Close the connection and stop serving.
+    Stop,
+    /// Write this back to the client, then close the connection.
+    Reply(Vec<u8>),
+}
+
+/// `true` keeps serving, `false` stops.
+impl From<bool> for Action {
+    fn from(keep: bool) -> Action {
+        if keep { Action::Continue } else { Action::Stop }
+    }
+}
 
 /// True for reserved control event names (`__` prefix).
 pub fn is_control(event: &[u8]) -> bool {
@@ -33,9 +62,41 @@ pub fn event_name(msg: &[u8]) -> &[u8] {
 
 /// The message asking a running daemon to shut down.
 pub fn shutdown_request() -> Vec<u8> {
-    let mut m = SHUTDOWN.as_bytes().to_vec();
+    control(SHUTDOWN)
+}
+
+/// The message asking a running daemon to reload its configuration.
+pub fn reload_request() -> Vec<u8> {
+    control(RELOAD)
+}
+
+/// The message asking a running daemon for its state snapshot.
+pub fn state_request() -> Vec<u8> {
+    control(STATE)
+}
+
+fn control(event: &str) -> Vec<u8> {
+    let mut m = event.as_bytes().to_vec();
     m.push(b'\n');
     m
+}
+
+/// Ask the daemon at `addr` to reload `config.toml`, with the same endpoint
+/// checks as hook events (`send_to`). An older daemon ignores it.
+pub fn send_reload(addr: &Path, in_private_dir: bool) -> io::Result<()> {
+    send_to(addr, in_private_dir, &reload_request())
+}
+
+/// A `__state` reply as read (at most `MAX_STATE + 1` bytes): the JSON line
+/// without its newline, `None` if the daemon closed without one (an older
+/// daemon, which ignores the request).
+fn parse_reply(buf: Vec<u8>) -> io::Result<Option<String>> {
+    if buf.len() > MAX_STATE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "state reply too large"));
+    }
+    let s = String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let line = s.trim_end();
+    Ok(if line.is_empty() { None } else { Some(line.to_owned()) })
 }
 
 // ------------------------------------------------------------------ client --
@@ -64,6 +125,29 @@ pub fn send_to(addr: &Path, in_private_dir: bool, msg: &[u8]) -> io::Result<()> 
         verify_private_dir(dir)?;
     }
     send(addr, msg)
+}
+
+/// Ask the daemon at `addr` for its state snapshot (one JSON line, see
+/// `state::StateSnapshot`), with the same fallback-dir check as `send_to`:
+/// the reply is trusted, so it must come from our own daemon. `None` if the
+/// daemon closed without replying (an older one). Each read and write gives
+/// up after `timeout`.
+#[cfg(unix)]
+pub fn query_state(addr: &Path, in_private_dir: bool, timeout: std::time::Duration) -> io::Result<Option<String>> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    if let (true, Some(dir)) = (in_private_dir, addr.parent()) {
+        verify_private_dir(dir)?;
+    }
+    let mut s = UnixStream::connect(addr)?;
+    s.set_write_timeout(Some(timeout))?;
+    s.set_read_timeout(Some(timeout))?;
+    s.write_all(&state_request())?;
+    // The daemon reads until end of input, as for hook events.
+    s.shutdown(std::net::Shutdown::Write)?;
+    let mut buf = Vec::with_capacity(4096);
+    s.take(MAX_STATE as u64 + 1).read_to_end(&mut buf)?;
+    parse_reply(buf)
 }
 
 /// What the `hook` command sends through: `send_to`, but when nothing
@@ -137,36 +221,112 @@ pub fn send_hook(
 #[cfg(windows)]
 pub fn send_to(addr: &Path, _in_private_dir: bool, msg: &[u8]) -> io::Result<()> {
     use std::io::Write;
+    use windows_sys::Win32::Foundation::GENERIC_WRITE;
+    let mut f = open_pipe(addr, GENERIC_WRITE)?;
+    check_pipe_owner(&f)?;
+    f.write_all(msg)
+}
+
+/// Fail unless the pipe `f` is connected to is owned by someone
+/// `pipe_owner_trusted` accepts.
+#[cfg(windows)]
+fn check_pipe_owner(f: &std::fs::File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
-    let mut f = open_pipe(addr)?;
     let owner = SecurityInfo::query(f.as_raw_handle(), windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION)?
         .owner_string()?;
     if !pipe_owner_trusted(&owner, &current_user_sid()?) {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "hook pipe owned by someone else"));
     }
-    f.write_all(msg)
+    Ok(())
 }
 
 #[cfg(windows)]
 pub fn send(addr: &Path, msg: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    open_pipe(addr)?.write_all(msg)
+    open_pipe(addr, windows_sys::Win32::Foundation::GENERIC_WRITE)?.write_all(msg)
 }
 
-/// Connect to the pipe at `addr` for writing, waiting while all instances
-/// are busy. `READ_CONTROL` lets `send_to` read the owner;
-/// `SECURITY_IDENTIFICATION` keeps the server from impersonating us.
+/// Ask the daemon at `addr` for its state snapshot (one JSON line, see
+/// `state::StateSnapshot`). Like `send_to`, only from a pipe whose owner
+/// checks out: the reply is trusted. `None` if the daemon closed without
+/// replying, or its pipe is inbound-only (both: an older daemon). Gives up
+/// after `timeout` without a complete reply.
+///
+/// The request has no end-of-input (a pipe can't be half-closed): the
+/// daemon stops reading at the newline. The reply is read as it arrives
+/// (`PeekNamedPipe`, so a stalled daemon can't block us past `timeout`)
+/// until the daemon disconnects, which it does once we have read it all.
 #[cfg(windows)]
-fn open_pipe(addr: &Path) -> io::Result<std::fs::File> {
+pub fn query_state(addr: &Path, _in_private_dir: bool, timeout: std::time::Duration) -> io::Result<Option<String>> {
+    use std::io::{Read, Write};
+    use std::os::windows::io::AsRawHandle;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE,
+    };
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    let deadline = Instant::now() + timeout;
+    let mut f = match open_pipe(addr, GENERIC_READ | GENERIC_WRITE) {
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => return Ok(None),
+        r => r?,
+    };
+    check_pipe_owner(&f)?;
+    f.write_all(&state_request())?;
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 16 * 1024];
+    while buf.len() <= MAX_STATE {
+        let mut avail = 0u32;
+        // SAFETY: `f` is an open pipe handle; no buffer is passed, only the
+        // byte count out-pointer, which is valid.
+        let ok = unsafe {
+            PeekNamedPipe(
+                f.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut avail,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let e = io::Error::last_os_error();
+            match e.raw_os_error().map(|c| c as u32) {
+                // The daemon is done (disconnected or closed its end).
+                Some(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED) => break,
+                _ => return Err(e),
+            }
+        }
+        if avail > 0 {
+            let want = (avail as usize).min(chunk.len()).min(MAX_STATE + 1 - buf.len());
+            // Doesn't block: at least `want` bytes are waiting.
+            let n = f.read(&mut chunk[..want])?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        } else if Instant::now() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "no state reply"));
+        } else {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    parse_reply(buf)
+}
+
+/// Connect to the pipe at `addr` with `access`, waiting while all instances
+/// are busy. `READ_CONTROL` is added so `check_pipe_owner` can read the
+/// owner; `SECURITY_IDENTIFICATION` keeps the server from impersonating us.
+#[cfg(windows)]
+fn open_pipe(addr: &Path, access: u32) -> io::Result<std::fs::File> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, GENERIC_WRITE};
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
     use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, SECURITY_IDENTIFICATION};
     use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
     let wide: Vec<u16> = addr.as_os_str().encode_wide().chain(Some(0)).collect();
     for _ in 0..10 {
         match std::fs::OpenOptions::new()
-            .access_mode(GENERIC_WRITE | READ_CONTROL)
+            .access_mode(access | READ_CONTROL)
             .security_qos_flags(SECURITY_IDENTIFICATION)
             .open(addr)
         {
@@ -195,6 +355,10 @@ pub fn daemon_running(addr: &Path) -> bool {
 }
 
 // ------------------------------------------------------------------ server --
+
+/// How long the Unix listener may spend writing a reply.
+#[cfg(unix)]
+const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// `Listener::bind`, but while another daemon still owns `addr` keep
 /// retrying for up to `wait`: on reinstall the old one may still be saving
@@ -335,9 +499,9 @@ impl Listener {
     }
 
     /// Accept connections forever, handing each complete message to `on_msg`
-    /// (which returns `false` to stop).
-    pub fn serve(self, mut on_msg: impl FnMut(Vec<u8>) -> bool) {
-        use std::io::Read;
+    /// (`false` or `Action::Stop` stops; `Action::Reply` is written back).
+    pub fn serve<A: Into<Action>>(self, mut on_msg: impl FnMut(Vec<u8>) -> A) {
+        use std::io::{Read, Write};
         use std::time::Duration;
         for conn in self.0.incoming() {
             let Ok(mut s) = conn else {
@@ -348,8 +512,17 @@ impl Listener {
             };
             let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
             let mut buf = Vec::with_capacity(4096);
-            if (&mut s).take(MAX_MSG as u64).read_to_end(&mut buf).is_ok() && !buf.is_empty() && !on_msg(buf) {
-                return;
+            if (&mut s).take(MAX_MSG as u64).read_to_end(&mut buf).is_err() || buf.is_empty() {
+                continue;
+            }
+            match on_msg(buf).into() {
+                Action::Continue => {}
+                Action::Stop => return,
+                Action::Reply(r) => {
+                    // A client that stops reading can't hold up the hooks.
+                    let _ = s.set_write_timeout(Some(REPLY_TIMEOUT));
+                    let _ = s.write_all(&r);
+                }
             }
         }
     }
@@ -540,12 +713,13 @@ impl Listener {
         use windows_sys::Win32::Foundation::{
             CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, INVALID_HANDLE_VALUE, SetLastError,
         };
-        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
         use windows_sys::Win32::System::Pipes::{
             CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
             PIPE_WAIT,
         };
-        let flags = PIPE_ACCESS_INBOUND | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
+        // Duplex for `__state` replies; hook clients still open it write-only.
+        let flags = PIPE_ACCESS_DUPLEX | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
         let sa = sd.attributes();
         // SAFETY: only resets this thread's last-error value.
         unsafe { SetLastError(0) };
@@ -557,7 +731,7 @@ impl Listener {
                 flags,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 PIPE_UNLIMITED_INSTANCES,
-                0,
+                MAX_STATE as u32,
                 64 * 1024,
                 0,
                 &sa,
@@ -594,8 +768,10 @@ impl Listener {
         Ok(Listener { name, sd, first })
     }
 
-    /// Read one client's message until it closes its end (`ERROR_BROKEN_PIPE`).
-    /// Empty if it sent nothing or more than `MAX_MSG`.
+    /// Read one client's message until it closes its end (`ERROR_BROKEN_PIPE`),
+    /// or, for a control message (no body), its first line: a `__state`
+    /// client keeps the pipe open for the reply. Empty if it sent nothing or
+    /// more than `MAX_MSG`.
     fn read_msg(h: windows_sys::Win32::Foundation::HANDLE) -> Vec<u8> {
         use windows_sys::Win32::Storage::FileSystem::ReadFile;
         let mut buf = Vec::with_capacity(4096);
@@ -608,6 +784,10 @@ impl Listener {
                 return buf; // ERROR_BROKEN_PIPE: client finished writing
             }
             buf.extend_from_slice(&chunk[..n as usize]);
+            if let Some(end) = control_line_end(&buf) {
+                buf.truncate(end);
+                return buf;
+            }
             if buf.len() > MAX_MSG {
                 buf.clear();
                 return buf;
@@ -615,7 +795,9 @@ impl Listener {
         }
     }
 
-    pub fn serve(mut self, mut on_msg: impl FnMut(Vec<u8>) -> bool) {
+    pub fn serve<A: Into<Action>>(mut self, mut on_msg: impl FnMut(Vec<u8>) -> A) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use windows_sys::Win32::Foundation::{
             CloseHandle, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
         };
@@ -627,6 +809,8 @@ impl Listener {
                 CloseHandle(h);
             }
         };
+        // One reply in flight at a time (see `reply`); others get none.
+        let replying = Arc::new(AtomicBool::new(false));
         // Ours from here on; Drop must not close it again.
         let mut next = std::mem::replace(&mut self.first, INVALID_HANDLE_VALUE);
         loop {
@@ -647,11 +831,29 @@ impl Listener {
             });
             // Read the current client even if no new instance could be made.
             let mut keep = true;
-            if connected {
-                let buf = Self::read_msg(cur);
-                keep = buf.is_empty() || on_msg(buf);
+            let buf = if connected { Self::read_msg(cur) } else { Vec::new() };
+            match if buf.is_empty() { Action::Continue } else { on_msg(buf).into() } {
+                Action::Continue => close(cur),
+                Action::Stop => {
+                    close(cur);
+                    keep = false;
+                }
+                Action::Reply(r) if !replying.swap(true, Ordering::AcqRel) => {
+                    let (h, busy) = (Handle(cur), replying.clone());
+                    let spawned =
+                        std::thread::Builder::new().name("reply".into()).stack_size(64 * 1024).spawn(move || {
+                            // Move the whole (Send) `Handle`, not just its raw pointer field.
+                            let h = h;
+                            reply(h.0, &r);
+                            busy.store(false, Ordering::Release);
+                        });
+                    if spawned.is_err() {
+                        close(cur);
+                        replying.store(false, Ordering::Release);
+                    }
+                }
+                Action::Reply(_) => close(cur),
             }
-            close(cur);
             match created {
                 Ok(h) if keep => next = h,
                 Ok(h) => return close(h),
@@ -661,6 +863,54 @@ impl Listener {
                 }
             }
         }
+    }
+}
+
+/// End of a control message's first line in `buf` (after the newline), if
+/// `buf` holds a complete one. Hook events never start with `__`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn control_line_end(buf: &[u8]) -> Option<usize> {
+    if !is_control(buf) {
+        return None;
+    }
+    memchr::memchr(b'\n', buf).map(|i| i + 1)
+}
+
+/// A server pipe handle moved to the `reply` thread, which closes it.
+#[cfg(windows)]
+struct Handle(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: a pipe HANDLE is a kernel object reference usable from any
+// thread; only the receiving thread uses (and closes) it afterwards.
+#[cfg(windows)]
+unsafe impl Send for Handle {}
+
+/// Write `data` to the client on server pipe `h`, wait until it has read it
+/// all, then disconnect and close `h`. `DisconnectNamedPipe` discards unread
+/// data, hence `FlushFileBuffers`, which blocks until the client reads (or
+/// closes): run on its own short-lived thread so a stalled client can only
+/// hold up other replies, never hook events.
+#[cfg(windows)]
+fn reply(h: windows_sys::Win32::Foundation::HANDLE, data: &[u8]) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FlushFileBuffers, WriteFile};
+    use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
+    let mut rest = data;
+    while !rest.is_empty() {
+        let mut n = 0u32;
+        let len = rest.len().min(u32::MAX as usize) as u32;
+        // SAFETY: `h` is a connected server pipe handle we own; `rest` is
+        // readable for `len` bytes; `n` is a valid out-pointer.
+        if unsafe { WriteFile(h, rest.as_ptr(), len, &mut n, std::ptr::null_mut()) } == 0 || n == 0 {
+            break;
+        }
+        rest = &rest[n as usize..];
+    }
+    // SAFETY: `h` is ours; flushed, disconnected and closed exactly once, here.
+    unsafe {
+        FlushFileBuffers(h);
+        DisconnectNamedPipe(h);
+        CloseHandle(h);
     }
 }
 
@@ -752,6 +1002,110 @@ mod tests {
         let m = rx.recv().unwrap();
         assert_eq!(event_name(&m), SHUTDOWN.as_bytes());
         assert!(is_control(event_name(&m)));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn state_and_reload_requests() {
+        assert_eq!(state_request(), b"__state\n");
+        assert_eq!(reload_request(), b"__reload\n");
+        assert!(is_control(event_name(&state_request())));
+        assert_eq!(event_name(&reload_request()), RELOAD.as_bytes());
+    }
+
+    #[test]
+    fn state_reply_parsing() {
+        // An older daemon closes without a word.
+        assert_eq!(parse_reply(Vec::new()).unwrap(), None);
+        assert_eq!(parse_reply(b"\n".to_vec()).unwrap(), None);
+        assert_eq!(parse_reply(b"{\"v\":1}\n".to_vec()).unwrap().as_deref(), Some("{\"v\":1}"));
+        // At the cap is fine, past it is refused.
+        let mut max = vec![b' '; MAX_STATE - 2];
+        max.splice(0..0, *b"{}");
+        assert_eq!(parse_reply(max).unwrap().as_deref(), Some("{}"));
+        let e = parse_reply(vec![b'x'; MAX_STATE + 1]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(parse_reply(vec![0xff, 0xfe]).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn control_messages_end_at_their_first_line() {
+        // A `__state` client waits for the reply instead of closing.
+        assert_eq!(control_line_end(b"__state\n"), Some(8));
+        assert_eq!(control_line_end(b"__shutdown\n{}"), Some(11));
+        assert_eq!(control_line_end(b"__sta"), None, "not complete yet");
+        assert_eq!(control_line_end(b"_"), None);
+        // Hook events are read to the end, newlines and all.
+        assert_eq!(control_line_end(b"Stop\n{}"), None);
+        assert_eq!(control_line_end(b"Stop\n__x\n"), None);
+        assert_eq!(control_line_end(b""), None);
+    }
+
+    #[test]
+    fn listener_actions_from_bool() {
+        assert!(matches!(Action::from(true), Action::Continue));
+        assert!(matches!(Action::from(false), Action::Stop));
+    }
+
+    /// Serve `l`, answering `__state` with `reply` (`None`: like an older
+    /// daemon, which ignores it) and forwarding every other message.
+    fn serve_state(l: Listener, reply: Option<Vec<u8>>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            l.serve(move |m| {
+                if event_name(&m) == STATE.as_bytes()
+                    && let Some(r) = &reply
+                {
+                    return Action::Reply(r.clone());
+                }
+                tx.send(m).is_ok().into()
+            })
+        });
+        rx
+    }
+
+    #[test]
+    fn state_roundtrip() {
+        use std::time::Duration;
+        let p = test_addr("state");
+        let rx = serve_state(Listener::bind(&p).unwrap(), Some(b"{\"v\":1,\"pid\":7}\n".to_vec()));
+        let t = Duration::from_secs(5);
+        assert_eq!(query_state(&p, false, t).unwrap().as_deref(), Some("{\"v\":1,\"pid\":7}"));
+        // Hooks still flow, before and after; repeated queries all answer.
+        send(&p, b"Stop\n{}").unwrap();
+        assert_eq!(rx.recv_timeout(t).unwrap(), b"Stop\n{}");
+        for _ in 0..3 {
+            assert_eq!(query_state(&p, false, t).unwrap().as_deref(), Some("{\"v\":1,\"pid\":7}"));
+        }
+        send_reload(&p, false).unwrap();
+        assert_eq!(rx.recv_timeout(t).unwrap(), reload_request());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn older_daemon_ignores_state_requests() {
+        use std::time::Duration;
+        let p = test_addr("state-old");
+        let rx = serve_state(Listener::bind(&p).unwrap(), None);
+        let t = Duration::from_secs(5);
+        assert_eq!(query_state(&p, false, t).unwrap(), None);
+        // It saw an unknown control event and carried on.
+        assert_eq!(rx.recv_timeout(t).unwrap(), state_request());
+        send(&p, b"Stop\n{}").unwrap();
+        assert_eq!(rx.recv_timeout(t).unwrap(), b"Stop\n{}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn oversized_state_reply_is_refused() {
+        use std::time::Duration;
+        let p = test_addr("state-big");
+        let rx = serve_state(Listener::bind(&p).unwrap(), Some(vec![b'x'; MAX_STATE + 1]));
+        let t = Duration::from_secs(5);
+        assert_eq!(query_state(&p, false, t).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        // The listener is still serving.
+        send(&p, b"Stop\n{}").unwrap();
+        assert_eq!(rx.recv_timeout(t).unwrap(), b"Stop\n{}");
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1004,6 +1358,45 @@ mod tests {
         }
 
         #[test]
+        fn non_elevated_client_reads_the_state_reply() {
+            // An elevated daemon's pipe (owned by Administrators) answering a
+            // TUI that runs non-elevated.
+            let p = test_addr("state-elev");
+            let _rx = serve_state(Listener::bind(&p).unwrap(), Some(b"{\"v\":1}\n".to_vec()));
+            let q = p.clone();
+            let r = as_non_elevated(move || query_state(&q, false, Duration::from_secs(5))).unwrap();
+            assert_eq!(r.as_deref(), Some("{\"v\":1}"));
+        }
+
+        #[test]
+        fn older_inbound_only_pipe_reads_as_an_older_daemon() {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
+            use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT};
+            // What releases before `__state` created: an inbound-only pipe.
+            let p = test_addr("inbound");
+            let name: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+            // SAFETY: valid NUL-terminated name; default security; closed below.
+            let h = unsafe {
+                CreateNamedPipeW(
+                    name.as_ptr(),
+                    PIPE_ACCESS_INBOUND,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    1,
+                    0,
+                    64 * 1024,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert_ne!(h, INVALID_HANDLE_VALUE);
+            assert_eq!(query_state(&p, false, Duration::from_secs(2)).unwrap(), None);
+            // SAFETY: the handle we created, closed once.
+            unsafe { CloseHandle(h) };
+        }
+
+        #[test]
         fn message_sent_before_serving_is_delivered() {
             // The client connects, writes and closes before ConnectNamedPipe,
             // which then reports ERROR_NO_DATA; the bytes are still buffered.
@@ -1198,6 +1591,10 @@ mod tests {
             std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
             let rx = serve(&open.join("s"));
             assert!(send_to(&open.join("s"), true, b"Stop\n{}").is_err());
+            // Nor a state query (whose reply the TUI trusts) or a reload.
+            let t = Duration::from_secs(2);
+            assert_eq!(query_state(&open.join("s"), true, t).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert!(send_reload(&open.join("s"), true).is_err());
             assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
             // Outside the fallback dir no check is made.
             send_to(&open.join("s"), false, b"Stop\n{}").unwrap();

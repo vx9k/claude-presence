@@ -7,6 +7,7 @@ use crate::discord::Presenter;
 use crate::git::{self, GitInfo};
 use crate::ledger::{self, Ledger};
 use crate::presence::{self, Activity, Vars};
+use crate::state::{self, SessionInfo, StateSnapshot};
 use crate::timeutil::{self, fmt_count, fmt_duration_ms, fmt_hours_ms};
 use crate::{ipc, paths};
 use serde::Deserialize;
@@ -14,13 +15,15 @@ use sonic_rs::{JsonValueTrait, LazyValue};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender};
 use std::time::{Duration, Instant};
 
 pub enum Msg {
     Hook(Vec<u8>),
     Reload,
     Shutdown,
+    /// `__state`: send the snapshot reply line back.
+    State(SyncSender<String>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,6 +46,16 @@ impl Status {
             Status::Working => "Working",
             Status::Compacting => "Compacting",
             Status::Notification => "Waiting for input",
+        }
+    }
+    /// Stable machine name, for `__state`.
+    fn key(self) -> &'static str {
+        match self {
+            Status::Idle => "idle",
+            Status::Thinking => "thinking",
+            Status::Working => "working",
+            Status::Compacting => "compacting",
+            Status::Notification => "notification",
         }
     }
 }
@@ -119,11 +132,11 @@ pub fn pretty_model(id: &str) -> String {
             name.push(' ');
             name.push_str(&major);
             let after = &rest[skip + n..];
-            if after.first().is_some_and(|c| *c == b'-' || *c == b'.') {
-                if let Some((minor, _)) = num(&after[1..]) {
-                    name.push('.');
-                    name.push_str(&minor);
-                }
+            if after.first().is_some_and(|c| *c == b'-' || *c == b'.')
+                && let Some((minor, _)) = num(&after[1..])
+            {
+                name.push('.');
+                name.push_str(&minor);
             }
         }
         return name;
@@ -147,6 +160,24 @@ pub fn pretty_tool(name: &str) -> String {
 
 fn file_name(p: &str) -> String {
     p.rsplit(['/', '\\']).next().unwrap_or(p).to_owned()
+}
+
+/// The model a session shows: its transcript's, else the hook's hint.
+fn model_name(s: &Session, fs: Option<&ledger::FileState>) -> String {
+    fs.and_then(|f| f.model.as_deref()).or(s.model_hint.as_deref()).map(pretty_model).unwrap_or_else(|| "Claude".into())
+}
+
+/// The prompt count a session shows. The transcript counts the whole
+/// conversation (resumed history included). The hooks also fire for custom
+/// slash commands, which it doesn't count, so a hook count ahead of it only
+/// adds the one prompt that may not be written yet, and only while that
+/// turn runs.
+fn shown_prompts(s: &Session, fs: Option<&ledger::FileState>) -> u32 {
+    let in_turn = matches!(s.status, Status::Thinking | Status::Working);
+    match fs {
+        Some(f) => f.prompts.saturating_add(u32::from(in_turn && s.prompts > f.prompts)),
+        None => s.prompts,
+    }
 }
 
 /// Seconds of quiet before `s` expires, `None` if sessions never expire.
@@ -185,6 +216,10 @@ pub struct Daemon {
 const SAVE_EVERY: Duration = Duration::from_secs(60);
 const TAIL_EVERY: Duration = Duration::from_secs(5);
 const GIT_TTL: Duration = Duration::from_secs(60);
+/// How long the hook listener waits for the loop to answer `__state`.
+const STATE_WAIT: Duration = Duration::from_millis(300);
+/// Longest text field (bytes) per session in a `__state` reply.
+const STATE_FIELD_MAX: usize = 128;
 
 impl Daemon {
     fn new(cfg: Config, ledger: Ledger) -> Daemon {
@@ -236,10 +271,10 @@ impl Daemon {
         crate::debug!("hook {event} session={sid}");
 
         if event == "SessionEnd" {
-            if let Some(s) = self.sessions.remove(&sid) {
-                if let Some(k) = &s.transcript {
-                    self.ledger.ingest(k);
-                }
+            if let Some(s) = self.sessions.remove(&sid)
+                && let Some(k) = &s.transcript
+            {
+                self.ledger.ingest(k);
             }
             self.ids.remove(&sid);
             return;
@@ -251,16 +286,16 @@ impl Daemon {
         }
         let s = self.sessions.entry(sid.clone()).or_insert_with(|| Session::new(now));
         s.last_activity = now;
-        if let Some(c) = input.cwd.as_deref() {
-            if s.cwd.as_os_str() != c {
-                s.cwd = PathBuf::from(c);
-            }
+        if let Some(c) = input.cwd.as_deref()
+            && s.cwd.as_os_str() != c
+        {
+            s.cwd = PathBuf::from(c);
         }
-        if let Some(t) = input.transcript_path.as_deref() {
-            if s.transcript_path.as_deref().map(Path::as_os_str) != Some(t.as_ref()) {
-                s.transcript_path = Some(PathBuf::from(t));
-                s.transcript = None;
-            }
+        if let Some(t) = input.transcript_path.as_deref()
+            && s.transcript_path.as_deref().map(Path::as_os_str) != Some(t.as_ref())
+        {
+            s.transcript_path = Some(PathBuf::from(t));
+            s.transcript = None;
         }
         match event.as_str() {
             "SessionStart" => {
@@ -335,10 +370,10 @@ impl Daemon {
                 if let Ok(rd) = std::fs::read_dir(sub) {
                     for e in rd.flatten() {
                         let p = e.path();
-                        if p.extension().is_some_and(|x| x == "jsonl") {
-                            if let Some(k) = ledger::key_for(&p) {
-                                self.ledger.ingest(&k);
-                            }
+                        if p.extension().is_some_and(|x| x == "jsonl")
+                            && let Some(k) = ledger::key_for(&p)
+                        {
+                            self.ledger.ingest(&k);
                         }
                     }
                 }
@@ -400,22 +435,21 @@ impl Daemon {
             .iter()
             .max_by_key(|(_, s)| (tier(s), s.last_activity))
             .map(|(id, s)| (id.clone(), tier(s)))?;
-        if let Some(d) = &self.displayed {
-            if let Some(s) = self.sessions.get(d) {
-                if tier(s) >= best.1 {
-                    return Some(d.clone());
-                }
-            }
+        if let Some(d) = &self.displayed
+            && let Some(s) = self.sessions.get(d)
+            && tier(s) >= best.1
+        {
+            return Some(d.clone());
         }
         self.displayed = Some(best.0.clone());
         Some(best.0)
     }
 
     fn git_info(&mut self, cwd: &Path) -> GitInfo {
-        if let Some((at, info)) = self.git.get(cwd) {
-            if at.elapsed() < GIT_TTL {
-                return info.clone();
-            }
+        if let Some((at, info)) = self.git.get(cwd)
+            && at.elapsed() < GIT_TTL
+        {
+            return info.clone();
         }
         if self.git.len() > 64 {
             self.git.clear();
@@ -423,6 +457,17 @@ impl Daemon {
         let info = git::inspect(cwd);
         self.git.insert(cwd.to_path_buf(), (Instant::now(), info.clone()));
         info
+    }
+
+    /// Git info for `cwd`, the project name shown for it (masked for a
+    /// hidden project) and whether it is hidden.
+    fn project(&mut self, cwd: &Path) -> (GitInfo, String, bool) {
+        let gi = self.git_info(cwd);
+        let base = gi.root.as_deref().unwrap_or(cwd);
+        let name = base.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let hidden = self.is_hidden(&name, cwd);
+        let name = if hidden { self.cfg.hidden_project_name.clone() } else { name };
+        (gi, name, hidden)
     }
 
     fn is_hidden(&self, name: &str, cwd: &Path) -> bool {
@@ -454,33 +499,18 @@ impl Daemon {
         let id = self.pick()?;
         let s = self.sessions.get(&id)?;
         let (cwd, status, started) = (s.cwd.clone(), s.status, s.started);
-        let gi = self.git_info(&cwd);
+        let (gi, name, hidden) = self.project(&cwd);
         let s = self.sessions.get(&id)?;
         let fs = s.transcript.as_deref().and_then(|k| self.ledger.file(k));
 
-        let base = gi.root.as_deref().unwrap_or(&cwd);
-        let name = base.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let hidden = self.is_hidden(&name, &cwd);
         let off = timeutil::local_offset_secs();
         let snap = self.ledger.snapshot(now, off);
-        let model = fs
-            .and_then(|f| f.model.as_deref())
-            .or(s.model_hint.as_deref())
-            .map(pretty_model)
-            .unwrap_or_else(|| "Claude".into());
+        let model = model_name(s, fs);
         let usage = fs.map(|f| f.usage).unwrap_or_default();
-        // The transcript counts the whole conversation (resumed history
-        // included). The hooks also fire for custom slash commands, which it
-        // doesn't count, so a hook count ahead of it only adds the one prompt
-        // that may not be written yet, and only while that turn runs.
-        let in_turn = matches!(status, Status::Thinking | Status::Working);
-        let prompts = match fs {
-            Some(f) => f.prompts.saturating_add(u32::from(in_turn && s.prompts > f.prompts)),
-            None => s.prompts,
-        };
+        let prompts = shown_prompts(s, fs);
 
         let mut v = Vars::default();
-        v.set("project", if hidden { self.cfg.hidden_project_name.clone() } else { name });
+        v.set("project", name);
         v.set("branch", if hidden { String::new() } else { gi.branch.clone() });
         v.set("model", model);
         v.set("tool", s.tool.clone().unwrap_or_default());
@@ -542,10 +572,11 @@ impl Daemon {
             small_text: presence::field(presence::render(&a.small_text, &v).0, 128),
         };
         let mut buttons = Vec::new();
-        if self.cfg.github_button && !hidden {
-            if let Some(url) = gi.github {
-                buttons.push(presence::Button { label: "View on GitHub".into(), url });
-            }
+        if self.cfg.github_button
+            && !hidden
+            && let Some(url) = gi.github
+        {
+            buttons.push(presence::Button { label: "View on GitHub".into(), url });
         }
         for b in &self.cfg.buttons {
             if buttons.len() < 2 && b.url.starts_with("http") && !b.label.is_empty() {
@@ -631,11 +662,11 @@ impl Daemon {
             .and_then(|d| self.sessions.get(d))
             .filter(|s| s.status.active())
             .and_then(|s| s.transcript.clone());
-        if let Some(k) = &active_key {
-            if now_i.duration_since(self.last_tail) >= TAIL_EVERY {
-                self.ledger.ingest(k);
-                self.last_tail = now_i;
-            }
+        if let Some(k) = &active_key
+            && now_i.duration_since(self.last_tail) >= TAIL_EVERY
+        {
+            self.ledger.ingest(k);
+            self.last_tail = now_i;
         }
         if self.cfg.rescan_interval > 0
             && now_i.duration_since(self.last_rescan) >= Duration::from_secs(self.cfg.rescan_interval)
@@ -684,6 +715,65 @@ impl Daemon {
         self.cfg = cfg;
         crate::info!("configuration reloaded");
     }
+
+    /// The `__state` snapshot, built only on request: the most recently
+    /// active sessions as the card would show them (hidden projects masked,
+    /// no paths), the card last handed to Discord, and the lifetime stats
+    /// unless they couldn't be loaded (a partial rebuild would look like lost
+    /// stats).
+    fn state(&mut self, now: i64) -> StateSnapshot {
+        // Most recent first; among equals, the newer session.
+        let mut recent: Vec<(i64, usize, String)> = self
+            .sessions
+            .iter()
+            .map(|(id, s)| (s.last_activity, self.ids.get(id).copied().unwrap_or(0), id.clone()))
+            .collect();
+        recent.sort_unstable_by(|a, b| b.cmp(a));
+        recent.truncate(state::MAX_SESSIONS);
+        let mut sessions = Vec::with_capacity(recent.len());
+        for (_, _, id) in recent {
+            let Some(cwd) = self.sessions.get(&id).map(|s| s.cwd.clone()) else { continue };
+            let (gi, project, hidden) = self.project(&cwd);
+            let Some(s) = self.sessions.get(&id) else { continue };
+            let fs = s.transcript.as_deref().and_then(|k| self.ledger.file(k));
+            sessions.push(SessionInfo {
+                id: id.chars().take(8).collect(),
+                project: presence::clamp(project, STATE_FIELD_MAX),
+                branch: if hidden { String::new() } else { presence::clamp(gi.branch, STATE_FIELD_MAX) },
+                status: s.status.key().into(),
+                model: presence::clamp(model_name(s, fs), STATE_FIELD_MAX),
+                tool: presence::clamp(s.tool.clone().unwrap_or_default(), STATE_FIELD_MAX),
+                started_ms: s.started,
+                last_event_ms: s.last_activity,
+                prompts: shown_prompts(s, fs),
+                tools: s.tools,
+                tokens: fs.map(|f| f.usage.total()).unwrap_or(0),
+                shown: self.displayed.as_deref() == Some(id.as_str()),
+            });
+        }
+        let card = match &self.last_given {
+            Some(Some(activity)) => sonic_rs::from_str::<state::Card>(activity).ok(),
+            _ => None,
+        };
+        let stats = (!self.ledger.needs_load()).then(|| self.ledger.stats(now, timeutil::local_offset_secs()));
+        StateSnapshot {
+            v: state::STATE_VERSION,
+            busy: false,
+            version: env!("CARGO_PKG_VERSION").into(),
+            pid: std::process::id(),
+            now_ms: now,
+            discord: self.presenter.status().into(),
+            card,
+            sessions,
+            sessions_total: self.sessions.len().try_into().unwrap_or(u32::MAX),
+            stats,
+        }
+    }
+
+    /// The `__state` reply line.
+    fn state_reply(&mut self) -> String {
+        self.state(timeutil::now_ms()).encode()
+    }
 }
 
 #[cfg(unix)]
@@ -724,10 +814,10 @@ fn install_signals(tx: Sender<Msg>) {
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
     static TX: OnceLock<Mutex<Sender<Msg>>> = OnceLock::new();
     unsafe extern "system" fn handler(_: u32) -> i32 {
-        if let Some(tx) = TX.get() {
-            if let Ok(tx) = tx.lock() {
-                let _ = tx.send(Msg::Shutdown);
-            }
+        if let Some(tx) = TX.get()
+            && let Ok(tx) = tx.lock()
+        {
+            let _ = tx.send(Msg::Shutdown);
         }
         // Give the main loop a moment to clear presence and save.
         std::thread::sleep(Duration::from_millis(1500));
@@ -739,9 +829,10 @@ fn install_signals(tx: Sender<Msg>) {
 }
 
 /// Turn a message from the hook channel into a loop message. `__shutdown`
-/// stops the daemon like SIGTERM (sent by `install`/`uninstall`); other
-/// reserved `__` events are ignored, so newer clients can't confuse older
-/// daemons.
+/// stops the daemon like SIGTERM (sent by `install`/`uninstall`), `__reload`
+/// reloads the config like SIGHUP; other reserved `__` events are ignored,
+/// so newer clients can't confuse older daemons. (`__state` is answered by
+/// `on_message`.)
 fn route(m: Vec<u8>) -> Option<Msg> {
     let event = ipc::event_name(&m);
     if !ipc::is_control(event) {
@@ -751,8 +842,27 @@ fn route(m: Vec<u8>) -> Option<Msg> {
         crate::info!("shutdown requested");
         return Some(Msg::Shutdown);
     }
+    if event == ipc::RELOAD.as_bytes() {
+        return Some(Msg::Reload);
+    }
     crate::debug!("ignoring control event {}", String::from_utf8_lossy(event));
     None
+}
+
+/// The hook listener's handler: queue messages for the loop (`route`), and
+/// answer `__state` with the loop's snapshot. The listener never touches
+/// daemon state itself; if the loop doesn't answer within `wait` (busy with
+/// the startup scan, say) the reply says so, rather than holding up hooks.
+fn on_message(m: Vec<u8>, tx: &Sender<Msg>, wait: Duration) -> ipc::Action {
+    if ipc::event_name(&m) == ipc::STATE.as_bytes() {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        if tx.send(Msg::State(reply_tx)).is_err() {
+            return ipc::Action::Stop;
+        }
+        let line = reply_rx.recv_timeout(wait).unwrap_or_else(|_| state::BUSY_REPLY.to_owned());
+        return ipc::Action::Reply(line.into_bytes());
+    }
+    route(m).is_none_or(|msg| tx.send(msg).is_ok()).into()
 }
 
 pub struct Options {
@@ -782,7 +892,7 @@ pub fn run(opts: Options) -> i32 {
     std::thread::Builder::new()
         .name("hooks".into())
         .stack_size(128 * 1024)
-        .spawn(move || listener.serve(move |m| route(m).is_none_or(|msg| htx.send(msg).is_ok())))
+        .spawn(move || listener.serve(move |m| on_message(m, &htx, STATE_WAIT)))
         .expect("spawn hook listener");
     drop(tx);
 
@@ -810,6 +920,10 @@ pub fn run(opts: Options) -> i32 {
                 Msg::Hook(b) => d.handle_hook(&b),
                 Msg::Reload => d.reload(),
                 Msg::Shutdown => stop = true,
+                // The listener may have given up waiting; then nobody reads it.
+                Msg::State(reply) => {
+                    let _ = reply.send(d.state_reply());
+                }
             }
         }
         if stop {
@@ -1011,8 +1125,10 @@ mod tests {
         assert!(matches!(route(b"__shutdown\n".to_vec()), Some(Msg::Shutdown)));
         assert!(matches!(route(b"__shutdown\n{}".to_vec()), Some(Msg::Shutdown)));
         assert!(matches!(route(b"__shutdown".to_vec()), Some(Msg::Shutdown)));
+        // `__reload` does what SIGHUP does (Windows has no SIGHUP).
+        assert!(matches!(route(ipc::reload_request()), Some(Msg::Reload)));
         // Other reserved names are dropped without error.
-        assert!(route(b"__reload\n{}".to_vec()).is_none());
+        assert!(route(b"__reloadx\n".to_vec()).is_none());
         assert!(route(b"__shutdownx\n{}".to_vec()).is_none());
         // The event name is the first line only; payload contents don't count.
         assert!(matches!(route(b"Stop\n{\"hook_event_name\":\"__shutdown\"}".to_vec()), Some(Msg::Hook(_))));
@@ -1187,5 +1303,161 @@ mod tests {
         assert_eq!(d.ledger.totals.prompts, 1);
         d.presenter.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_requests_wait_briefly_for_the_loop() {
+        let wait = Duration::from_millis(300);
+        // The loop answers.
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let t = std::thread::spawn(move || {
+            for m in rx {
+                if let Msg::State(r) = m {
+                    r.send("{\"v\":1,\"pid\":1}\n".into()).unwrap();
+                }
+            }
+        });
+        let ipc::Action::Reply(r) = on_message(ipc::state_request(), &tx, wait) else { panic!("no reply") };
+        assert_eq!(r, b"{\"v\":1,\"pid\":1}\n");
+        drop(tx);
+        t.join().unwrap();
+
+        // The loop is busy (the startup scan runs before it): say so, soon.
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let started = Instant::now();
+        let ipc::Action::Reply(r) = on_message(ipc::state_request(), &tx, wait) else { panic!("no reply") };
+        assert_eq!(r, crate::state::BUSY_REPLY.as_bytes());
+        assert!(started.elapsed() >= wait && started.elapsed() < Duration::from_secs(2));
+        // The stale request is still queued; answering it later is harmless.
+        let Ok(Msg::State(late)) = rx.try_recv() else { panic!("not queued") };
+        assert!(late.send(String::new()).is_err(), "nobody waits for it any more");
+
+        // Everything else is queued as before.
+        assert!(matches!(on_message(b"Stop\n{}".to_vec(), &tx, wait), ipc::Action::Continue));
+        assert!(matches!(rx.try_recv(), Ok(Msg::Hook(_))));
+        assert!(matches!(on_message(ipc::reload_request(), &tx, wait), ipc::Action::Continue));
+        assert!(matches!(rx.try_recv(), Ok(Msg::Reload)));
+        assert!(matches!(on_message(b"__nope\n".to_vec(), &tx, wait), ipc::Action::Continue));
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        assert!(matches!(on_message(b"Stop\n{}".to_vec(), &tx, wait), ipc::Action::Stop), "loop gone");
+    }
+
+    #[test]
+    fn state_snapshot_is_private_and_capped() {
+        use crate::state::{MAX_SESSIONS, StateSnapshot};
+        let mut d = daemon();
+        let line = r#"{"type":"assistant","timestamp":"2026-10-04T10:00:00Z","message":{"id":"st1","model":"claude-opus-5-5","usage":{"input_tokens":5,"output_tokens":7}}}"#;
+        let (tp, tp_s) = transcript("state-snap", &format!("{line}\n"));
+        let tp_field = format!(",\"transcript_path\":\"{tp_s}\"");
+        for i in 0..40 {
+            hook(&mut d, "Stop", &format!("old-session-{i:02}"), "");
+        }
+        for s in d.sessions.values_mut() {
+            s.last_activity -= 60_000;
+        }
+        hook(&mut d, "UserPromptSubmit", "secret-proj", "");
+        d.sessions.get_mut("secret-proj").unwrap().last_activity -= 1000;
+        d.cfg.hidden_projects = vec!["secret-proj".into()];
+        hook(&mut d, "UserPromptSubmit", "visible-session-id", &tp_field);
+        hook(
+            &mut d,
+            "PreToolUse",
+            "visible-session-id",
+            &format!(r#","tool_name":"Edit","tool_input":{{"file_path":"/x/private-file.rs"}}{tp_field}"#),
+        );
+        d.tick();
+        let reply = d.state_reply();
+        assert!(reply.len() <= ipc::MAX_STATE && reply.ends_with('\n'));
+        // No paths (cwd, tool input, transcript), and no hidden project name.
+        for leak in ["/p/", "/x/", "secret-proj", "cp-state-snap"] {
+            assert!(!reply.contains(leak), "{leak} leaked: {reply}");
+        }
+        let s: StateSnapshot = sonic_rs::from_str(&reply).unwrap();
+        // Sessions never carry tool input; only the card, which Discord
+        // shows anyway, has the file name its template asks for.
+        let listed = sonic_rs::to_string(&s.sessions).unwrap();
+        assert!(!listed.contains("private-file"), "{listed}");
+        // The cap keeps the newest of the equally quiet sessions.
+        assert!(listed.contains("old-session-39") && !listed.contains("old-session-00"));
+        assert_eq!((s.v, s.busy, s.pid), (crate::state::STATE_VERSION, false, std::process::id()));
+        assert_eq!(s.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(s.discord, "disconnected");
+        assert_eq!((s.sessions.len(), s.sessions_total), (MAX_SESSIONS, 42));
+        // Most recent first: the tool user, then the hidden project.
+        let v = &s.sessions[0];
+        assert_eq!(
+            (v.id.as_str(), v.project.as_str(), v.status.as_str()),
+            ("visible-", "visible-session-id", "working")
+        );
+        assert_eq!((v.model.as_str(), v.tool.as_str(), v.tokens, v.prompts, v.tools), ("Opus 5.5", "Edit", 12, 1, 1));
+        assert!(v.shown && v.started_ms > 0 && v.last_event_ms >= v.started_ms);
+        let h = &s.sessions[1];
+        assert_eq!((h.project.as_str(), h.branch.as_str(), h.shown), ("a private project", "", false));
+        assert!(s.sessions[2..].iter().all(|x| x.status == "idle"));
+        // The card as last handed to Discord.
+        let card = s.card.expect("card");
+        assert_eq!(card.details, "Working in visible-session-id");
+        assert!(card.state.starts_with("Edit"), "{}", card.state);
+        let stats = s.stats.expect("stats");
+        assert_eq!(stats.usage.output, 7);
+        d.presenter.shutdown();
+        let _ = std::fs::remove_file(&tp);
+    }
+
+    #[test]
+    fn unloaded_stats_are_left_out_of_the_snapshot() {
+        let dir = std::env::temp_dir().join(format!("cp-daemon-state-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("ledger.db");
+        Ledger::load(db.clone()).save().unwrap();
+        let lock = rusqlite::Connection::open(&db).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let cfg = Config { client_id: "0".into(), scan_history: false, ..Config::default() };
+        let mut d = Daemon::with_presenter(cfg, Ledger::load(db.clone()), Presenter::inert());
+        assert!(d.ledger.needs_load());
+        let s: crate::state::StateSnapshot = sonic_rs::from_str(&d.state_reply()).unwrap();
+        assert_eq!(s.stats, None, "a partial rebuild would look like lost stats");
+        assert_eq!(s.card, None);
+        lock.execute_batch("ROLLBACK").unwrap();
+        d.presenter.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_round_trip_over_the_hook_endpoint() {
+        #[cfg(unix)]
+        let addr = std::env::temp_dir().join(format!("cp-daemon-state-{}.sock", std::process::id()));
+        #[cfg(windows)]
+        let addr = PathBuf::from(format!(r"\\.\pipe\cp-test-daemon-state-{}", std::process::id()));
+        let listener = ipc::Listener::bind(&addr).unwrap();
+        let (tx, rx) = mpsc::channel::<Msg>();
+        std::thread::spawn(move || listener.serve(move |m| on_message(m, &tx, STATE_WAIT)));
+        // The loop, as `run` drives it.
+        let main = std::thread::spawn(move || {
+            let mut d = daemon();
+            for m in rx {
+                match m {
+                    Msg::Hook(b) => d.handle_hook(&b),
+                    Msg::State(r) => {
+                        let _ = r.send(d.state_reply());
+                    }
+                    Msg::Reload => {}
+                    Msg::Shutdown => break,
+                }
+            }
+            d.presenter.shutdown();
+        });
+        let t = Duration::from_secs(5);
+        ipc::send(&addr, b"UserPromptSubmit\n{\"session_id\":\"rt-1\",\"cwd\":\"/p/roundtrip\"}").unwrap();
+        let reply = ipc::query_state(&addr, false, t).unwrap().expect("a reply");
+        let s: crate::state::StateSnapshot = sonic_rs::from_str(&reply).unwrap();
+        assert_eq!(s.sessions.len(), 1);
+        assert_eq!((s.sessions[0].id.as_str(), s.sessions[0].project.as_str()), ("rt-1", "roundtrip"));
+        assert_eq!(s.sessions[0].status, "thinking");
+        ipc::send(&addr, &ipc::shutdown_request()).unwrap();
+        main.join().unwrap();
+        let _ = std::fs::remove_file(&addr);
     }
 }
