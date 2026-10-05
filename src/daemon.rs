@@ -637,7 +637,9 @@ impl Daemon {
         self.last_rescan = Instant::now();
     }
 
-    fn save(&mut self) {
+    /// `rescan`: catch up on transcripts if the stats load now. Not at
+    /// shutdown, where it could outlast the stop wait; the next start rescans.
+    fn save(&mut self, rescan: bool) {
         // Stats that couldn't load (e.g. a busy database) are loaded before
         // any save: saving the in-memory rebuild would replace them.
         if self.ledger.needs_load() {
@@ -646,7 +648,7 @@ impl Daemon {
                 return;
             }
             crate::info!("stats loaded");
-            if self.cfg.scan_history {
+            if rescan && self.cfg.scan_history {
                 self.rescan();
             }
         }
@@ -684,7 +686,7 @@ impl Daemon {
         // Unloaded stats are retried on the same deadline, hooks or not.
         let save_due = self.ledger.is_dirty() || self.ledger.needs_load();
         if save_due && now_i.duration_since(self.last_save) >= SAVE_EVERY {
-            self.save();
+            self.save(true);
         }
         self.push();
 
@@ -911,7 +913,7 @@ pub fn run(opts: Options) -> i32 {
     let mut d = Daemon::new(cfg, ledger);
     if scan {
         d.rescan();
-        d.save();
+        d.save(true);
     }
 
     loop {
@@ -942,7 +944,7 @@ pub fn run(opts: Options) -> i32 {
         }
     }
     crate::info!("shutting down");
-    d.save();
+    d.save(false);
     d.presenter.shutdown();
     0
 }
@@ -1300,11 +1302,11 @@ mod tests {
         let cfg = Config { client_id: "0".into(), scan_history: false, ..Config::default() };
         let mut d = Daemon::with_presenter(cfg, Ledger::load(db.clone()), Presenter::inert());
         assert!(d.ledger.needs_load());
-        d.save();
+        d.save(true);
         assert!(d.ledger.needs_load(), "still busy: nothing saved");
         lock.execute_batch("ROLLBACK").unwrap();
         drop(lock);
-        d.save();
+        d.save(true);
         assert!(!d.ledger.needs_load());
         assert_eq!(d.ledger.totals.prompts, 1, "the stored stats are loaded");
         d.presenter.shutdown();
