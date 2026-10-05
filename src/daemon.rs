@@ -74,6 +74,9 @@ struct Session {
     started: i64,
     last_activity: i64,
     prompts: u32,
+    /// The transcript's prompt count when the running turn's prompt was
+    /// submitted; `None` outside a turn (cleared by `Stop`).
+    prompt_at_submit: Option<u32>,
     tools: u32,
 }
 
@@ -90,6 +93,7 @@ impl Session {
             started: now,
             last_activity: now,
             prompts: 0,
+            prompt_at_submit: None,
             tools: 0,
         }
     }
@@ -169,14 +173,13 @@ fn model_name(s: &Session, fs: Option<&ledger::FileState>) -> String {
 }
 
 /// The prompt count a session shows. The transcript counts the whole
-/// conversation (resumed history included). The hooks also fire for custom
-/// slash commands, which it doesn't count, so a hook count ahead of it only
-/// adds the one prompt that may not be written yet, and only while that
-/// turn runs.
+/// conversation (resumed history included) but not custom slash commands,
+/// which also fire `UserPromptSubmit`. Until `Stop`, the running turn's
+/// prompt adds one while the transcript hasn't passed its count at submit
+/// (the prompt isn't written yet).
 fn shown_prompts(s: &Session, fs: Option<&ledger::FileState>) -> u32 {
-    let in_turn = matches!(s.status, Status::Thinking | Status::Working);
     match fs {
-        Some(f) => f.prompts.saturating_add(u32::from(in_turn && s.prompts > f.prompts)),
+        Some(f) => f.prompts.saturating_add(u32::from(s.prompt_at_submit.is_some_and(|at| f.prompts <= at))),
         None => s.prompts,
     }
 }
@@ -314,6 +317,7 @@ impl Daemon {
                     s.status = Status::Idle;
                     s.tool = None;
                     s.file = None;
+                    s.prompt_at_submit = None;
                 }
                 if let Some(m) = input.model.as_ref() {
                     let id = m
@@ -327,6 +331,8 @@ impl Daemon {
             }
             "UserPromptSubmit" => {
                 s.prompts += 1;
+                let key = s.transcript.clone().or_else(|| s.transcript_path.as_deref().and_then(ledger::key_for));
+                s.prompt_at_submit = Some(key.and_then(|k| self.ledger.file(&k)).map_or(0, |f| f.prompts));
                 s.status = Status::Thinking;
                 s.tool = None;
                 s.file = None;
@@ -349,6 +355,7 @@ impl Daemon {
             "Notification" => s.status = Status::Notification,
             "PreCompact" => s.status = Status::Compacting,
             "Stop" => {
+                s.prompt_at_submit = None;
                 s.status = Status::Idle;
                 s.tool = None;
                 s.file = None;
@@ -1184,6 +1191,31 @@ mod tests {
         // The second prompt is not written yet when its hook arrives.
         hook(&mut d, "UserPromptSubmit", "lag", &tp_field);
         assert_eq!(activity(&mut d)["state"].as_str(), Some("Claude · 2 prompts · 0 tokens"));
+        d.presenter.shutdown();
+        let _ = std::fs::remove_file(&tp);
+    }
+
+    #[test]
+    fn in_flight_prompt_counts_once_until_stop() {
+        let mut d = daemon();
+        let prompt = |u: &str| {
+            format!(r#"{{"type":"user","timestamp":"2026-10-04T10:00:00Z","uuid":"{u}","message":{{"content":"go"}}}}"#)
+        };
+        // A resumed conversation: the transcript has more prompts than hooks.
+        let (tp, tp_s) = transcript("inflight", &format!("{}\n{}\n", prompt("if1"), prompt("if2")));
+        let tp_field = format!(",\"transcript_path\":\"{tp_s}\"");
+        hook(&mut d, "SessionStart", "if", &format!(",\"source\":\"resume\"{tp_field}"));
+        let state = |d: &mut Daemon| activity(d)["state"].as_str().unwrap_or_default().to_owned();
+        hook(&mut d, "UserPromptSubmit", "if", &tp_field);
+        assert!(state(&mut d).contains("3 prompts"), "the new prompt counts before it is written");
+        hook(&mut d, "Notification", "if", &tp_field);
+        assert!(state(&mut d).contains("3 prompts"), "still in flight during a notification");
+        hook(&mut d, "PreCompact", "if", &tp_field);
+        // The default compacting card has no `{prompts}`; the TUI's view does.
+        assert_eq!(d.state(timeutil::now_ms()).sessions[0].prompts, 3, "and while compacting");
+        hook(&mut d, "Stop", "if", &tp_field);
+        let prompts = d.state(timeutil::now_ms()).sessions[0].prompts;
+        assert_eq!(prompts, 2, "the turn ended without it being written");
         d.presenter.shutdown();
         let _ = std::fs::remove_file(&tp);
     }
