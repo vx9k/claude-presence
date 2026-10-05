@@ -159,8 +159,9 @@ Symptom-by-symptom table, log lines explained, log file locations:
 | [docs/ledger.md](docs/ledger.md) | Lifetime stats database, dedup rules, crash consistency, migration |
 | [docs/development.md](docs/development.md) | Build, checks, test-driven workflow, sub-agents, CI |
 
-For contributors and coding agents: [AGENTS.md](AGENTS.md), [CLAUDE.md](CLAUDE.md),
-[TODO.md](TODO.md). Build with `cargo build --release`; run `cargo test`.
+Contributing: start with [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md). Coding agents: [AGENTS.md](AGENTS.md),
+[CLAUDE.md](CLAUDE.md), [TODO.md](TODO.md). Build with `cargo build --release`; run `cargo test`.
 Commits follow [Conventional Commits](docs/development.md#commit-messages).
 
 ## Security

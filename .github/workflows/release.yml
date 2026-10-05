@@ -104,8 +104,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends musl-tools
           echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
       - run: cargo build --release --locked --target "$TARGET"
+      # pwsh, as in ci.yml: MSYS bash makes the user SID the token's default
+      # owner, which defeats the elevated-pipe tests (they need
+      # Administrators). pwsh is on every runner and reads $TARGET the same.
       - if: matrix.test
-        run: cargo test --locked --target "$TARGET"
+        shell: pwsh
+        run: cargo test --locked --target $env:TARGET
       # crt-static (.cargo/config.toml): no Visual C++ runtime DLL dependency.
       - if: contains(matrix.target, 'windows')
         name: Check for a static C runtime
