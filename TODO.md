@@ -7,7 +7,7 @@ Work items are ordered by priority. Delete an entry once its fix is merged.
 ## Status
 
 - CI (fmt, clippy, test, release build on Linux/macOS/Windows) is green.
-  Unit tests: 127 on Linux, 126 on Windows (socket and POSIX permission tests
+  Unit tests: 174 on Windows (socket and POSIX permission tests
   are Unix-only; named pipe tests Windows-only).
 - **Verified on Windows by hand:** `install` (Task Scheduler), `status`, the
   hook named pipe, connecting to Discord and setting an activity (via a
@@ -70,9 +70,9 @@ Line numbers are approximate.
     smaller); gcc/clang process `-D`/`-U` in order too, but the Linux and
     macOS builds are only checked by CI. Also unverified: the ledger on a
     network/FUSE data dir (SQLite locking), and the daemon's busy-db retry
-    against a real second process (unit-tested with a second connection),
-    and the Unix (`ENOTDIR`) branch of `unreadable_db_path_is_retried`
-    (only the Windows `ERROR_INVALID_NAME` branch was run locally).
+    against a real second process (unit-tested with a second connection).
+    The Unix (`ENOTDIR`) branch of `unreadable_db_path_is_retried` and the
+    trimmed gcc/clang builds pass in CI; the size saving there is unmeasured.
     Known, accepted: a lasting load error (read-only data dir, invalid
     path) makes the daemon retry the load once a minute forever (logged at
     `debug` after the first warning). A backoff can be added later.
