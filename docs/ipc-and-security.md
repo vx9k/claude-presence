@@ -61,11 +61,7 @@ Client (`send_to`, used by every hook): verify only, nothing is created. A faile
 
 Daemon failure logs `cannot listen on <path>: <path>: <reason>` and exits 1. Fix: if the directory is yours, `chmod 700` it or delete it; if it is not yours, someone else created it first, so leave it and set `XDG_RUNTIME_DIR` or `TMPDIR` to a directory you own.
 
-### Legacy socket fallback (Unix)
-
-Versions before the private socket directory listened at `<tmp>/claude-presence-<uid>.sock` (`<tmp>/claude-presence.sock` when `<tmp>` is not `/tmp`), only when there was no per-user runtime directory (`paths::legacy_hook_socket`). So that upgrading the binary without re-running `install` keeps working while such a daemon is still running, `hook` (`ipc::send_hook`) retries there when sending to today's endpoint fails with not found or connection refused. It does not retry after a refusal of an untrusted directory. The legacy socket is used only if its parent directory passes the parent check (ours or root's, sticky or not writable by others) and the path itself is a socket (`lstat`, so not a symlink) owned by the current user. Otherwise nothing is sent. The fallback is temporary and will be removed a couple of releases after the private directory shipped.
-
-On Windows the pipe used to be named after `%USERNAME%` (`\\.\pipe\claude-presence-<USERNAME>`). `install` and `uninstall` also stop a daemon found there; hooks don't fall back to it, since the daemon and hooks are upgraded together.
+On Windows the pipe used to be named after `%USERNAME%` (`\\.\pipe\claude-presence-<USERNAME>`). Nothing reaches a daemon still listening there: log out or stop it by hand.
 
 ### Windows pipe
 
@@ -113,7 +109,7 @@ Another user who creates `\\.\pipe\claude-presence-<SID>` before your daemon can
 
 `windows-latest` runs elevated. Its tests cover: the pipe DACL read back (protected, one allow ACE for your SID); an elevated daemon accepting a non-elevated hook, with an `OW` (owner rights) pipe rejecting the same client as a negative control; the hook-side owner check on our own pipe (`pipe_owner_trusted` rules run on every platform); `SECURITY_IDENTIFICATION` against a fake Discord server; a message written and closed before the daemon reads it (`ERROR_NO_DATA`); the bind retry against `FILE_FLAG_FIRST_PIPE_INSTANCE`; the `__shutdown` round trip over the pipe; and cancelling a Discord worker stuck in a pipe read (`CancelSynchronousIo`). Details in [development.md](development.md#ci).
 
-Verified by hand on Windows: `install` via Task Scheduler, `status`, the hook named pipe, and setting an activity from a hand-fed `UserPromptSubmit`. Not yet verified: a full local Claude Code session on Windows, and the locked-`.exe` copy during a real reinstall (its retry and rename logic is unit-tested).
+Verified by hand on Windows: `install` via Task Scheduler, `status`, the hook named pipe, a local Claude Code session driving the card in Discord, and a reinstall while the `.exe` is in use (renamed to `.old`, removed by the next install).
 
 ## Privacy
 

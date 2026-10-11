@@ -74,7 +74,7 @@ fn hook(event: &str) -> ExitCode {
     msg.push(b'\n');
     let _ = std::io::stdin().lock().read_to_end(&mut msg);
     let (sock, in_private_dir) = paths::hook_endpoint();
-    let _ = ipc::send_hook(&sock, in_private_dir, paths::legacy_hook_socket, &msg);
+    let _ = ipc::send_to(&sock, in_private_dir, &msg);
     ExitCode::SUCCESS
 }
 
