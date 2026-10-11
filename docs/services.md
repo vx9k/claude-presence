@@ -192,7 +192,7 @@ Stop the daemon first (the manual steps below do not ask it to stop; `claude-pre
 Re-running `claude-presence install` is safe. For the service step it:
 
 1. Prints `Installing claude-presence <version>`.
-2. Calls the same cleanup as `uninstall` (`uninstall_service`): sends `__shutdown` to the running daemon at the current socket or pipe, and also at the legacy socket path if different and present. It then polls for up to 2 s (every 50 ms). Output: `stopped the running daemon (reinstalling)`. If it has not stopped: `warn: the running daemon has not stopped after 2 s (still busy, or a version without __shutdown)`. Then it stops and removes every service flavor it finds (see Uninstall).
+2. Calls the same cleanup as `uninstall` (`uninstall_service`): sends `__shutdown` to the running daemon at the current socket or pipe. It then polls for up to 2 s (every 50 ms). Output: `stopped the running daemon (reinstalling)`. If it has not stopped: `warn: the running daemon has not stopped after 2 s (still busy, or a version without __shutdown)`. Then it stops and removes every service flavor it finds (see Uninstall).
 3. On Windows, copies the binaries (now replaceable because the old daemon exited; see [Windows](#windows) for retry, `.old` and rollback).
 4. Keeps an existing `config.toml` (`keeping existing config <path>`); otherwise writes the default.
 5. Rewrites the hooks (idempotent: our old entries are removed and all 10 current events are written, so events added by a newer version appear without duplicates; first run saves `settings.json.bak` next to `settings.json` if it did not exist). Output: `wired 10 hook events into <path>`.
@@ -204,11 +204,9 @@ A daemon that starts while the old one is still shutting down retries binding fo
 
 `--no-service` skips steps 2, 7 and 8. On Windows the binaries are still copied: the running daemon is stopped, the binaries replaced, and the daemon restarted detached (see [Windows](#windows)).
 
-Legacy socket path: older versions listened at `<tmp>/claude-presence-<uid>.sock` (or `<tmp>/claude-presence.sock` when `<tmp>` is not `/tmp`) when no per-user runtime directory exists. Only in that case is the legacy path also asked to stop.
+### Upgrading the binary without `install`
 
-### Upgrading the binary without `install` (Linux, macOS)
-
-If you replace the binaries (`cargo install ...`) but do not re-run `install`, a daemon from before the private socket directory may still be running at the legacy path. A hook first tries today's endpoint; if nothing listens there (not found or connection refused), it falls back to the legacy socket, but only if that path is a socket owned by you and its parent directory is safe (the same parent check as the fallback directory). Hooks therefore keep working until the next `install` or logon replaces the old daemon. Windows has no legacy endpoint. Re-run `claude-presence install` after an upgrade anyway to get new hook events and the new daemon.
+Re-run `claude-presence install` after replacing the binaries (`cargo install ...`): it stops the old daemon and starts the new one, and wires any new hook events. A daemon from before the private socket directory (Unix) or the SID pipe name (Windows) listens where today's hooks no longer look, and `install` no longer stops it there; it receives no hooks until you log out or stop it yourself.
 
 ## Uninstall
 

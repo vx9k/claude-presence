@@ -691,23 +691,16 @@ pub fn replace_binary(src: &Path, dst: &Path) -> io::Result<()> {
     replace_with(src, dst, 20, Duration::from_millis(250), || fs::copy(src, dst).map(|_| ()))
 }
 
-/// Ask a running daemon (at today's address and the legacy one) to shut
-/// down, so it saves its stats and releases its binary.
+/// Ask a running daemon to shut down, so it saves its stats and releases
+/// its binary.
 pub fn stop_daemons() -> Vec<String> {
     let mut done = Vec::new();
-    let sock = paths::hook_socket();
-    // TODO: drop the legacy path a couple of releases after the private
-    // socket dir shipped.
-    // No `exists()` probe: on Windows it would open (connect to) the pipe.
-    let legacy = paths::legacy_hook_socket().filter(|old| *old != sock);
-    for addr in std::iter::once(sock.clone()).chain(legacy) {
-        match stop_daemon(&addr, Duration::from_secs(2)) {
-            Some(true) => done.push("stopped the running daemon".into()),
-            Some(false) => crate::warn!(
-                "the running daemon has not stopped after 2 s (still busy, or a version without __shutdown)"
-            ),
-            None => {}
+    match stop_daemon(&paths::hook_socket(), Duration::from_secs(2)) {
+        Some(true) => done.push("stopped the running daemon".into()),
+        Some(false) => {
+            crate::warn!("the running daemon has not stopped after 2 s (still busy, or a version without __shutdown)")
         }
+        None => {}
     }
     done
 }

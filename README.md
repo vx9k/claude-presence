@@ -65,9 +65,9 @@ Re-running `install` is safe (e.g. after upgrading): it asks a running daemon to
 cleanly (it saves your stats; waits up to 2 s; prints `stopped the running daemon`),
 stops the old service, rewrites the hooks and service file, and starts the new binary.
 Re-running it also adds hook events a newer version wires (no duplicates). On Windows it
-replaces the copied binaries even while the old daemon is shutting down. If you upgrade
-the binary but don't re-run `install`, hooks on Linux and macOS still reach a daemon from
-before the private socket directory that keeps running.
+replaces the copied binaries even while the old daemon is shutting down. After upgrading
+the binary, re-run `install`: a daemon from before the private socket directory (Unix) or
+the SID pipe name (Windows) gets no hooks and is not stopped for you.
 Details: [docs/services.md](docs/services.md#reinstall-and-upgrade).
 
 ### Commands
