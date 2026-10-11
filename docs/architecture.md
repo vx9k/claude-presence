@@ -11,7 +11,7 @@ See also: [ipc-and-security.md](ipc-and-security.md), [ledger.md](ledger.md),
 | Daemon | `src/daemon.rs` | Main thread event loop: sessions, expiry, rotation, rendering, saving. Entry points: `claude-presence daemon` and `claude-presenced` (`src/bin/claude-presenced.rs`; GUI subsystem on Windows, logs to `daemon.log` in the data dir). |
 | Hook listener | `src/ipc.rs` | Thread `hooks`. Accepts connections, reads one message each (max 16 MiB, 2 s read timeout on Unix), forwards to the main loop. |
 | Discord worker | `src/discord.rs` | Thread `discord`. Owns the Discord IPC connection, rate limiting, reconnect backoff, keepalive. |
-| Ledger | `src/ledger.rs` | Incremental transcript parsing, lifetime stats, persistence. See [ledger.md](ledger.md). |
+| Ledger | `src/ledger.rs` | Incremental transcript parsing, lifetime stats, delta saves to the SQLite database `ledger.db` (opened only for each load or save). See [ledger.md](ledger.md). |
 | Git reader | `src/git.rs` | Branch and GitHub origin read from `.git` files; no `git` process. Cached per cwd for 60 s (`GIT_TTL`), cache cleared past 64 entries. |
 | Presence rendering | `src/presence.rs`, `Daemon::render` | Template substitution, field clamping (128 bytes, 300 for image keys, 32 for button labels), activity JSON. |
 | Config | `src/config.rs` | `config.toml` schema and defaults. Loaded at start and on reload; never by the hook process. |
@@ -24,7 +24,7 @@ flowchart LR
     H -- "unix socket / named pipe<br/>&lt;Event&gt;\n&lt;raw JSON&gt;" --> L["hooks thread"]
     L -- "mpsc Msg::Hook" --> D["daemon main loop"]
     S["signals thread<br/>SIGHUP/INT/TERM"] -- "Reload / Shutdown" --> D
-    D -- "ingest" --> LG[("ledger<br/>ledger.json + seen.bin")]
+    D -- "ingest" --> LG[("ledger<br/>ledger.db (SQLite)")]
     LG -. "reads appended bytes" .-> T[("~/.claude/projects/**/*.jsonl")]
     D -- "Presenter::set(activity JSON)" --> W["discord thread"]
     W -- "discord-ipc-N" --> DC[Discord desktop]

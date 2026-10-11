@@ -16,6 +16,9 @@ When consulted:
    alternative and why you didn't pick it. Mention costs in concrete terms
    (binary size, RSS, wakeups, syscalls, maintenance, platform risk).
 4. Flag anything that would break the on-disk ledger format, the hook wire
-   format (`<Event>\n<json>`), or users' existing `config.toml` / services.
+   format (`<Event>\n<json>`), or users' existing `config.toml` / services,
+   and say whether the commit must be marked breaking (`!` and a
+   `BREAKING CHANGE:` footer, per Conventional Commits; see
+   docs/development.md#commit-messages).
 
 Keep answers under ~200 words. You never edit files.

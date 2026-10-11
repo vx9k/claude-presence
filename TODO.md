@@ -7,7 +7,7 @@ Work items are ordered by priority. Delete an entry once its fix is merged.
 ## Status
 
 - CI (fmt, clippy, test, release build on Linux/macOS/Windows) is green.
-  Unit tests: 107 on Linux, 106 on Windows (socket and POSIX permission tests
+  Unit tests: 127 on Linux, 126 on Windows (socket and POSIX permission tests
   are Unix-only; named pipe tests Windows-only).
 - **Verified on Windows by hand:** `install` (Task Scheduler), `status`, the
   hook named pipe, connecting to Discord and setting an activity (via a
@@ -65,17 +65,22 @@ Line numbers are approximate.
     Compacting. Fix: record the transcript's count at `UserPromptSubmit`
     (`prompts_at_submit`) and add 1 only while the transcript hasn't passed
     it, until `Stop`. Then tighten the wording in docs/configuration.md.
-18. **Spurious `seen.bin` warning** (`src/ledger.rs` `load`):
-    `append_seen` never creates `seen.bin` while every tracked file is
-    id-less, so a new user whose only transcript has no prompts gets
-    "previously counted ids are forgotten" on every start. Fix: warn on
-    `NotFound` only if `totals.turns + totals.prompts > 0`.
-19. **Healed ids can recount growth** (`src/ledger.rs` `settle`): after
-    `seen.bin` is lost, a healed id becomes `Seen::Counted`, so growth on
-    its lines past `counted_to` goes to totals even if the message was a
-    copy counted elsewhere. Very narrow. Optional fix: `e.seen = Seen::Dup`
-    when `p.counted`.
-20. **docs/ledger.md "Known per-file overcount" is imprecise**: it applies
-    to any message evicted from the ring (not only ones counted
-    elsewhere), and the evicted message's later growth is lost from
-    totals (a small undercount).
+21. **Drop the legacy ledger import** (`src/ledger.rs` `import_legacy`,
+    `read_legacy`, `Stored`, `LEGACY_*`, and `load_stats`' legacy
+    fallback): a couple of releases after `ledger.db` shipped, stop reading
+    `ledger.json`/`seen.bin` (users who skipped those releases rebuild from
+    the transcripts still on disk). The `*.bak` files can then be ignored
+    or removed by `uninstall --purge` (already covered: it deletes the
+    whole data dir).
+22. **SQLite trim flags verified on Windows MSVC only**
+    (`.cargo/config.toml` `LIBSQLITE3_FLAGS`): `-U` after
+    libsqlite3-sys's `-D`s works with cl.exe (tests pass, ~650 KB
+    smaller); gcc/clang process `-D`/`-U` in order too, but the Linux and
+    macOS builds are only checked by CI. Also unverified: the ledger on a
+    network/FUSE data dir (SQLite locking), and the daemon's busy-db retry
+    against a real second process (unit-tested with a second connection),
+    and the Unix (`ENOTDIR`) branch of `unreadable_db_path_is_retried`
+    (only the Windows `ERROR_INVALID_NAME` branch was run locally).
+    Known, accepted: a lasting load error (read-only data dir, invalid
+    path) makes the daemon retry the load once a minute forever (logged at
+    `debug` after the first warning). A backoff can be added later.

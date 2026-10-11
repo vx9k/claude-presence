@@ -31,13 +31,24 @@ from `advisor`, `auditor`, `developer`, `docs-writer`:
 
 Keep any other trailers your harness requires.
 
+## Commit messages
+
+Commits and PR titles strictly follow Conventional Commits 1.0.0:
+`<type>(<scope>)!: <description>`, imperative, lowercase, no period, header
+≤ 72 characters; `!` plus a `BREAKING CHANGE:` footer for breaking changes;
+footers in order `BREAKING CHANGE:`, `Refs:`/`Closes:`, `Sub-agent:`, then
+harness trailers. Allowed types, scopes and what counts as breaking are in
+[docs/development.md](docs/development.md#commit-messages). Split mixed work
+into one commit per type. PRs are squash-merged, so the PR title must
+conform too.
+
 ## Resuming work
 
 Start from `TODO.md` (and `docs/architecture.md` if the code is new to you).
 Stack related PRs when later work depends on earlier fixes. The usual loop for an item: advisor (if the item
 touches IPC, the ledger format, config schema or services) → developer →
 auditor until no high/medium findings → docs-writer if user-facing behavior
-changed → commit with a `Sub-agent:` trailer → push → check CI.
+changed → conventional commit with a `Sub-agent:` trailer → push → check CI.
 
 ## Gotchas
 
