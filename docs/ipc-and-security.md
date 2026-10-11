@@ -61,11 +61,7 @@ Client (`send_to`, used by every hook): verify only, nothing is created. A faile
 
 Daemon failure logs `cannot listen on <path>: <path>: <reason>` and exits 1. Fix: if the directory is yours, `chmod 700` it or delete it; if it is not yours, someone else created it first, so leave it and set `XDG_RUNTIME_DIR` or `TMPDIR` to a directory you own.
 
-### Legacy socket fallback (Unix)
-
-Versions before the private socket directory listened at `<tmp>/claude-presence-<uid>.sock` (`<tmp>/claude-presence.sock` when `<tmp>` is not `/tmp`), only when there was no per-user runtime directory (`paths::legacy_hook_socket`). So that upgrading the binary without re-running `install` keeps working while such a daemon is still running, `hook` (`ipc::send_hook`) retries there when sending to today's endpoint fails with not found or connection refused. It does not retry after a refusal of an untrusted directory. The legacy socket is used only if its parent directory passes the parent check (ours or root's, sticky or not writable by others) and the path itself is a socket (`lstat`, so not a symlink) owned by the current user. Otherwise nothing is sent. The fallback is temporary and will be removed a couple of releases after the private directory shipped.
-
-On Windows the pipe used to be named after `%USERNAME%` (`\\.\pipe\claude-presence-<USERNAME>`). `install` and `uninstall` also stop a daemon found there; hooks don't fall back to it, since the daemon and hooks are upgraded together.
+On Windows the pipe used to be named after `%USERNAME%` (`\\.\pipe\claude-presence-<USERNAME>`). Nothing reaches a daemon still listening there: log out or stop it by hand.
 
 ### Windows pipe
 

@@ -180,50 +180,9 @@ fn user_name_pipe() -> PathBuf {
     PathBuf::from(format!(r"\\.\pipe\{APP}-{user}"))
 }
 
-/// Where versions before the private socket dir listened, if that differs
-/// from today's path: `install`/`uninstall` stop a daemon found there too.
-// TODO: remove a couple of releases after the private socket dir shipped.
-#[cfg(unix)]
-pub fn legacy_hook_socket() -> Option<PathBuf> {
-    match user_runtime_dir() {
-        Some(_) => None, // unchanged
-        // SAFETY: getuid never fails.
-        None => Some(legacy_socket_in(&tmp_dir(), unsafe { libc::getuid() })),
-    }
-}
-
-#[cfg(unix)]
-fn legacy_socket_in(tmp: &std::path::Path, uid: u32) -> PathBuf {
-    if tmp == std::path::Path::new("/tmp") {
-        tmp.join(format!("{APP}-{uid}.sock"))
-    } else {
-        tmp.join(format!("{APP}.sock"))
-    }
-}
-
-/// Only `install`/`uninstall` use it on Windows, to stop an older daemon;
-/// hooks and the daemon are upgraded together, so hooks don't fall back.
-// TODO: remove a couple of releases after the SID pipe name shipped.
-#[cfg(windows)]
-pub fn legacy_hook_socket() -> Option<PathBuf> {
-    Some(user_name_pipe())
-}
-
 #[cfg(windows)]
 pub fn hook_endpoint() -> (PathBuf, bool) {
     (hook_socket(), false)
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn legacy_socket_names() {
-        assert_eq!(legacy_socket_in(Path::new("/tmp"), 1000), Path::new("/tmp/claude-presence-1000.sock"));
-        assert_eq!(legacy_socket_in(Path::new("/var/tmp/me"), 1000), Path::new("/var/tmp/me/claude-presence.sock"));
-    }
 }
 
 #[cfg(all(test, windows))]
@@ -234,6 +193,5 @@ mod win_tests {
         let pipe = super::hook_socket();
         let sid = crate::ipc::current_user_sid().unwrap();
         assert_eq!(pipe.to_str().unwrap(), format!(r"\\.\pipe\claude-presence-{sid}"));
-        assert_ne!(super::legacy_hook_socket(), Some(pipe));
     }
 }
