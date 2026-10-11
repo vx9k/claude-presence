@@ -24,28 +24,6 @@ A lean alternative to the Node.js [claude-rpc](https://github.com/rar-file/claud
    default on; only the `tui` command uses it — the daemon binary stays the
    same size).
 
-## Layout
-
-| Path | Purpose |
-|---|---|
-| `src/main.rs` | CLI: `install`, `uninstall`, `status`, `daemon`, `hook`, `config` |
-| `src/bin/claude-presenced.rs` | Daemon entry used by services (Windows GUI subsystem → no console window) |
-| `src/daemon.rs` | Event loop, session state machine, card rendering, signals |
-| `src/discord.rs` | Discord IPC client + worker thread with rate limiting/coalescing |
-| `src/ipc.rs` | Hook → daemon channel: Unix socket (0600) / local named pipe |
-| `src/ledger.rs` | Incremental transcript parsing, lifetime stats, delta saves to SQLite `ledger.db` |
-| `src/presence.rs` | Template rendering and the activity payload |
-| `src/config.rs` | `config.toml` schema, defaults and `DEFAULT_TOML` (keep in sync — a test enforces it) |
-| `src/install.rs` | `settings.json` hook wiring and per-user services |
-| `src/git.rs` | Branch / GitHub origin read directly from `.git` |
-| `src/paths.rs` | Per-OS directories and socket/pipe names |
-| `src/timeutil.rs` | Time helpers (RFC 3339 parsing, local offset, formatting) |
-| `src/log.rs` | Minimal leveled logger (`CLAUDE_PRESENCE_LOG`) |
-| `src/state.rs` | `__state` snapshot (JSON, ≤ 64 KiB) the daemon builds for the TUI |
-| `src/tui/` | `claude-presence tui`: pure `app` (state/keys) and `ui` (drawing, `TestBackend` tests); `run` owns the terminal and the poll thread |
-| `docs/` | In-depth docs: architecture, IPC/security, ledger, config, services, troubleshooting, development |
-| `TODO.md` | Handoff: open audit findings and verification status |
-
 ## Current state
 
 Open work (audit findings, unverified platforms, decisions already made) is
@@ -160,14 +138,3 @@ short (AF_UNIX limit ~100 bytes) when overriding `XDG_RUNTIME_DIR`.
   [`docs/development.md`](docs/development.md#commit-messages)); add a
   `Sub-agent: <name>` trailer only when a sub-agent did most of the work
   (see CLAUDE.md).
-
-## Sub-agents
-
-Definitions live in `.claude/agents/`:
-
-| Agent | Model | Role |
-|---|---|---|
-| `advisor` | sonnet | Read-only design second opinion before non-trivial decisions |
-| `auditor` | inherit | Read-only review: correctness, unsafe/FFI, platform pitfalls, resources |
-| `developer` | inherit | Implements changes/fixes with tests; runs all checks |
-| `docs-writer` | sonnet | README and docs, verified against the source |
