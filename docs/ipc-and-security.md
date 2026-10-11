@@ -113,7 +113,7 @@ Another user who creates `\\.\pipe\claude-presence-<SID>` before your daemon can
 
 `windows-latest` runs elevated. Its tests cover: the pipe DACL read back (protected, one allow ACE for your SID); an elevated daemon accepting a non-elevated hook, with an `OW` (owner rights) pipe rejecting the same client as a negative control; the hook-side owner check on our own pipe (`pipe_owner_trusted` rules run on every platform); `SECURITY_IDENTIFICATION` against a fake Discord server; a message written and closed before the daemon reads it (`ERROR_NO_DATA`); the bind retry against `FILE_FLAG_FIRST_PIPE_INSTANCE`; the `__shutdown` round trip over the pipe; and cancelling a Discord worker stuck in a pipe read (`CancelSynchronousIo`). Details in [development.md](development.md#ci).
 
-Verified by hand on Windows: `install` via Task Scheduler, `status`, the hook named pipe, and setting an activity from a hand-fed `UserPromptSubmit`. Not yet verified: a full local Claude Code session on Windows, and the locked-`.exe` copy during a real reinstall (its retry and rename logic is unit-tested).
+Verified by hand on Windows: `install` via Task Scheduler, `status`, the hook named pipe, a local Claude Code session driving the card in Discord, and a reinstall while the `.exe` is in use (renamed to `.old`, removed by the next install).
 
 ## Privacy
 

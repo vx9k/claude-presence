@@ -37,7 +37,7 @@ From [TODO.md](../TODO.md); update both when this changes. You do not need to ve
 
 | Service | Status |
 |---|---|
-| Windows Task Scheduler | `install`, `status`, hook pipe and Discord activity verified by hand on Windows. Windows CI verifies the pipe DACL, an elevated daemon accepting a non-elevated hook, the hook-side pipe owner check, `ERROR_NO_DATA` handling, the bind retry, the `__shutdown` round trip and cancelling a stuck Discord worker (see [development.md](development.md#ci)). A full local Claude Code session on Windows is not yet verified. |
+| Windows Task Scheduler | `install`, `status`, hook pipe and Discord activity verified by hand on Windows. Windows CI verifies the pipe DACL, an elevated daemon accepting a non-elevated hook, the hook-side pipe owner check, `ERROR_NO_DATA` handling, the bind retry, the `__shutdown` round trip and cancelling a stuck Discord worker (see [development.md](development.md#ci)). A full local Claude Code session and a reinstall over a running `.exe` are verified by hand. |
 | Run key | not verified on a real system |
 | User `PATH` edit (Windows) | the `PATH` string logic is unit-tested; the registry read/write and the `WM_SETTINGCHANGE` broadcast are only type-checked (tests never touch the real registry) |
 | launchd | not verified on a real system (CI compiles and tests it; macOS clippy target type-checks) |
