@@ -2,7 +2,7 @@
 name = "claude-presence"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99"
 license = "Apache-2.0"
 description = "Discord Rich Presence for Claude Code, driven by Claude Code hooks. Lean, native, no Node.js."
 repository = "https://github.com/vx9k/claude-presence"
